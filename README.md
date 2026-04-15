@@ -1,0 +1,50 @@
+# AI Interview Portal
+
+Voice-based AI technical interviewer for software engineering, AI/ML, and robotics roles.
+
+**Pipeline:** mic → Deepgram STT → Groq LLM (Llama 3.3 70B) → ElevenLabs TTS → speaker
+
+## Stack
+- **STT:** Deepgram (`nova-2`)
+- **LLM:** Groq cloud API (`llama-3.3-70b-versatile`) — chosen over local Ollama due to hardware constraints on prototype machine. Provider-agnostic `backend/llm/` makes swap trivial.
+- **TTS:** ElevenLabs (`eleven_turbo_v2_5`, voice: Rachel)
+- **Backend:** Python 3.10+, FastAPI (Phase 9)
+
+## Setup
+
+```bash
+python3 -m pip install -r requirements.txt
+cp .env.example .env        # fill in keys
+```
+
+Required keys in `.env`:
+- `DEEPGRAM_API_KEY` — deepgram.com
+- `ELEVENLABS_API_KEY` — elevenlabs.io
+- `GROQ_API_KEY` — console.groq.com (free tier)
+
+## Smoke tests (run after Phase 4)
+
+```bash
+python tests/smoke_llm.py              # Groq → text reply
+python tests/smoke_tts.py              # ElevenLabs → tests/audio/output_tts.mp3
+# Drop a short .wav at tests/audio/sample.wav first:
+python tests/smoke_stt.py              # Deepgram → transcript
+```
+
+## Progress
+
+See [PROGRESS.md](PROGRESS.md) for phase tracker.
+
+## Project structure
+
+```
+backend/
+  stt/deepgram_stt.py      # Phase 2
+  tts/elevenlabs_tts.py    # Phase 3
+  llm/groq_client.py       # Phase 4
+  interview/engine.py      # Phase 6
+  main.py                  # Phase 5 pipeline
+tests/
+  smoke_*.py               # one per service
+  audio/                   # test .wav files
+```

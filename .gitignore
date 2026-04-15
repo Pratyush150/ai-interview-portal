@@ -1,0 +1,11 @@
+.env
+*.pyc
+__pycache__/
+*.wav
+!tests/audio/sample.wav
+venv/
+.venv/
+.vscode/
+.idea/
+*.log
+tests/audio/output_*.wav

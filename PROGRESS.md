@@ -1,0 +1,21 @@
+# AI Interview Portal — Progress Tracker
+
+| Phase | Goal | Status | Tag |
+|---|---|---|---|
+| 0 | Env + smoke tests | 🟡 in progress | `v0.0-smoke` |
+| 1 | Skeleton + .env + .gitignore + README | 🟡 in progress | `v0.1-init` |
+| 2 | Deepgram STT module | 🟡 in progress | `v0.2-stt` |
+| 3 | ElevenLabs TTS module | 🟡 in progress | `v0.3-tts` |
+| 4 | Groq LLM client | 🟡 in progress | `v0.4-llm` |
+| 5 | Audio pipeline echo-bot | ⚪ not started | `v0.5-pipeline` |
+| 6 | Interview engine with stages + memory | ⚪ not started | `v0.6-engine` |
+| 7 | Structured JSON LLM output | ⚪ not started | `v0.7-structured` |
+| 8 | Deepgram streaming upgrade | ⚪ not started | `v0.8-streaming` |
+| 9 | FastAPI wrap + browser mic | ⚪ not started | `v0.9-api` |
+| 10 | Frontend | ⚪ not started | `v1.0-ui` |
+
+## Decisions log
+- **LLM:** Groq cloud API (`llama-3.3-70b-versatile`) — local Ollama blocked by 3.7GB RAM / no GPU. Module is provider-agnostic; swap to Ollama later on better hardware.
+- **Mic:** deferred to Phase 9 (browser `getUserMedia`). Phases 2–7 use pre-recorded `.wav` files in `tests/audio/`.
+- **Voice:** ElevenLabs "Rachel" (`21m00Tcm4TlvDq8ikWAM`).
+- **Domain:** Software engineering + AI/ML/Robotics technical interviews, English.
