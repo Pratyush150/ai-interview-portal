@@ -108,6 +108,7 @@ def ask_llm_structured(
     history: list[dict] | None = None,
     resume_context: str = "",
     job_context: str = "",
+    asked_topics: list[str] | None = None,
 ) -> InterviewResponse:
     """Send a prompt and parse the structured JSON response."""
     api_key = os.getenv("GROQ_API_KEY")
@@ -118,22 +119,43 @@ def ask_llm_structured(
     system_content = f"{STRUCTURED_SYSTEM_PROMPT}\n\nCurrent interview stage: {stage}."
     if resume_context:
         system_content += f"\n\nCandidate resume context:\n{resume_context}"
-        system_content += "\nTailor questions to the candidate's specific experience and skills."
+        system_content += "\nTailor questions to the candidate's specific experience and skills, but VARY the topics."
     if job_context:
         system_content += f"\n\nJob context:\n{job_context}"
         system_content += "\nFocus technical questions on the required skills for this role."
 
+    # Topic diversity enforcement
+    if asked_topics:
+        system_content += (
+            f"\n\nCRITICAL — TOPIC DIVERSITY: These topics have already been covered: "
+            f"{', '.join(asked_topics)}. "
+            f"You MUST ask about a DIFFERENT topic now. Do NOT repeat or revisit these areas. "
+            f"Pick a completely new technical area from the candidate's skills or the job requirements. "
+            f"Vary between: system design, algorithms, databases, APIs, testing, DevOps, security, "
+            f"code quality, concurrency, networking, CI/CD, monitoring."
+        )
+
+    # Trim history to last 12 messages to keep within context limits and reduce latency
+    trimmed_history = history[-12:] if history and len(history) > 12 else history
+
     messages = [{"role": "system", "content": system_content}]
-    if history:
-        messages.extend(history)
+    if trimmed_history:
+        messages.extend(trimmed_history)
     messages.append({"role": "user", "content": user_text})
+
+    # Use faster model for non-evaluative stages (intro, wrap_up)
+    use_model = model
+    temperature = 0.5  # Balance between consistency and variety
+    if stage in ("intro", "wrap_up"):
+        use_model = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+        temperature = 0.7
 
     client = Groq(api_key=api_key)
     completion = client.chat.completions.create(
-        model=model,
+        model=use_model,
         messages=messages,
-        temperature=0.3,  # Lower temp for consistent scoring
-        max_tokens=600,
+        temperature=temperature,
+        max_tokens=500,
         response_format={"type": "json_object"},
     )
 

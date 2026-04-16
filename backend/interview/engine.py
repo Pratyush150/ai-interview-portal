@@ -61,62 +61,60 @@ STAGE_PROMPTS = {
         "You are in the technical deep-dive stage. Go DEEP into one or two topics rather than "
         "skimming across many. Choose topics based on the candidate's background and the job requirements.\n\n"
         "Pick from these question types and mix them:\n"
-        "- SYSTEM DESIGN: 'Imagine you need to design a system that handles 10M daily active users "
-        "doing X. Walk me through your architecture.' Then probe: 'What happens when that database "
-        "shard fills up? How do you handle a datacenter failover? What is your caching strategy and "
-        "what are the invalidation tradeoffs?'\n"
-        "- ALGORITHM & COMPLEXITY: Ask about time/space complexity of their proposed solutions. "
-        "'Can you do better than O(n^2) here? What data structure would you reach for and why?'\n"
-        "- DEBUGGING SCENARIOS: 'Your service is returning 500 errors for 2%% of requests but only "
-        "during peak hours. Walk me through your debugging process step by step.'\n"
-        "- CODE REVIEW: 'If you saw a pull request that did X, what concerns would you raise?'\n"
-        "- TRADEOFF ANALYSIS: 'Why would you choose a SQL database over NoSQL here? What do you lose?'\n\n"
-        "When the candidate gives an answer, ALWAYS follow up: 'Why that choice specifically? "
-        "What would happen if the requirements changed to Y? What are the failure modes?'\n"
-        "Never say 'good answer' and move on. Always dig one level deeper."
+        "- SYSTEM DESIGN: 'Design a system that handles X at scale.' Then probe: database sharding, "
+        "caching strategy, failover, consistency vs availability tradeoffs.\n"
+        "- ALGORITHM & COMPLEXITY: Ask about time/space complexity. 'Can you do better than O(n^2)?'\n"
+        "- DEBUGGING SCENARIOS: 'Your service returns 500 errors for 2%% of requests during peak hours. "
+        "Walk me through your debugging process.'\n"
+        "- CODE REVIEW: 'If you saw a PR that did X, what concerns would you raise?'\n"
+        "- TRADEOFF ANALYSIS: 'Why SQL over NoSQL here? What do you lose?'\n\n"
+        "When the candidate answers, ALWAYS follow up: 'Why that choice? What if requirements changed? "
+        "What are the failure modes?' Never say 'good answer' and move on. Always dig one level deeper."
     ),
     Stage.FOLLOW_UP: (
         "You are in the follow-up stage. Go back to the candidate's earlier answers and find weak spots.\n"
-        "- Pick an answer where the candidate was vague or hand-wavy and ask them to be precise.\n"
-        "- Ask 'what if' questions: 'Earlier you said you would use Redis for caching. What if your "
-        "dataset is 500GB and does not fit in memory? What changes?'\n"
-        "- Ask about failure cases and edge cases they did not mention: 'You described the happy path. "
-        "What happens when the downstream service is down? What about race conditions?'\n"
-        "- Ask about monitoring and observability: 'How would you know if this system is healthy? "
-        "What metrics and alerts would you set up?'\n"
-        "- Challenge directly but professionally: 'You mentioned using microservices, but for the scale "
-        "you described, a monolith might be simpler. Convince me why microservices are the right call.'\n"
-        "Reference specific things the candidate said earlier. Show that you were listening."
+        "- Pick an answer where the candidate was vague and ask them to be precise.\n"
+        "- Ask 'what if' questions: change a constraint and see how their answer adapts.\n"
+        "- Ask about failure cases and edge cases they did not mention.\n"
+        "- Ask about monitoring, observability, and how they would know the system is healthy.\n"
+        "- Challenge directly but professionally: 'You mentioned X, but Y might be simpler for this scale. "
+        "Convince me why X is the right call.'\n"
+        "Reference specific things the candidate said earlier."
     ),
     Stage.WRAP_UP: (
         "You are wrapping up the interview. Ask these probing closing questions:\n"
-        "- 'Tell me about a technical decision you made that turned out to be wrong. "
-        "What did you learn and what would you do differently?'\n"
+        "- 'Tell me about a technical decision you made that turned out to be wrong. What did you learn?'\n"
         "- 'What is the hardest bug you have ever debugged? Walk me through the process.'\n"
-        "- 'If you could go back and re-architect one system you built, which one and why?'\n"
-        "After their response, give a brief, honest summary of the strengths and areas for "
-        "improvement you observed during the interview. Then thank them for their time."
+        "After their response, give a brief, honest summary of strengths and areas for improvement. "
+        "Then thank them for their time."
     ),
 }
 
 BASE_SYSTEM_PROMPT = (
     "You are a senior staff engineer at a FAANG company conducting a rigorous technical interview. "
     "Your interview style:\n"
-    "- NEVER accept surface-level answers. Always dig deeper with 'why', 'how', 'what tradeoffs "
-    "did you consider', 'what would happen if'.\n"
-    "- Reference the candidate's previous answers when asking follow-ups to show you are listening "
-    "and to test consistency.\n"
-    "- Use scenario-based questions: 'Imagine you have 10 million users...', 'Your CEO tells you "
-    "this feature must ship in 2 weeks but your estimate is 6 weeks...'\n"
-    "- When a candidate gives a weak or vague answer, challenge it directly but professionally: "
-    "'That sounds like a textbook answer. Can you give me a concrete example from your own experience?'\n"
-    "- Adapt difficulty dynamically: if the candidate is strong, push harder with edge cases and "
-    "failure modes; if they are struggling, simplify slightly but do not lower the bar.\n"
-    "- Ask ONE question at a time. Keep your responses concise (2-4 sentences). Do not lecture.\n"
+    "- NEVER accept surface-level answers. Always dig deeper with 'why', 'how', 'what tradeoffs'.\n"
+    "- Reference the candidate's previous answers when asking follow-ups.\n"
+    "- Use scenario-based questions with concrete numbers and constraints.\n"
+    "- When a candidate gives a weak or vague answer, challenge it professionally.\n"
+    "- Adapt difficulty dynamically based on the candidate's performance.\n"
+    "- Ask ONE question at a time. Keep responses concise (2-3 sentences). Do not lecture.\n"
     "- Conduct the interview in English.\n"
-    "- Your goal is to accurately assess the candidate's true depth of knowledge, not to trick them "
-    "or make them feel bad. Be tough but fair."
+    "- Be tough but fair. Assess true depth of knowledge."
 )
+
+
+# Topic categories the interviewer should cycle through
+TOPIC_CATEGORIES = [
+    "system design & architecture",
+    "data structures & algorithms",
+    "databases & storage",
+    "APIs & distributed systems",
+    "testing & debugging",
+    "deployment & DevOps",
+    "security & performance",
+    "code quality & best practices",
+]
 
 
 @dataclass
@@ -135,6 +133,7 @@ class InterviewSession:
     job_skills: list[str] = field(default_factory=list)
     job_description: str = ""
     cheating_flags: list[dict] = field(default_factory=list)
+    asked_topics: list[str] = field(default_factory=list)  # track covered topics
 
     @property
     def is_finished(self) -> bool:
@@ -147,12 +146,22 @@ class InterviewSession:
             parts.append(f"\nCandidate name: {self.candidate_name}.")
         if self.resume_context:
             parts.append(f"\nCandidate resume context: {self.resume_context}")
-            parts.append("Tailor your questions to the candidate's specific experience and skills.")
+            parts.append("Tailor questions to the candidate's specific experience and skills.")
         if self.job_title:
             parts.append(f"\nThis interview is for the position: {self.job_title}.")
         if self.job_skills:
             parts.append(f"Required skills: {', '.join(self.job_skills)}.")
-            parts.append("Focus technical questions on these specific skills.")
+
+        # Topic diversity instruction
+        if self.asked_topics:
+            parts.append(
+                f"\n\nIMPORTANT — TOPIC DIVERSITY: You have already asked about these topics: "
+                f"{', '.join(self.asked_topics)}. "
+                f"Do NOT ask another question about the same topic area. "
+                f"Switch to a DIFFERENT topic. Choose from areas you have NOT covered yet. "
+                f"Vary between: {', '.join(TOPIC_CATEGORIES)}."
+            )
+
         parts.append(
             f"\nThis is turn {self.stage_turn_count + 1} of the {self.stage.value} stage. "
             f"Total interview turns so far: {self.total_turns}."
@@ -221,18 +230,18 @@ class InterviewSession:
         if self.is_finished:
             return InterviewResponse(spoken_text="The interview has concluded. Thank you for participating!")
 
+        # Pass asked_topics so the LLM knows what to avoid
         resp = ask_llm_structured(
             user_text,
             stage=self.stage.value,
             history=self.history,
             resume_context=self.resume_context,
             job_context=self._job_context(),
+            asked_topics=self.asked_topics,
         )
 
         # Run heuristic AI detection
         heuristic = analyze_answer(user_text, time_to_respond_ms, is_voice_input)
-
-        # Combine LLM + heuristic AI detection (40% heuristic, 60% LLM)
         combined_ai = round(0.4 * heuristic.likelihood + 0.6 * resp.ai_likelihood, 2)
 
         self.history.append({"role": "user", "content": user_text})
@@ -240,13 +249,16 @@ class InterviewSession:
         self.stage_turn_count += 1
         self.total_turns += 1
 
+        # Track the topic to prevent repetition
+        if resp.topic and resp.topic not in self.asked_topics:
+            self.asked_topics.append(resp.topic)
+
         if resp.score is not None:
-            # Apply AI penalty if high likelihood
             adjusted_score = resp.score
             if combined_ai > 0.7:
-                adjusted_score = round(resp.score * 0.7, 1)  # 30% penalty
+                adjusted_score = round(resp.score * 0.7, 1)
             elif combined_ai > 0.5:
-                adjusted_score = round(resp.score * 0.85, 1)  # 15% penalty
+                adjusted_score = round(resp.score * 0.85, 1)
 
             self.evaluations.append({
                 "turn": self.total_turns,
@@ -271,11 +283,9 @@ class InterviewSession:
         return resp
 
     def add_cheating_flag(self, violation: dict):
-        """Record a cheating violation."""
         self.cheating_flags.append(violation)
 
     def get_status(self) -> dict:
-        """Return current session state summary."""
         scores = [e["score"] for e in self.evaluations if e.get("score") is not None]
         ai_scores = [e["ai_likelihood"] for e in self.evaluations if e.get("ai_likelihood") is not None]
         return {
@@ -289,4 +299,5 @@ class InterviewSession:
             "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
             "avg_ai_likelihood": round(sum(ai_scores) / len(ai_scores), 2) if ai_scores else None,
             "cheating_flags_count": len(self.cheating_flags),
+            "topics_covered": self.asked_topics,
         }

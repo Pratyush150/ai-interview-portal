@@ -243,20 +243,23 @@ def get_session(session_id: str):
 
 
 @app.post("/api/session/{session_id}/turn", response_model=TurnResponse)
-def text_turn(session_id: str, req: TextTurnRequest):
+async def text_turn(session_id: str, req: TextTurnRequest):
     session = sessions.get(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
 
-    reply = session.turn(req.text, req.time_to_respond_ms, req.is_voice_input)
+    # Run LLM call in thread pool (CPU-bound work)
+    reply = await asyncio.to_thread(
+        session.turn, req.text, req.time_to_respond_ms, req.is_voice_input
+    )
     status = session.get_status()
 
-    # TTS is optional
+    # TTS in background — don't block the response
     audio_url = None
     try:
         audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
         audio_path.parent.mkdir(parents=True, exist_ok=True)
-        synthesize(reply, audio_path)
+        await asyncio.to_thread(synthesize, reply, audio_path)
         audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
     except Exception:
         pass
@@ -283,21 +286,24 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
         tmp_path = Path(tmp.name)
 
     try:
-        transcript = transcribe_file(str(tmp_path))
+        # Run STT in thread pool
+        transcript = await asyncio.to_thread(transcribe_file, str(tmp_path))
     finally:
         tmp_path.unlink(missing_ok=True)
 
     if not transcript or not transcript.strip():
         raise HTTPException(400, "No speech detected in audio")
 
-    reply = session.turn(transcript.strip(), is_voice_input=True)
+    # Run LLM in thread pool
+    reply = await asyncio.to_thread(session.turn, transcript.strip(), 0, True)
     status = session.get_status()
 
+    # TTS in thread pool
     audio_url = None
     try:
         audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
         audio_path.parent.mkdir(parents=True, exist_ok=True)
-        synthesize(reply, audio_path)
+        await asyncio.to_thread(synthesize, reply, audio_path)
         audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
     except Exception:
         pass
