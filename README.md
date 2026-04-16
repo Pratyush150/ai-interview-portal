@@ -22,6 +22,14 @@ Required keys in `.env`:
 - `ELEVENLABS_API_KEY` — elevenlabs.io
 - `GROQ_API_KEY` — console.groq.com (free tier)
 
+## Run the pipeline (Phase 5+)
+
+```bash
+# Full pipeline: audio → transcript → LLM reply → speech
+python -m backend.main tests/audio/sample.wav
+python -m backend.main tests/audio/sample.wav --out tests/audio/reply.mp3
+```
+
 ## Smoke tests (run after Phase 4)
 
 ```bash
@@ -29,6 +37,7 @@ python tests/smoke_llm.py              # Groq → text reply
 python tests/smoke_tts.py              # ElevenLabs → tests/audio/output_tts.mp3
 # Drop a short .wav at tests/audio/sample.wav first:
 python tests/smoke_stt.py              # Deepgram → transcript
+python tests/smoke_pipeline.py         # Full STT → LLM → TTS pipeline
 ```
 
 ## Progress

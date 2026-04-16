@@ -2,12 +2,12 @@
 
 | Phase | Goal | Status | Tag |
 |---|---|---|---|
-| 0 | Env + smoke tests | 🟡 in progress | `v0.0-smoke` |
-| 1 | Skeleton + .env + .gitignore + README | 🟡 in progress | `v0.1-init` |
-| 2 | Deepgram STT module | 🟡 in progress | `v0.2-stt` |
-| 3 | ElevenLabs TTS module | 🟡 in progress | `v0.3-tts` |
-| 4 | Groq LLM client | 🟡 in progress | `v0.4-llm` |
-| 5 | Audio pipeline echo-bot | ⚪ not started | `v0.5-pipeline` |
+| 0 | Env + smoke tests | ✅ done | `v0.0-smoke` |
+| 1 | Skeleton + .env + .gitignore + README | ✅ done | `v0.1-init` |
+| 2 | Deepgram STT module | ✅ done | `v0.2-stt` |
+| 3 | ElevenLabs TTS module | ✅ done | `v0.3-tts` |
+| 4 | Groq LLM client | ✅ done | `v0.4-llm` |
+| 5 | Audio pipeline echo-bot | ✅ done | `v0.5-pipeline` |
 | 6 | Interview engine with stages + memory | ⚪ not started | `v0.6-engine` |
 | 7 | Structured JSON LLM output | ⚪ not started | `v0.7-structured` |
 | 8 | Deepgram streaming upgrade | ⚪ not started | `v0.8-streaming` |
