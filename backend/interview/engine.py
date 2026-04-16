@@ -1,9 +1,10 @@
-"""Phase 6 — Interview engine with stages and conversation memory.
+"""Phase 6+7 — Interview engine with stages, memory, and structured output.
 
 Manages a multi-stage technical interview:
     INTRO → BACKGROUND → TECHNICAL → FOLLOW_UP → WRAP_UP
 
 Each stage has its own system prompt overlay and transition logic.
+Supports both plain text and structured JSON responses (Phase 7).
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ from enum import Enum
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from groq import Groq
+
+from backend.llm.structured import ask_llm_structured, InterviewResponse
 
 load_dotenv()
 
@@ -83,6 +86,8 @@ class InterviewSession:
     stage_turn_count: int = 0
     total_turns: int = 0
     candidate_name: str | None = None
+    evaluations: list[dict] = field(default_factory=list)
+    use_structured: bool = False
 
     @property
     def is_finished(self) -> bool:
@@ -110,7 +115,11 @@ class InterviewSession:
             self.stage_turn_count = 0
 
     def turn(self, user_text: str) -> str:
-        """Process one candidate utterance and return the interviewer response."""
+        """Process one candidate utterance and return the interviewer response (text)."""
+        if self.use_structured:
+            resp = self.turn_structured(user_text)
+            return resp.spoken_text
+
         if self.is_finished:
             return "The interview has concluded. Thank you for participating!"
 
@@ -119,7 +128,6 @@ class InterviewSession:
         if not api_key or api_key.startswith("PASTE"):
             raise RuntimeError("GROQ_API_KEY missing in .env")
 
-        # Build messages with full history
         messages = [{"role": "system", "content": self._system_prompt()}]
         messages.extend(self.history)
         messages.append({"role": "user", "content": user_text})
@@ -133,20 +141,47 @@ class InterviewSession:
         )
         reply = completion.choices[0].message.content.strip()
 
-        # Update history and counters
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": reply})
         self.stage_turn_count += 1
         self.total_turns += 1
 
-        # Check for stage transition
         if self._should_advance():
             self._advance_stage()
 
         return reply
 
+    def turn_structured(self, user_text: str) -> InterviewResponse:
+        """Process one turn and return structured InterviewResponse with evaluation."""
+        if self.is_finished:
+            return InterviewResponse(spoken_text="The interview has concluded. Thank you for participating!")
+
+        resp = ask_llm_structured(user_text, stage=self.stage.value, history=self.history)
+
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": resp.spoken_text})
+        self.stage_turn_count += 1
+        self.total_turns += 1
+
+        if resp.score is not None:
+            self.evaluations.append({
+                "turn": self.total_turns,
+                "stage": self.stage.value,
+                "score": resp.score,
+                "topic": resp.topic,
+                "strengths": resp.strengths,
+                "weaknesses": resp.weaknesses,
+                "notes": resp.eval_notes,
+            })
+
+        if resp.suggest_advance or self._should_advance():
+            self._advance_stage()
+
+        return resp
+
     def get_status(self) -> dict:
         """Return current session state summary."""
+        scores = [e["score"] for e in self.evaluations if e["score"] is not None]
         return {
             "session_id": self.session_id,
             "stage": self.stage.value,
@@ -154,4 +189,6 @@ class InterviewSession:
             "total_turns": self.total_turns,
             "is_finished": self.is_finished,
             "history_length": len(self.history),
+            "evaluations_count": len(self.evaluations),
+            "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
         }

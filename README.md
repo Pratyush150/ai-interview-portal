@@ -39,6 +39,7 @@ python tests/smoke_tts.py              # ElevenLabs → tests/audio/output_tts.m
 python tests/smoke_stt.py              # Deepgram → transcript
 python tests/smoke_pipeline.py         # Full STT → LLM → TTS pipeline
 python tests/smoke_engine.py           # Interview engine stages + memory
+python tests/smoke_structured.py       # Structured JSON LLM output + scoring
 ```
 
 ## Interview mode (text, Phase 6+)
