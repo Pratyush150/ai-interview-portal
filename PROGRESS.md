@@ -11,7 +11,7 @@
 | 6 | Interview engine with stages + memory | ✅ done | `v0.6-engine` |
 | 7 | Structured JSON LLM output | ✅ done | `v0.7-structured` |
 | 8 | Deepgram streaming upgrade | ✅ done | `v0.8-streaming` |
-| 9 | FastAPI wrap + browser mic | ⚪ not started | `v0.9-api` |
+| 9 | FastAPI wrap + browser mic | ✅ done | `v0.9-api` |
 | 10 | Frontend | ⚪ not started | `v1.0-ui` |
 
 ## Decisions log
