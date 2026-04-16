@@ -44,7 +44,9 @@ that watches the camera, the keyboard, and the tab.
 13. [Resume parser](#resume-parser)
 14. [Database schema](#database-schema)
 15. [HTTP / WebSocket API](#http--websocket-api)
-16. [Performance notes](#performance-notes)
+16. [Streaming, personas, memory, dashboard](#streaming-personas-memory-dashboard)
+17. [Performance notes](#performance-notes)
+18. [Roadmap — what's next and why](#roadmap--whats-next-and-why)
 
 ---
 
@@ -547,6 +549,136 @@ Password hashing uses a random 16-byte salt with SHA-256 → stored as
 
 ---
 
+## Streaming, personas, memory, dashboard
+
+This release adds four features that make the system feel like a real-time
+conversation rather than a request/response form.
+
+### 1. SSE streaming — spoken reply begins on the first token
+
+Two new endpoints return Server-Sent Events:
+
+```
+POST /api/session/:id/turn-stream          (text in → SSE reply)
+POST /api/session/:id/audio-turn-stream    (audio in → SSE transcript + reply)
+```
+
+Each emits three kinds of events:
+
+```
+event: transcript     # audio only: STT result so the UI can render the user line
+data: {"text": "..."}
+
+event: token          # one per LLM delta
+data: {"text": " how"}
+
+event: done
+data: {"stage": "technical", "total_turns": 4, "is_finished": false}
+```
+
+The frontend consumer (`consumeSSE` in `app.js`) accumulates tokens into the
+assistant bubble and feeds *completed sentences* to the Web Speech API as
+they become available. Result: the interviewer starts speaking ~200 ms
+after the candidate stops, instead of waiting 1–3 s for the full reply.
+
+Scoring is decoupled. After the SSE response is fully flushed, the server
+schedules a background task (`asyncio.create_task`) that runs
+`session.score_last_turn()` — a heavier structured-JSON call to the 70b
+model. Results land in `session.evaluations` a second or two later and are
+picked up by the next `/evaluations` poll.
+
+### 2. Interruption handling (barge-in)
+
+The VAD loop keeps running while the interviewer is talking. If the
+candidate produces sustained speech (>350 ms above threshold) during the
+interviewer's turn, `interruptInterviewer()` is called:
+
+- aborts the in-flight SSE fetch (`AbortController.abort()`),
+- cancels `speechSynthesis` and drops the sentence queue,
+- clears `vad.interviewerSpeaking`,
+- records an `interruption` entry on the anti-cheat log (not a violation
+  — just an observability signal).
+
+The candidate's utterance then becomes the next turn via the normal VAD
+path, so "wait, can you repeat that?" works naturally.
+
+### 3. Interviewer personas
+
+Three system-prompt variants, selectable on the setup screen:
+
+| Persona        | Tone / style                                                    |
+|----------------|-----------------------------------------------------------------|
+| `mentor`       | Warm, patient, positive acknowledgement before deeper follow-ups. Good for juniors. |
+| `senior`       | Terse, rigorous, cuts off rambling, pulls back to numbers and p99s. |
+| `cto`          | Ties every technical question to business impact and trade-offs. |
+
+Defined in `backend/llm/streaming.py::PERSONAS`. Passed at session
+creation via `POST /api/session {"persona": "mentor"}`.
+
+### 4. Cross-turn claim memory
+
+The scoring response includes an `extracted_claims` list — up to three
+concrete factual statements the candidate made (e.g. "worked on Kafka
+pipeline at Flipkart handling 200k events/sec"). These accumulate on
+`InterviewSession.key_claims` and are injected into every subsequent
+system prompt:
+
+```
+Key claims the candidate has made earlier in this interview
+(use these to check consistency and drill into specifics):
+- worked on Kafka pipeline at Flipkart handling 200k events/sec
+- used Redis as a write-through cache with 1-hour TTL
+- led a team of 5 on the migration from MySQL to Postgres
+```
+
+This is a lightweight alternative to a full vector DB — it gives the
+interviewer persistent memory across the entire session, even past the
+8-turn sliding history window. Recorder's note in the *Roadmap* below:
+the proper fix at scale is Chroma or Pinecone.
+
+### 5. Adaptive probing on vague answers
+
+The scorer emits a `meta.is_vague` flag; we also auto-flag any answer
+whose `depth` score is ≤ 3. When the flag is set on turn N, the system
+prompt for turn N+1 contains:
+
+> IMPORTANT: the candidate's last answer was vague or surface-level. DO
+> NOT move on. Ask a sharper follow-up on the SAME topic demanding
+> specifics — numbers, names, a concrete example, or a failure mode they hit.
+
+So "I used PyTorch for a project" no longer gets a polite move-on; it
+gets "which loss function, and why over cross-entropy in that specific
+case?".
+
+### 6. Recruiter X-ray dashboard
+
+The end-of-interview results screen renders:
+
+- **Skill radar** — SVG polygon of the four rubric dimensions averaged
+  across turns.
+- **Score timeline** — per-turn line chart, dot color = AI-likelihood
+  flag (red when > 0.5).
+- **AI-answer similarity** — horizontal bar showing mean likelihood.
+- **Integrity flag histogram** — one bar per violation type
+  (`tab_switch`, `phone_suspected`, `face_absent`, …) sized by count.
+- **Turn-by-turn detail** — strengths, weaknesses, per-dimension scores.
+
+All charts are hand-rolled inline SVG — no chart-library dependency.
+
+### 7. Face-presence tracking
+
+Added to `anticheat.js`. During the first ~10 samples we calibrate a
+baseline center-region luminance variance (faces have edges; empty
+frames don't). Sustained drop below 40% of baseline for 4 consecutive
+frames → `face_absent` violation + warning banner.
+
+This is intentionally *simpler* than full eye tracking (see Roadmap for
+the WebGazer.js upgrade path) — it catches the big case of the
+candidate leaving the seat or turning their head toward a second screen
+without adding a 4 MB ML dependency.
+
+---
+
 ## Performance notes
 
 End-to-end turn latency, voice path, measured on a typical WSL2 dev box:
@@ -563,10 +695,60 @@ End-to-end turn latency, voice path, measured on a typical WSL2 dev box:
 Total with `USE_SERVER_TTS=0`: ~2.3–4.2 s from the moment the candidate
 stops speaking to the moment the interviewer starts replying.
 
+With the SSE path enabled (default for both text and voice turns),
+time-to-first-spoken-word drops to ~200–400 ms after the last byte of
+audio/text arrives at the server. The rest of the reply streams behind
+it, and scoring happens out-of-band.
+
 Knobs to turn if a turn still feels slow:
 - Shrink `VAD_SILENCE_MS` (default 1400 ms) — but watch for the system
   submitting half-finished thoughts.
 - Move more stages onto `GROQ_FAST_MODEL` in `structured.py`.
-- Keep `USE_SERVER_TTS=0` unless voice quality is required.
+- Keep `USE_SERVER_TTS=0` unless voice quality is required — browser
+  Web Speech is zero-latency and speaks sentence-by-sentence during
+  streaming.
 - Reduce the history window (`structured.py` currently keeps the last 8
   messages). Going below 6 starts to cost continuity.
+
+---
+
+## Roadmap — what's next and why
+
+The items below are intentionally *not* implemented yet — each is a real
+engineering project, not a one-session change. Listed here with a
+pragmatic estimate so the scope is honest.
+
+### Cognitive upgrades
+
+| Feature | Value | Why not yet |
+|---------|-------|-------------|
+| **Vector DB memory (Chroma / Pinecone)** | Exact similarity recall across a 1-hour interview, not just the 15-claim scratchpad we ship now. | Needs a running Chroma service + embeddings call per turn (~$0.0001 each). Current claim-memory is 80% of the benefit at 1% of the complexity. Swap-in target: `backend/interview/memory.py` — keep the current claim list as L1, add Chroma as L2. |
+| **Multi-model federated scoring** | Cross-check Llama-70b's verdict with DeepSeek-Coder and GPT-4o; disagreement = flag for human review. | 3x the token cost per turn. Better unlocked behind a "senior role" flag so we pay the cost only where it matters. |
+| **Agentic evaluation (3-model debate)** | Three scorers argue their grade; the transcript of the debate becomes part of the report. | Same cost concern + ~4 s extra latency. Fits as an end-of-interview batch job, not per-turn. |
+| **Head-pose + eye tracking (WebGazer.js)** | Detect candidate's gaze drifting off-screen toward a second monitor. | Adds a 4 MB CDN dep and requires a per-user calibration step. Our brightness-variance tracker catches the gross case (face gone) — gaze-level tracking is a phase-2 upgrade. |
+| **Vision-capable LLM (GPT-4o / Gemini 1.5 Pro)** | Actually *watch* the candidate: body language, whispering, a second person in frame. | ~10x cost per turn. Best used as a once-per-minute batch sample, not every frame. |
+
+### Technical assessment
+
+| Feature | Value | Why not yet |
+|---------|-------|-------------|
+| **Monaco editor + sandbox execution** | Real coding interview with the AI watching the candidate type, flagging O(n²) loops live. | A secure code sandbox is its own subsystem (Firecracker / gVisor). Slotting the editor UI in is easy; making code execution safe is the work. |
+| **Real-time whiteboarding** | Candidates draw architectures; CV parses the diagram into a graph the LLM can reason about. | Requires either a dedicated diagram parser or a multimodal LLM call per stroke. Belongs with the vision-LLM item. |
+| **Code "execution sentiment"** | Big-O estimate + style lint + voice-over feedback like a pair programmer. | Cheap if we skip execution, just static analysis. Will ship with the Monaco editor. |
+
+### Infra / scale
+
+| Feature | Value | Why not yet |
+|---------|-------|-------------|
+| **Rust / Go audio layer** | Python's GIL caps us around a few dozen concurrent streams. Rust can take that to thousands at ~40% lower server cost. | Only worth the migration cost once we actually hit the GIL ceiling. The current WebSocket STT design is GIL-friendly enough for now. |
+| **On-device VAD (WASM / silero-vad)** | Server stops receiving silence bytes entirely. Saves bandwidth and STT cost. | Our Web-Audio RMS VAD is already on-device; silero would be more accurate in noisy rooms but adds 2 MB of WASM. Worth the upgrade if false-positive barge-ins become an issue. |
+| **Salary / seniority prediction** | Cross-reference scores against market data (Bengaluru / SF / remote) to predict band + retention. | Needs a labeled dataset we don't have. Deferred to after real customer usage. |
+
+### What the current build prioritizes
+
+We picked streaming + barge-in + personas + claim-memory + adaptive
+probing + face-presence + the recruiter dashboard because they are the
+changes that the candidate *feels* inside a single interview. The
+infra and multi-model items above are worth the work only once we have
+enough load to justify them.
+

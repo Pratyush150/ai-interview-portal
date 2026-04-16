@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from backend.llm.structured import ask_llm_structured, InterviewResponse
+from backend.llm.streaming import stream_spoken_reply, score_answer_blocking, DEFAULT_PERSONA, PERSONAS
 from backend.ai_detection import analyze_answer
 
 load_dotenv()
@@ -134,6 +135,16 @@ class InterviewSession:
     job_description: str = ""
     cheating_flags: list[dict] = field(default_factory=list)
     asked_topics: list[str] = field(default_factory=list)  # track covered topics
+    # Long-term memory: claims the candidate has made in earlier turns.
+    # Injected into every subsequent system prompt so the interviewer can
+    # reference specifics and check consistency far beyond the 8-turn
+    # sliding history window.
+    key_claims: list[str] = field(default_factory=list)
+    # Persona drives the interviewer's tone (mentor / senior / cto).
+    persona: str = DEFAULT_PERSONA
+    # True when the last answer was judged vague; next turn will drill
+    # deeper rather than moving on.
+    last_answer_was_vague: bool = False
 
     @property
     def is_finished(self) -> bool:
@@ -293,6 +304,137 @@ class InterviewSession:
 
         return resp
 
+    # ------------------------------------------------------------------
+    # Streaming path: fast spoken reply + background scoring.
+    # ------------------------------------------------------------------
+
+    def turn_stream(self, user_text: str):
+        """Yield tokens of the spoken reply. The scoring call must be
+        scheduled separately by the caller once the reply is complete
+        (see ``score_last_turn``).
+        """
+        if self.is_finished:
+            yield "The interview has concluded. Thank you for participating!"
+            return
+
+        token_buffer: list[str] = []
+        for tok in stream_spoken_reply(
+            user_text,
+            stage=self.stage.value,
+            persona=self.persona,
+            history=self.history,
+            resume_context=self.resume_context,
+            job_context=self._job_context(),
+            asked_topics=self.asked_topics,
+            key_claims=self.key_claims,
+            vague_last_answer=self.last_answer_was_vague,
+        ):
+            token_buffer.append(tok)
+            yield tok
+
+        reply = "".join(token_buffer).strip()
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": reply})
+        self.stage_turn_count += 1
+        self.total_turns += 1
+        # Stash the pending pair so the scoring task can read it after
+        # the SSE response has been fully sent.
+        self._pending_scoring = {"user_text": user_text, "reply": reply}
+        if self._should_advance():
+            self._advance_stage()
+
+    def score_last_turn(self, time_to_respond_ms: int = 0, is_voice_input: bool = False):
+        """Runs the heavier structured evaluation call on the turn most
+        recently produced by ``turn_stream``. Safe to call in a
+        background thread/task — mutates ``self.evaluations`` and
+        ``self.key_claims`` when done.
+        """
+        pending = getattr(self, "_pending_scoring", None)
+        if not pending:
+            return
+        self._pending_scoring = None
+
+        user_text = pending["user_text"]
+        reply = pending["reply"]
+
+        data = score_answer_blocking(
+            user_text,
+            reply,
+            stage=self.stage.value,
+            resume_context=self.resume_context,
+            job_context=self._job_context(),
+        )
+        if not data:
+            return
+
+        evaluation = data.get("evaluation", {}) or {}
+        meta = data.get("meta", {}) or {}
+        ai_det = data.get("ai_detection", {}) or {}
+        claims = data.get("extracted_claims", []) or []
+
+        # Heuristic AI detection (same guard as turn_structured).
+        heuristic = analyze_answer(user_text, time_to_respond_ms, is_voice_input)
+        llm_ai = float(ai_det.get("ai_likelihood", 0.0) or 0.0)
+        if not heuristic.confident:
+            combined_ai = 0.0
+        else:
+            blended = 0.5 * heuristic.likelihood + 0.5 * llm_ai
+            if heuristic.likelihood < 0.2 and llm_ai < 0.4:
+                blended *= 0.3
+            combined_ai = round(blended, 2)
+
+        # Compute final score from dimensions.
+        dims = [evaluation.get(d) for d in ("correctness", "depth", "communication", "relevance")]
+        valid_dims = [d for d in dims if d is not None]
+        score = round(sum(valid_dims) / len(valid_dims), 1) if valid_dims else None
+
+        if score is not None:
+            adjusted = score
+            if combined_ai > 0.7:
+                adjusted = round(score * 0.7, 1)
+            elif combined_ai > 0.5:
+                adjusted = round(score * 0.85, 1)
+
+            self.evaluations.append({
+                "turn": self.total_turns,
+                "stage": self.stage.value,
+                "score": adjusted,
+                "original_score": score,
+                "correctness": evaluation.get("correctness"),
+                "depth": evaluation.get("depth"),
+                "communication": evaluation.get("communication"),
+                "relevance": evaluation.get("relevance"),
+                "topic": meta.get("topic", ""),
+                "strengths": evaluation.get("strengths", []),
+                "weaknesses": evaluation.get("weaknesses", []),
+                "notes": evaluation.get("notes", ""),
+                "ai_likelihood": combined_ai,
+                "ai_signals": heuristic.signals,
+            })
+
+        topic = meta.get("topic", "")
+        if topic and topic not in self.asked_topics:
+            self.asked_topics.append(topic)
+
+        # Claim memory: LLM-extracted facts the candidate stated. Used to
+        # inject long-term context into future system prompts so the
+        # interviewer can reference specifics even after the sliding
+        # history window drops them.
+        for c in claims[:3]:
+            c = str(c).strip()
+            if c and c not in self.key_claims:
+                self.key_claims.append(c)
+
+        # Adaptive probing: was the last answer vague / surface-level?
+        # Trigger when the LLM says so OR when depth / communication are
+        # very low. Next turn's system prompt will force a drill-down.
+        is_vague = bool(meta.get("is_vague"))
+        if score is not None:
+            depth = evaluation.get("depth") or 0
+            if depth and depth <= 3:
+                is_vague = True
+        self.last_answer_was_vague = is_vague
+
     def add_cheating_flag(self, violation: dict):
         self.cheating_flags.append(violation)
 
@@ -311,4 +453,10 @@ class InterviewSession:
             "avg_ai_likelihood": round(sum(ai_scores) / len(ai_scores), 2) if ai_scores else None,
             "cheating_flags_count": len(self.cheating_flags),
             "topics_covered": self.asked_topics,
+            "persona": self.persona,
+            "key_claims_count": len(self.key_claims),
         }
+
+    def set_persona(self, persona: str) -> None:
+        if persona in PERSONAS:
+            self.persona = persona

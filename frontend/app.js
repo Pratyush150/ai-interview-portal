@@ -92,6 +92,12 @@ if (navTabs) {
 }
 
 // --- API helpers ---
+// Track the currently-streaming turn so VAD can cancel it on barge-in.
+let currentStreamCtrl = null;
+let currentAssistantContent = null;  // DOM node to append tokens to
+let currentSpeechSentences = [];     // sentences still waiting to be spoken
+let currentSpeechBuffer = '';        // unflushed token stream
+
 async function apiPost(path, body, authToken) {
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
@@ -426,11 +432,13 @@ if (resumeUpload) {
 async function startSession() {
     const name = candidateName.value.trim() || null;
     const structured = useStructured.checked;
+    const personaEl = document.getElementById('persona-select');
+    const persona = personaEl ? personaEl.value : null;
     startBtn.disabled = true;
     startBtn.textContent = 'Starting...';
     try {
         const data = await apiPost('/api/session', {
-            candidate_name: name, use_structured: structured, resume_id: resumeId, job_id: jobId,
+            candidate_name: name, use_structured: structured, resume_id: resumeId, job_id: jobId, persona,
         });
         sessionId = data.session_id;
         updateStatus(data.stage, data.total_turns, data.avg_score);
@@ -442,7 +450,7 @@ async function startSession() {
         // Kick off always-on mic. The VAD loop auto-pauses while the
         // interviewer is speaking so the greeting won't be captured.
         startVAD();
-        await sendTextTurn('Hello, I am ready for the interview.');
+        await streamTextTurn('Hello, I am ready for the interview.');
     } catch (err) {
         alert('Failed to start session: ' + err.message);
     } finally {
@@ -487,49 +495,162 @@ async function showResults() {
             apiGet(`/api/session/${sessionId}`),
             apiGet(`/api/session/${sessionId}/evaluations`),
         ]);
-        let html = '';
-        if (evals.avg_score != null) {
-            html += `<div class="score-big">${evals.avg_score.toFixed(1)}/10</div>`;
-        }
-        if (evals.avg_ai_likelihood != null && evals.avg_ai_likelihood > 0) {
-            const aiPct = (evals.avg_ai_likelihood * 100).toFixed(0);
-            const aiColor = evals.avg_ai_likelihood > 0.5 ? 'var(--danger)' : evals.avg_ai_likelihood > 0.3 ? 'var(--warning)' : 'var(--success)';
-            html += `<div class="result-row"><span class="result-label">AI Detection</span><span class="result-value" style="color:${aiColor}">${aiPct}% likelihood</span></div>`;
-        }
-        if (evals.cheating_flags_count > 0) {
-            html += `<div class="result-row"><span class="result-label">Integrity Flags</span><span class="result-value" style="color:var(--warning)">${evals.cheating_flags_count} violations</span></div>`;
-        }
-        html += `
-            <div class="result-row"><span class="result-label">Total Turns</span><span class="result-value">${session.total_turns}</span></div>
-            <div class="result-row"><span class="result-label">Final Stage</span><span class="result-value">${session.stage}</span></div>
-            <div class="result-row"><span class="result-label">Evaluations</span><span class="result-value">${session.evaluations_count}</span></div>
-        `;
-        if (evals.evaluations && evals.evaluations.length > 0) {
-            html += '<h3 style="margin-top:1.5rem;margin-bottom:0.5rem">Turn-by-Turn Evaluation</h3>';
-            evals.evaluations.forEach((e) => {
-                const aiFlag = e.ai_likelihood > 0.5 ? ' [AI suspected]' : '';
-                html += `<div class="result-row">
-                    <span class="result-label">Turn ${e.turn} (${e.stage})${aiFlag}</span>
-                    <span class="result-value">${e.score}/10</span>
-                </div>`;
-                if (e.correctness != null) {
-                    html += `<div style="font-size:0.75rem;color:var(--text-muted);padding-left:1rem">
-                        C:${e.correctness} D:${e.depth} Cm:${e.communication} R:${e.relevance}</div>`;
-                }
-                if (e.strengths && e.strengths.length) {
-                    html += `<div style="color:var(--success);font-size:0.8rem;padding-left:1rem">+ ${e.strengths.join(', ')}</div>`;
-                }
-                if (e.weaknesses && e.weaknesses.length) {
-                    html += `<div style="color:var(--warning);font-size:0.8rem;padding-left:1rem">- ${e.weaknesses.join(', ')}</div>`;
-                }
-            });
-        }
-        resultsSummary.innerHTML = html;
+        resultsSummary.innerHTML = renderXrayDashboard(session, evals);
         showScreen(resultsScreen);
     } catch (err) {
         resultsSummary.innerHTML = '<p>Interview complete. Could not load detailed results.</p>';
         showScreen(resultsScreen);
     }
+}
+
+// Recruiter X-ray dashboard — SVG radar of rubric dimensions, per-turn
+// score timeline, AI-similarity summary, cheating-flag breakdown.
+function renderXrayDashboard(session, evals) {
+    const items = (evals.evaluations || []).filter(e => e.score != null);
+    const avg = (key) => {
+        const v = items.map(e => e[key]).filter(x => x != null);
+        return v.length ? (v.reduce((a, b) => a + b, 0) / v.length) : 0;
+    };
+    const dims = {
+        Correctness:   avg('correctness'),
+        Depth:         avg('depth'),
+        Communication: avg('communication'),
+        Relevance:     avg('relevance'),
+    };
+
+    let html = '';
+    if (evals.avg_score != null) {
+        html += `<div class="score-big">${evals.avg_score.toFixed(1)}/10</div>`;
+    }
+
+    // --- Radar chart ---
+    if (items.length > 0) {
+        html += `<h3 class="xray-h">Skill Radar</h3>`;
+        html += radarSVG(dims);
+    }
+
+    // --- Per-turn score timeline ---
+    if (items.length > 1) {
+        html += `<h3 class="xray-h">Score Timeline</h3>`;
+        html += timelineSVG(items);
+    }
+
+    // --- AI-similarity summary ---
+    if (evals.avg_ai_likelihood != null && evals.avg_ai_likelihood > 0) {
+        const pct = (evals.avg_ai_likelihood * 100).toFixed(0);
+        const color = evals.avg_ai_likelihood > 0.5 ? 'var(--danger)'
+                    : evals.avg_ai_likelihood > 0.3 ? 'var(--warning)'
+                    : 'var(--success)';
+        html += `<h3 class="xray-h">AI-Answer Similarity</h3>
+                 <div class="xray-bar" style="background:linear-gradient(to right, ${color} ${pct}%, var(--surface-hover) ${pct}%)">
+                   <span>${pct}% — average likelihood this candidate used an AI assistant</span>
+                 </div>`;
+    }
+
+    // --- Cheating flag breakdown ---
+    if (evals.cheating_flags && evals.cheating_flags.length) {
+        const counts = {};
+        evals.cheating_flags.forEach(f => { counts[f.type] = (counts[f.type] || 0) + 1; });
+        const max = Math.max(...Object.values(counts));
+        html += `<h3 class="xray-h">Integrity Flags (${evals.cheating_flags.length})</h3><div class="xray-flags">`;
+        for (const [type, n] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
+            const w = (n / max * 100).toFixed(0);
+            html += `<div class="xray-flag-row">
+                       <span class="xray-flag-label">${type.replace(/_/g, ' ')}</span>
+                       <div class="xray-flag-bar"><div style="width:${w}%"></div></div>
+                       <span class="xray-flag-count">${n}</span>
+                     </div>`;
+        }
+        html += '</div>';
+    }
+
+    // --- Stats row ---
+    html += `
+        <div class="result-row"><span class="result-label">Total Turns</span><span class="result-value">${session.total_turns}</span></div>
+        <div class="result-row"><span class="result-label">Final Stage</span><span class="result-value">${session.stage}</span></div>
+        <div class="result-row"><span class="result-label">Persona</span><span class="result-value">${session.persona || '—'}</span></div>
+        <div class="result-row"><span class="result-label">Long-term claims captured</span><span class="result-value">${session.key_claims_count || 0}</span></div>
+    `;
+
+    // --- Turn-by-turn detail ---
+    if (items.length) {
+        html += '<h3 class="xray-h">Turn-by-turn detail</h3>';
+        items.forEach((e) => {
+            const aiFlag = e.ai_likelihood > 0.5 ? ' <span style="color:var(--danger)">[AI suspected]</span>' : '';
+            html += `<div class="result-row">
+                <span class="result-label">Turn ${e.turn} · ${e.stage}${e.topic ? ' · ' + e.topic : ''}${aiFlag}</span>
+                <span class="result-value">${e.score}/10</span>
+            </div>`;
+            if (e.correctness != null) {
+                html += `<div class="xray-dim-row">C:${e.correctness} D:${e.depth} Cm:${e.communication} R:${e.relevance}</div>`;
+            }
+            if (e.strengths && e.strengths.length) {
+                html += `<div class="xray-strength">+ ${e.strengths.join(', ')}</div>`;
+            }
+            if (e.weaknesses && e.weaknesses.length) {
+                html += `<div class="xray-weakness">- ${e.weaknesses.join(', ')}</div>`;
+            }
+        });
+    }
+
+    return html;
+}
+
+function radarSVG(dims) {
+    const labels = Object.keys(dims);
+    const values = Object.values(dims);
+    const N = labels.length;
+    const cx = 150, cy = 140, R = 100;
+    const point = (i, r) => {
+        const a = -Math.PI / 2 + (i * 2 * Math.PI / N);
+        return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+    };
+    // Grid rings at 2/4/6/8/10
+    let grid = '';
+    for (let ring = 2; ring <= 10; ring += 2) {
+        const pts = labels.map((_, i) => point(i, R * ring / 10).join(',')).join(' ');
+        grid += `<polygon points="${pts}" fill="none" stroke="var(--border)" stroke-width="1" />`;
+    }
+    // Axes + labels
+    let axes = '';
+    labels.forEach((lbl, i) => {
+        const [x, y] = point(i, R);
+        axes += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="var(--border)" stroke-width="1"/>`;
+        const [lx, ly] = point(i, R + 18);
+        axes += `<text x="${lx}" y="${ly}" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="var(--text-muted)">${lbl} ${values[i].toFixed(1)}</text>`;
+    });
+    // Data polygon
+    const poly = values.map((v, i) => point(i, R * v / 10).join(',')).join(' ');
+    return `<svg viewBox="0 0 300 280" class="xray-svg" xmlns="http://www.w3.org/2000/svg">
+              ${grid}${axes}
+              <polygon points="${poly}" fill="var(--primary)" fill-opacity="0.25" stroke="var(--primary)" stroke-width="2"/>
+            </svg>`;
+}
+
+function timelineSVG(items) {
+    const W = 300, H = 120, pad = 24;
+    const n = items.length;
+    const xs = (i) => pad + (i * (W - 2 * pad) / Math.max(n - 1, 1));
+    const ys = (v) => H - pad - (v / 10) * (H - 2 * pad);
+    let grid = '';
+    for (let g = 0; g <= 10; g += 2) {
+        const y = ys(g);
+        grid += `<line x1="${pad}" y1="${y}" x2="${W - pad}" y2="${y}" stroke="var(--border)" stroke-width="0.5"/>`;
+        grid += `<text x="4" y="${y + 3}" font-size="9" fill="var(--text-muted)">${g}</text>`;
+    }
+    let path = '';
+    let dots = '';
+    items.forEach((e, i) => {
+        const x = xs(i), y = ys(e.score);
+        path += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
+        const color = e.ai_likelihood > 0.5 ? 'var(--danger)' : 'var(--primary)';
+        dots += `<circle cx="${x}" cy="${y}" r="3.5" fill="${color}"><title>Turn ${e.turn}: ${e.score}/10</title></circle>`;
+    });
+    return `<svg viewBox="0 0 ${W} ${H}" class="xray-svg" xmlns="http://www.w3.org/2000/svg">
+              ${grid}
+              <path d="${path}" fill="none" stroke="var(--primary)" stroke-width="1.5"/>
+              ${dots}
+            </svg>`;
 }
 
 // --- Always-on mic with Voice Activity Detection ---
@@ -570,6 +691,7 @@ async function startVAD() {
 
 function vadLoop() {
     const buf = new Float32Array(vad.analyser.fftSize);
+    let bargeInStart = 0;
     const tick = () => {
         if (!vad.audioCtx) return;
         vad.analyser.getFloatTimeDomainData(buf);
@@ -578,8 +700,26 @@ function vadLoop() {
         const rms = Math.sqrt(sum / buf.length);
         const now = performance.now();
 
-        const blocked = vad.muted || vad.processing || vad.interviewerSpeaking;
         const above = rms > VAD_RMS_THRESHOLD;
+
+        // Barge-in: if the candidate sustains speech while the interviewer
+        // is talking, cut off the interviewer immediately. We require ~350 ms
+        // of sustained energy so brief acknowledgement noises don't trigger.
+        if (vad.interviewerSpeaking && !vad.muted) {
+            if (above) {
+                if (!bargeInStart) bargeInStart = now;
+                else if (now - bargeInStart > 350) {
+                    interruptInterviewer();
+                    bargeInStart = 0;
+                }
+            } else {
+                bargeInStart = 0;
+            }
+        } else {
+            bargeInStart = 0;
+        }
+
+        const blocked = vad.muted || vad.processing || vad.interviewerSpeaking;
 
         if (!blocked) {
             if (above) {
@@ -671,32 +811,219 @@ function stopVAD() {
 
 async function sendAudioAsFile(blob) {
     if (!sessionId || !blob || blob.size < 2000) return; // guard empty/tiny blobs
+    await streamAudioTurn(blob);
+}
+
+// --- Streaming turn consumers ---
+//
+// Both text and audio paths converge on consumeSSE(). Tokens arrive on
+// event: token, the transcript (voice only) on event: transcript, and the
+// final status on event: done. We feed complete sentences to the Web
+// Speech API as they become available so the interviewer starts
+// speaking ~200 ms after the candidate stops.
+
+async function streamTextTurn(text) {
+    if (!sessionId || !text.trim()) return;
+    const isGreeting = text === 'Hello, I am ready for the interview.';
+    if (!isGreeting) addMessage('user', text);
+    textInput.value = '';
+    setMicState('processing');
+    const responseTime = questionShownAt ? Date.now() - questionShownAt : 0;
+    try {
+        const ctrl = new AbortController();
+        currentStreamCtrl = ctrl;
+        const res = await fetch(`${API}/api/session/${sessionId}/turn-stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, time_to_respond_ms: responseTime, is_voice_input: false }),
+            signal: ctrl.signal,
+        });
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        await consumeSSE(res);
+    } catch (err) {
+        if (err.name !== 'AbortError') addMessage('assistant', 'Error: ' + err.message);
+    } finally {
+        currentStreamCtrl = null;
+        setMicState(vad.audioCtx && !vad.muted ? 'listening' : 'idle');
+        pollEvaluations();
+    }
+}
+
+async function streamAudioTurn(blob) {
     vad.processing = true;
     setMicState('processing');
     try {
         const formData = new FormData();
         formData.append('audio', blob, 'recording.webm');
-        const res = await fetch(`${API}/api/session/${sessionId}/audio-turn`, { method: 'POST', body: formData });
-        if (!res.ok) {
-            const detail = await res.text();
-            throw new Error(`${res.status}: ${detail}`);
-        }
-        const data = await res.json();
-        addMessage('user', '[voice input]');
-        updateStatus(data.stage, data.total_turns, null);
-        addMessage('assistant', data.reply, data.audio_url);
-        try {
-            const evalData = await apiGet(`/api/session/${sessionId}/evaluations`);
-            avgScore.textContent = evalData.avg_score != null ? evalData.avg_score.toFixed(1) : '--';
-        } catch (_) {}
-        if (data.is_finished) { showResults(); return; }
+        const ctrl = new AbortController();
+        currentStreamCtrl = ctrl;
+        const res = await fetch(`${API}/api/session/${sessionId}/audio-turn-stream`, {
+            method: 'POST',
+            body: formData,
+            signal: ctrl.signal,
+        });
+        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+        await consumeSSE(res);
     } catch (err) {
-        addMessage('assistant', 'Error: ' + err.message);
+        if (err.name !== 'AbortError') addMessage('assistant', 'Error: ' + err.message);
     } finally {
+        currentStreamCtrl = null;
         vad.processing = false;
         if (vad.audioCtx && !vad.muted) setMicState('listening');
         else setMicState('idle');
+        pollEvaluations();
     }
+}
+
+async function pollEvaluations() {
+    if (!sessionId) return;
+    try {
+        const evalData = await apiGet(`/api/session/${sessionId}/evaluations`);
+        avgScore.textContent = evalData.avg_score != null ? evalData.avg_score.toFixed(1) : '--';
+    } catch (_) {}
+}
+
+async function consumeSSE(res) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let userMsgShown = false;
+    let doneStatus = null;
+
+    beginStreamingAssistantMessage();
+
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE messages (double-newline separated)
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            const raw = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            const evt = parseSSEBlock(raw);
+            if (!evt) continue;
+            if (evt.event === 'transcript' && !userMsgShown) {
+                addMessage('user', evt.data.text || '[voice input]');
+                userMsgShown = true;
+            } else if (evt.event === 'token') {
+                appendStreamToken(evt.data.text || '');
+            } else if (evt.event === 'done') {
+                doneStatus = evt.data;
+            } else if (evt.event === 'error') {
+                appendStreamToken('\n[error: ' + (evt.data._error || 'unknown') + ']');
+            }
+        }
+    }
+    finishStreamingAssistantMessage();
+    if (doneStatus) {
+        updateStatus(doneStatus.stage, doneStatus.total_turns, null);
+        if (doneStatus.is_finished) { setTimeout(showResults, 2000); }
+    }
+}
+
+function parseSSEBlock(raw) {
+    const lines = raw.split('\n');
+    let event = 'message';
+    const dataLines = [];
+    for (const line of lines) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length === 0) return null;
+    try { return { event, data: JSON.parse(dataLines.join('\n')) }; }
+    catch (_) { return null; }
+}
+
+function beginStreamingAssistantMessage() {
+    const div = document.createElement('div');
+    div.className = 'message assistant';
+    const sender = document.createElement('div');
+    sender.className = 'sender';
+    sender.textContent = 'Interviewer';
+    div.appendChild(sender);
+    const content = document.createElement('div');
+    div.appendChild(content);
+    conversation.appendChild(div);
+    conversation.scrollTop = conversation.scrollHeight;
+
+    currentAssistantContent = content;
+    currentSpeechSentences = [];
+    currentSpeechBuffer = '';
+    vad.interviewerSpeaking = true;
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    speakingIndicator.classList.add('active');
+    questionShownAt = Date.now();
+}
+
+function appendStreamToken(tok) {
+    if (!currentAssistantContent) return;
+    currentAssistantContent.textContent += tok;
+    conversation.scrollTop = conversation.scrollHeight;
+    currentSpeechBuffer += tok;
+    // Flush complete sentences to TTS
+    const re = /[^.!?\n]+[.!?]+[\s]*/g;
+    let m;
+    let lastIdx = 0;
+    while ((m = re.exec(currentSpeechBuffer)) !== null) {
+        enqueueSpeech(m[0].trim());
+        lastIdx = re.lastIndex;
+    }
+    if (lastIdx > 0) currentSpeechBuffer = currentSpeechBuffer.slice(lastIdx);
+}
+
+function finishStreamingAssistantMessage() {
+    if (currentSpeechBuffer.trim()) enqueueSpeech(currentSpeechBuffer.trim());
+    currentSpeechBuffer = '';
+    currentAssistantContent = null;
+    // If the queue is empty and nothing is playing, clear the speaking flag.
+    if (!window.speechSynthesis || (!window.speechSynthesis.speaking && currentSpeechSentences.length === 0)) {
+        vad.interviewerSpeaking = false;
+        speakingIndicator.classList.remove('active');
+    }
+}
+
+function enqueueSpeech(sentence) {
+    if (!isSpeakerOn || !('speechSynthesis' in window) || !sentence) return;
+    currentSpeechSentences.push(sentence);
+    if (!window.speechSynthesis.speaking) playNextSentence();
+}
+
+function playNextSentence() {
+    if (currentSpeechSentences.length === 0) {
+        vad.interviewerSpeaking = false;
+        speakingIndicator.classList.remove('active');
+        return;
+    }
+    const text = currentSpeechSentences.shift();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.2;
+    u.pitch = 1.0;
+    const voices = window.speechSynthesis.getVoices();
+    const preferred = voices.find(v => v.name.includes('Google') && v.lang.startsWith('en'))
+                   || voices.find(v => v.lang.startsWith('en-US'))
+                   || voices.find(v => v.lang.startsWith('en'));
+    if (preferred) u.voice = preferred;
+    u.onend = () => playNextSentence();
+    u.onerror = () => playNextSentence();
+    window.speechSynthesis.speak(u);
+}
+
+// Called by the VAD loop when the candidate starts speaking over the
+// interviewer. Cancels the in-flight SSE request, drops the TTS queue,
+// clears the speaking flag, and logs the barge-in to anti-cheat.
+function interruptInterviewer() {
+    if (currentStreamCtrl) {
+        try { currentStreamCtrl.abort(); } catch (_) {}
+        currentStreamCtrl = null;
+    }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    currentSpeechSentences = [];
+    currentSpeechBuffer = '';
+    vad.interviewerSpeaking = false;
+    speakingIndicator.classList.remove('active');
+    if (antiCheat && antiCheat._record) antiCheat._record('interruption', {});
 }
 
 // --- Jobs ---
@@ -921,12 +1248,12 @@ speakerBtn.addEventListener('click', () => {
     if (!isSpeakerOn && window.speechSynthesis) window.speechSynthesis.cancel();
 });
 
-sendBtn.addEventListener('click', () => sendTextTurn(textInput.value));
+sendBtn.addEventListener('click', () => streamTextTurn(textInput.value));
 
 textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        sendTextTurn(textInput.value);
+        streamTextTurn(textInput.value);
     }
 });
 

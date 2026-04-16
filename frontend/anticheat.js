@@ -11,6 +11,7 @@ class AntiCheatMonitor {
         this.copyPasteCount = 0;
         this.motionWarnCount = 0;
         this.phoneWarnCount = 0;
+        this.faceAbsentWarnCount = 0;
         this.active = false;
         this._handlers = {};
         this._intervals = [];
@@ -21,6 +22,10 @@ class AntiCheatMonitor {
         this._highMotionStreak = 0;
         this._phoneStreak = 0;
         this._darkStreak = 0;
+        this._faceAbsentStreak = 0;
+        this._centerBaseline = null;   // calibrated brightness of face region
+        this._baselineSamples = 0;
+        this._lastFaceWarnAt = 0;
         this._lastMotionWarnAt = 0;
         this._lastPhoneWarnAt = 0;
         this._lastDarkWarnAt = 0;
@@ -79,6 +84,7 @@ class AntiCheatMonitor {
                 }
                 this._handlePhoneDetection(stats);
                 this._handleDarkFrame(stats);
+                this._handleFacePresence(stats);
                 this._prevFrame = frame;
             } catch (_) {}
         }, 600);
@@ -165,10 +171,14 @@ class AntiCheatMonitor {
     }
 
     _frameStats(data, W, H) {
-        // One pass: mean luminance + bright-pixel bounding box
+        // One pass: mean luminance + bright-pixel bounding box + center
+        // region luminance + center-region variance (face presence proxy).
+        const cx0 = Math.floor(W * 0.25), cx1 = Math.floor(W * 0.75);
+        const cy0 = Math.floor(H * 0.20), cy1 = Math.floor(H * 0.80);
         let sumLum = 0;
         let brightCount = 0;
         let minX = W, minY = H, maxX = -1, maxY = -1;
+        let centerSum = 0, centerCount = 0, centerSq = 0;
         for (let y = 0; y < H; y++) {
             for (let x = 0; x < W; x++) {
                 const i = (y * W + x) * 4;
@@ -181,19 +191,70 @@ class AntiCheatMonitor {
                     if (x > maxX) maxX = x;
                     if (y > maxY) maxY = y;
                 }
+                if (x >= cx0 && x < cx1 && y >= cy0 && y < cy1) {
+                    centerSum += lum;
+                    centerSq += lum * lum;
+                    centerCount++;
+                }
             }
         }
         const total = W * H;
         const avgBrightness = sumLum / total;
         const brightFraction = brightCount / total;
+        const centerMean = centerCount ? centerSum / centerCount : 0;
+        // Variance in the center region is a rough proxy for "is there
+        // content here?" — a face has edges so variance is high; an
+        // empty chair or wall is uniform, so variance drops.
+        const centerVar = centerCount ? (centerSq / centerCount) - (centerMean * centerMean) : 0;
         let brightBoxCoverage = 0;
         let brightBoxFillRatio = 0;
         if (maxX >= 0) {
             const boxArea = (maxX - minX + 1) * (maxY - minY + 1);
             brightBoxCoverage = boxArea / total;
-            brightBoxFillRatio = brightCount / boxArea; // how packed the box is
+            brightBoxFillRatio = brightCount / boxArea;
         }
-        return { avgBrightness, brightFraction, brightBoxCoverage, brightBoxFillRatio };
+        return {
+            avgBrightness, brightFraction, brightBoxCoverage, brightBoxFillRatio,
+            centerMean, centerVar,
+        };
+    }
+
+    // Face-presence heuristic. During the first ~10 samples we calibrate
+    // a baseline center-region variance (a face has edges and textures,
+    // so variance is elevated). After calibration, a sustained drop below
+    // 40% of baseline indicates the candidate has left the frame or is
+    // looking far off-camera.
+    _handleFacePresence(stats) {
+        if (this._baselineSamples < 10) {
+            this._centerBaseline = this._centerBaseline == null
+                ? stats.centerVar
+                : (this._centerBaseline * 0.7 + stats.centerVar * 0.3);
+            this._baselineSamples++;
+            return;
+        }
+        const ratio = this._centerBaseline > 0 ? stats.centerVar / this._centerBaseline : 1;
+        if (ratio < 0.4) {
+            this._faceAbsentStreak++;
+            if (this._faceAbsentStreak >= 4) {
+                this.faceAbsentWarnCount++;
+                this._record('face_absent', {
+                    center_var: Number(stats.centerVar.toFixed(1)),
+                    baseline: Number(this._centerBaseline.toFixed(1)),
+                    ratio: Number(ratio.toFixed(2)),
+                    count: this.faceAbsentWarnCount,
+                });
+                const now = Date.now();
+                if (now - this._lastFaceWarnAt > 10000) {
+                    this._lastFaceWarnAt = now;
+                    this._showWarning('Your face is not visible. Please stay centered in the frame and look at the camera.');
+                }
+                this._faceAbsentStreak = 0;
+            }
+        } else {
+            this._faceAbsentStreak = Math.max(0, this._faceAbsentStreak - 1);
+            // Slowly adapt baseline to lighting changes.
+            this._centerBaseline = this._centerBaseline * 0.98 + stats.centerVar * 0.02;
+        }
     }
 
     _frameDiff(a, b) {
@@ -365,6 +426,7 @@ class AntiCheatMonitor {
             copyPastes: this.copyPasteCount,
             motionWarnings: this.motionWarnCount,
             phoneWarnings: this.phoneWarnCount,
+            faceAbsentWarnings: this.faceAbsentWarnCount,
         };
     }
 
