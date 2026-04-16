@@ -1,5 +1,5 @@
 // AI Interview Portal — Phase 10 Frontend
-const API = window.location.origin;
+const API = (window.location.protocol === 'file:') ? 'http://localhost:8000' : window.location.origin;
 
 // DOM
 const setupScreen    = document.getElementById('setup-screen');
@@ -68,7 +68,7 @@ function addMessage(role, text, audioUrl) {
         player.className = 'audio-player';
         const audio = document.createElement('audio');
         audio.controls = true;
-        audio.src = audioUrl;
+        audio.src = audioUrl.startsWith('blob:') ? audioUrl : `${API}${audioUrl}`;
         player.appendChild(audio);
         div.appendChild(player);
         // Auto-play the interviewer's response
