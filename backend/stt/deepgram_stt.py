@@ -1,4 +1,4 @@
-"""Deepgram speech-to-text. File-based for prototype; streaming upgrade in Phase 8."""
+"""Deepgram speech-to-text — file-based (prerecorded). See deepgram_streaming.py for live WebSocket."""
 import os
 from pathlib import Path
 from dotenv import load_dotenv

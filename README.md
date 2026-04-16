@@ -40,6 +40,7 @@ python tests/smoke_stt.py              # Deepgram → transcript
 python tests/smoke_pipeline.py         # Full STT → LLM → TTS pipeline
 python tests/smoke_engine.py           # Interview engine stages + memory
 python tests/smoke_structured.py       # Structured JSON LLM output + scoring
+python tests/smoke_streaming.py        # Deepgram real-time streaming STT
 ```
 
 ## Interview mode (text, Phase 6+)
@@ -56,12 +57,14 @@ See [PROGRESS.md](PROGRESS.md) for phase tracker.
 
 ```
 backend/
-  stt/deepgram_stt.py      # Phase 2
-  tts/elevenlabs_tts.py    # Phase 3
-  llm/groq_client.py       # Phase 4
-  interview/engine.py      # Phase 6
-  main.py                  # Phase 5 pipeline
+  stt/deepgram_stt.py        # Phase 2 — file-based STT
+  stt/deepgram_streaming.py  # Phase 8 — real-time streaming STT
+  tts/elevenlabs_tts.py      # Phase 3
+  llm/groq_client.py         # Phase 4
+  llm/structured.py          # Phase 7 — JSON structured output
+  interview/engine.py        # Phase 6 — interview state machine
+  main.py                    # Phase 5 pipeline + interview mode
 tests/
-  smoke_*.py               # one per service
-  audio/                   # test .wav files
+  smoke_*.py                 # one per service
+  audio/                     # test .wav files
 ```
