@@ -135,18 +135,22 @@ def ask_llm_structured(
             f"code quality, concurrency, networking, CI/CD, monitoring."
         )
 
-    # Trim history to last 12 messages to keep within context limits and reduce latency
-    trimmed_history = history[-12:] if history and len(history) > 12 else history
+    # Trim history to last 8 messages — shorter context means fewer input
+    # tokens and noticeably lower LLM latency per turn. The system prompt
+    # still carries stage, resume, and job context so continuity is kept.
+    trimmed_history = history[-8:] if history and len(history) > 8 else history
 
     messages = [{"role": "system", "content": system_content}]
     if trimmed_history:
         messages.extend(trimmed_history)
     messages.append({"role": "user", "content": user_text})
 
-    # Use faster model for non-evaluative stages (intro, wrap_up)
+    # Use the faster, smaller model for non-evaluative stages (intro,
+    # background, wrap-up). The 70b model is only needed where we rely
+    # on nuanced scoring (technical + follow-up).
     use_model = model
-    temperature = 0.5  # Balance between consistency and variety
-    if stage in ("intro", "wrap_up"):
+    temperature = 0.5
+    if stage in ("intro", "background", "wrap_up"):
         use_model = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
         temperature = 0.7
 

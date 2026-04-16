@@ -36,16 +36,35 @@ let resumeId = null;
 let jobId = null;
 let mediaRecorder = null;
 let audioStream = null;
-let isRecording = false;
+let isRecording = false;        // recording a single utterance
 let cameraStream = null;
 let isCameraOn = false;
 let isSpeakerOn = true;
 let antiCheat = null;
 let questionShownAt = 0;
 let companyId = null;
-let companyToken = null; // auth token for company
-let autoListenEnabled = true;
-let currentTypingAnimation = null; // track ongoing typing animation
+let companyToken = null;
+let currentTypingAnimation = null;
+
+// --- VAD (Voice Activity Detection) state ---
+let vad = {
+    enabled: true,
+    muted: false,              // user toggled the mic off
+    audioCtx: null,
+    analyser: null,
+    sourceNode: null,
+    rafId: null,
+    recorder: null,
+    chunks: [],
+    speaking: false,           // candidate is currently producing speech
+    speechStartAt: 0,
+    lastSpeechAt: 0,
+    processing: false,         // we're uploading / waiting for a reply
+    interviewerSpeaking: false // we pause VAD while the interviewer talks
+};
+const VAD_RMS_THRESHOLD = 0.022;   // energy above this = probable speech
+const VAD_SILENCE_MS = 1400;       // end-of-utterance after this much silence
+const VAD_MIN_UTTERANCE_MS = 700;  // discard blips shorter than this
 
 // --- Screen management ---
 function showScreen(screen) {
@@ -167,16 +186,14 @@ function speakText(text, contentEl) {
     window.speechSynthesis.speak(utterance);
 }
 
-// Auto-listen after interviewer finishes speaking
+// Called both when TTS finishes and when the typed-text animation completes.
+// Resumes VAD so the candidate can respond without clicking.
 function onSpeechFinished() {
-    if (!autoListenEnabled || !sessionId) return;
-    // Wait 2 seconds then auto-start listening
-    setTimeout(() => {
-        // Only auto-start if we're not already recording and interview is active
-        if (!isRecording && sessionId && interviewScreen.classList.contains('active')) {
-            startRecording();
-        }
-    }, 2000);
+    vad.interviewerSpeaking = false;
+    if (!sessionId) return;
+    if (vad.audioCtx && !vad.muted) {
+        setMicState('listening');
+    }
 }
 
 if ('speechSynthesis' in window) {
@@ -201,6 +218,9 @@ function addMessage(role, text, audioUrl) {
     conversation.scrollTop = conversation.scrollHeight;
 
     if (role === 'assistant') {
+        // While the interviewer talks we pause VAD so our own TTS doesn't
+        // get picked up as the candidate speaking.
+        vad.interviewerSpeaking = true;
         // For assistant: typing animation synced with speech, no audio player controls
         if (audioUrl) {
             // Server TTS available — play it hidden, type along
@@ -253,17 +273,26 @@ function setMicState(state) {
     micIndicator.className = 'indicator';
     switch (state) {
         case 'idle':
-            micText.textContent = 'Click to speak';
+            micText.textContent = vad.muted ? 'Mic muted — click to unmute' : 'Mic off';
             micBtn.classList.remove('recording');
             break;
         case 'listening':
-            micText.textContent = 'Listening... click to stop';
+            micText.textContent = 'Listening — just speak, pause when done';
+            micIndicator.classList.add('listening');
+            micBtn.classList.add('recording');
+            break;
+        case 'speaking':
+            micText.textContent = 'Hearing you...';
             micIndicator.classList.add('listening');
             micBtn.classList.add('recording');
             break;
         case 'processing':
-            micText.textContent = 'Processing...';
+            micText.textContent = 'Thinking...';
             micIndicator.classList.add('processing');
+            micBtn.classList.remove('recording');
+            break;
+        case 'muted':
+            micText.textContent = 'Mic muted — click to unmute';
             micBtn.classList.remove('recording');
             break;
     }
@@ -303,6 +332,9 @@ async function startCamera() {
         };
         isCameraOn = true;
         cameraBtn.classList.add('active');
+        if (antiCheat && sessionId) {
+            antiCheat.attachCamera(cameraFeed, cameraStream, onCameraLost);
+        }
     } catch (err) {
         cameraFeed.classList.add('hidden');
         cameraPlaceholder.classList.remove('hidden');
@@ -310,6 +342,19 @@ async function startCamera() {
         isCameraOn = false;
         cameraBtn.classList.remove('active');
     }
+}
+
+// Called by AntiCheatMonitor when the camera track ends unexpectedly (user
+// stopped it from the browser UI, unplugged the device, revoked permission).
+async function onCameraLost() {
+    if (!sessionId) return;
+    isCameraOn = false;
+    cameraBtn.classList.remove('active');
+    cameraFeed.classList.add('hidden');
+    cameraPlaceholder.classList.remove('hidden');
+    cameraPlaceholder.querySelector('span').textContent = 'Camera required — restarting...';
+    // Try to restart once; if it fails the warning banner from anticheat stays up.
+    setTimeout(() => { if (sessionId && !isCameraOn) startCamera(); }, 1000);
 }
 
 function stopCamera() {
@@ -320,6 +365,37 @@ function stopCamera() {
     cameraPlaceholder.querySelector('span').textContent = 'Camera off';
     isCameraOn = false;
     cameraBtn.classList.remove('active');
+}
+
+// Builds the rich resume-analysis panel shown after upload. Each field
+// is labelled with what it will be used for downstream (tailoring
+// questions, selecting topics, driving AI-detection weighting, etc.)
+// so the candidate can see exactly what the system extracted.
+function renderResumeSummary(data) {
+    const esc = (s) => String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const chips = (arr) => (arr || []).map(x => `<span class="chip">${esc(x)}</span>`).join('');
+    const section = (label, content, hint) => content
+        ? `<div class="resume-section">
+             <div class="resume-label">${label}${hint ? ` <span class="resume-hint">— ${hint}</span>` : ''}</div>
+             <div class="resume-value">${content}</div>
+           </div>`
+        : '';
+    const skills = chips(data.skills);
+    const domains = chips(data.domains);
+    const projects = (data.key_projects || []).map(p => `<li>${esc(p)}</li>`).join('');
+    const suggestions = (data.suggested_questions || []).slice(0, 5).map(q => `<li>${esc(q)}</li>`).join('');
+    return `
+      <div class="resume-summary">
+        <div class="resume-header">Resume parsed successfully</div>
+        ${section('Skills', skills || '<em>none detected</em>', 'used to tailor technical questions')}
+        ${section('Experience', data.experience_years ? `${esc(data.experience_years)} years` : '', 'calibrates question difficulty')}
+        ${section('Domains', domains, 'biases topic selection (backend, ML, mobile, etc.)')}
+        ${section('Education', esc(data.education), 'context for theoretical questions')}
+        ${section('Summary', esc(data.experience_summary), 'shown to the interviewer LLM as background')}
+        ${projects ? section('Key projects', `<ul>${projects}</ul>`, 'the interviewer will drill into these') : ''}
+        ${suggestions ? section('Suggested questions', `<ol>${suggestions}</ol>`, 'seeded into the interview topic pool') : ''}
+      </div>
+    `;
 }
 
 // --- Resume Upload ---
@@ -337,7 +413,7 @@ if (resumeUpload) {
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             resumeId = data.resume_id;
-            resumeStatus.textContent = `Resume analyzed: ${data.skills.join(', ') || 'No skills detected'}`;
+            resumeStatus.innerHTML = renderResumeSummary(data);
             resumeStatus.className = 'upload-status success';
         } catch (err) {
             resumeStatus.textContent = 'Failed to parse resume: ' + err.message;
@@ -363,9 +439,10 @@ async function startSession() {
         antiCheat = new AntiCheatMonitor(sessionId, API);
         antiCheat.start();
         questionShownAt = Date.now();
-        autoListenEnabled = false; // Don't auto-listen for the initial greeting
+        // Kick off always-on mic. The VAD loop auto-pauses while the
+        // interviewer is speaking so the greeting won't be captured.
+        startVAD();
         await sendTextTurn('Hello, I am ready for the interview.');
-        autoListenEnabled = true; // Enable auto-listen after first response
     } catch (err) {
         alert('Failed to start session: ' + err.message);
     } finally {
@@ -400,8 +477,8 @@ async function sendTextTurn(text) {
 }
 
 async function showResults() {
+    stopVAD();
     stopCamera();
-    autoListenEnabled = false;
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     if (currentTypingAnimation) { clearInterval(currentTypingAnimation); currentTypingAnimation = null; }
     if (antiCheat) await antiCheat.stop();
@@ -455,45 +532,146 @@ async function showResults() {
     }
 }
 
-// --- Microphone ---
-async function toggleRecording() {
-    if (isRecording) stopRecording();
-    else await startRecording();
-}
+// --- Always-on mic with Voice Activity Detection ---
+//
+// Once the interview starts we hold an open audio stream and continuously
+// analyze RMS energy. When energy rises above VAD_RMS_THRESHOLD we start a
+// MediaRecorder; when energy stays below the threshold for VAD_SILENCE_MS
+// we stop the recorder and submit the utterance as a turn. The mic button
+// becomes a mute toggle instead of a push-to-talk button.
 
-async function startRecording() {
-    // Stop any ongoing speech first
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
-    speakingIndicator.classList.remove('active');
-
+async function startVAD() {
+    if (vad.audioCtx) return; // already running
     try {
         audioStream = await navigator.mediaDevices.getUserMedia({
-            audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true }
+            audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            }
         });
     } catch (err) {
-        alert('Microphone access denied. Please allow mic access or use text input.');
+        alert('Microphone access denied. Please allow mic access to continue.');
+        vad.enabled = false;
         return;
     }
-    isRecording = true;
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    vad.audioCtx = new AudioCtx();
+    vad.sourceNode = vad.audioCtx.createMediaStreamSource(audioStream);
+    vad.analyser = vad.audioCtx.createAnalyser();
+    vad.analyser.fftSize = 1024;
+    vad.sourceNode.connect(vad.analyser);
     setMicState('listening');
-    const chunks = [];
-    mediaRecorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm;codecs=opus' });
-    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-    mediaRecorder.onstop = async () => {
-        isRecording = false;
-        setMicState('processing');
-        audioStream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(chunks, { type: 'audio/webm' });
-        await sendAudioAsFile(blob);
-    };
-    mediaRecorder.start();
+    vadLoop();
 }
 
-function stopRecording() {
-    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+function vadLoop() {
+    const buf = new Float32Array(vad.analyser.fftSize);
+    const tick = () => {
+        if (!vad.audioCtx) return;
+        vad.analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+        const now = performance.now();
+
+        const blocked = vad.muted || vad.processing || vad.interviewerSpeaking;
+        const above = rms > VAD_RMS_THRESHOLD;
+
+        if (!blocked) {
+            if (above) {
+                vad.lastSpeechAt = now;
+                if (!vad.speaking) {
+                    vad.speaking = true;
+                    vad.speechStartAt = now;
+                    startUtteranceRecording();
+                }
+            } else if (vad.speaking && (now - vad.lastSpeechAt) > VAD_SILENCE_MS) {
+                const duration = now - vad.speechStartAt;
+                vad.speaking = false;
+                if (duration >= VAD_MIN_UTTERANCE_MS) {
+                    finishUtteranceRecording();
+                } else {
+                    discardUtteranceRecording();
+                }
+            }
+        }
+
+        // Visual feedback — subtle indicator animation
+        if (!blocked) {
+            if (vad.speaking) setMicState('speaking');
+            else setMicState('listening');
+        }
+
+        vad.rafId = requestAnimationFrame(tick);
+    };
+    vad.rafId = requestAnimationFrame(tick);
+}
+
+function startUtteranceRecording() {
+    if (!audioStream) return;
+    try {
+        vad.chunks = [];
+        vad.recorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm;codecs=opus' });
+        vad.recorder.ondataavailable = (e) => { if (e.data.size > 0) vad.chunks.push(e.data); };
+        vad.recorder.start();
+        isRecording = true;
+    } catch (_) {
+        vad.recorder = null;
+    }
+}
+
+function finishUtteranceRecording() {
+    if (!vad.recorder) return;
+    const recorder = vad.recorder;
+    vad.recorder = null;
+    isRecording = false;
+    recorder.onstop = async () => {
+        const blob = new Blob(vad.chunks, { type: 'audio/webm' });
+        vad.chunks = [];
+        await sendAudioAsFile(blob);
+    };
+    try { recorder.stop(); } catch (_) {}
+}
+
+function discardUtteranceRecording() {
+    if (!vad.recorder) return;
+    const recorder = vad.recorder;
+    vad.recorder = null;
+    vad.chunks = [];
+    isRecording = false;
+    try { recorder.stop(); } catch (_) {}
+}
+
+function stopVAD() {
+    if (vad.rafId) cancelAnimationFrame(vad.rafId);
+    vad.rafId = null;
+    if (vad.recorder) {
+        try { vad.recorder.stop(); } catch (_) {}
+        vad.recorder = null;
+    }
+    if (vad.audioCtx) {
+        try { vad.audioCtx.close(); } catch (_) {}
+    }
+    vad.audioCtx = null;
+    vad.analyser = null;
+    vad.sourceNode = null;
+    if (audioStream) {
+        audioStream.getTracks().forEach(t => t.stop());
+        audioStream = null;
+    }
+    vad.speaking = false;
+    vad.processing = false;
+    vad.interviewerSpeaking = false;
+    isRecording = false;
 }
 
 async function sendAudioAsFile(blob) {
+    if (!sessionId || !blob || blob.size < 2000) return; // guard empty/tiny blobs
+    vad.processing = true;
     setMicState('processing');
     try {
         const formData = new FormData();
@@ -511,11 +689,13 @@ async function sendAudioAsFile(blob) {
             const evalData = await apiGet(`/api/session/${sessionId}/evaluations`);
             avgScore.textContent = evalData.avg_score != null ? evalData.avg_score.toFixed(1) : '--';
         } catch (_) {}
-        if (data.is_finished) showResults();
+        if (data.is_finished) { showResults(); return; }
     } catch (err) {
         addMessage('assistant', 'Error: ' + err.message);
     } finally {
-        setMicState('idle');
+        vad.processing = false;
+        if (vad.audioCtx && !vad.muted) setMicState('listening');
+        else setMicState('idle');
     }
 }
 
@@ -702,8 +882,38 @@ window.sendInvite = async function(appId) {
 
 // --- Event listeners ---
 startBtn.addEventListener('click', startSession);
-micBtn.addEventListener('click', toggleRecording);
-cameraBtn.addEventListener('click', () => { isCameraOn ? stopCamera() : startCamera(); });
+
+// Mic button = mute/unmute toggle (no push-to-talk; VAD does the work).
+micBtn.addEventListener('click', () => {
+    if (!sessionId) return;
+    vad.muted = !vad.muted;
+    if (vad.muted) {
+        if (vad.recorder) discardUtteranceRecording();
+        setMicState('muted');
+    } else {
+        if (!vad.audioCtx) startVAD();
+        else setMicState('listening');
+    }
+});
+cameraBtn.addEventListener('click', () => {
+    // Camera is mandatory during an active interview session.
+    if (sessionId) {
+        if (antiCheat) antiCheat._record?.('camera_off_attempt', {});
+        const banner = document.getElementById('anticheat-warning') || (() => {
+            const b = document.createElement('div');
+            b.id = 'anticheat-warning';
+            b.style.cssText = 'position:fixed;top:0;left:0;right:0;padding:8px 16px;background:#ef4444;color:white;text-align:center;font-size:0.85rem;z-index:9999;transition:opacity 0.3s;';
+            document.body.appendChild(b);
+            return b;
+        })();
+        banner.textContent = 'Camera must stay on throughout the interview.';
+        banner.style.opacity = '1';
+        setTimeout(() => { banner.style.opacity = '0'; }, 4000);
+        if (!isCameraOn) startCamera();
+        return;
+    }
+    isCameraOn ? stopCamera() : startCamera();
+});
 
 speakerBtn.addEventListener('click', () => {
     isSpeakerOn = !isSpeakerOn;
@@ -724,8 +934,8 @@ restartBtn.addEventListener('click', () => {
     sessionId = null;
     resumeId = null;
     jobId = null;
-    autoListenEnabled = false;
     conversation.innerHTML = '';
+    stopVAD();
     stopCamera();
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     if (currentTypingAnimation) { clearInterval(currentTypingAnimation); currentTypingAnimation = null; }
@@ -733,10 +943,12 @@ restartBtn.addEventListener('click', () => {
     if (navTabs) navTabs.style.display = 'flex';
 });
 
+// Spacebar toggles mute during an active interview.
 document.addEventListener('keydown', (e) => {
+    if (!sessionId) return;
     if (e.code === 'Space' && document.activeElement !== textInput && document.activeElement !== candidateName
         && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
         e.preventDefault();
-        toggleRecording();
+        micBtn.click();
     }
 });

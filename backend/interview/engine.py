@@ -28,9 +28,9 @@ class Stage(str, Enum):
 
 STAGE_TURN_LIMITS = {
     Stage.INTRO: 2,
-    Stage.BACKGROUND: 3,
-    Stage.TECHNICAL: 6,
-    Stage.FOLLOW_UP: 4,
+    Stage.BACKGROUND: 4,
+    Stage.TECHNICAL: 9,
+    Stage.FOLLOW_UP: 5,
     Stage.WRAP_UP: 2,
 }
 
@@ -240,9 +240,20 @@ class InterviewSession:
             asked_topics=self.asked_topics,
         )
 
-        # Run heuristic AI detection
+        # Run heuristic AI detection. For short answers (< MIN_WORDS_FOR_DETECTION)
+        # the heuristic is not confident — in that case we also discount the
+        # LLM's guess, since the LLM tends to default to 0.2-0.3 on short
+        # ambiguous inputs which produces noisy false positives.
         heuristic = analyze_answer(user_text, time_to_respond_ms, is_voice_input)
-        combined_ai = round(0.4 * heuristic.likelihood + 0.6 * resp.ai_likelihood, 2)
+        if not heuristic.confident:
+            combined_ai = 0.0
+        else:
+            # Weighted blend, but require at least one signal to exceed 0.2
+            # before we report anything above 0.1 overall.
+            blended = 0.5 * heuristic.likelihood + 0.5 * resp.ai_likelihood
+            if heuristic.likelihood < 0.2 and resp.ai_likelihood < 0.4:
+                blended *= 0.3
+            combined_ai = round(blended, 2)
 
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": resp.spoken_text})

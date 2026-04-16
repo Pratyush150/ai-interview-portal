@@ -48,6 +48,13 @@ sessions: dict[str, InterviewSession] = {}
 
 AUDIO_DIR = Path("tests/audio/sessions")
 
+# Server-side TTS (ElevenLabs) adds ~0.5-1.5s per turn. The browser has
+# its own Web Speech API which speaks instantly; by default we skip the
+# server synthesis entirely for lower latency. Flip USE_SERVER_TTS=1 in
+# .env to restore ElevenLabs voice.
+import os
+USE_SERVER_TTS = os.getenv("USE_SERVER_TTS", "0") in ("1", "true", "True", "yes")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -254,15 +261,15 @@ async def text_turn(session_id: str, req: TextTurnRequest):
     )
     status = session.get_status()
 
-    # TTS in background — don't block the response
     audio_url = None
-    try:
-        audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(synthesize, reply, audio_path)
-        audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
-    except Exception:
-        pass
+    if USE_SERVER_TTS:
+        try:
+            audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(synthesize, reply, audio_path)
+            audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
+        except Exception:
+            pass
 
     return TurnResponse(
         reply=reply,
@@ -298,15 +305,15 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
     reply = await asyncio.to_thread(session.turn, transcript.strip(), 0, True)
     status = session.get_status()
 
-    # TTS in thread pool
     audio_url = None
-    try:
-        audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(synthesize, reply, audio_path)
-        audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
-    except Exception:
-        pass
+    if USE_SERVER_TTS:
+        try:
+            audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(synthesize, reply, audio_path)
+            audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
+        except Exception:
+            pass
 
     return TurnResponse(
         reply=reply,
@@ -392,6 +399,10 @@ async def upload_resume(
         "candidate_id": candidate_id,
         "filename": file.filename,
         "skills": skills_data.get("skills", []),
+        "experience_years": skills_data.get("experience_years"),
+        "domains": skills_data.get("domains", []),
+        "key_projects": skills_data.get("key_projects", []),
+        "education": skills_data.get("education", ""),
         "experience_summary": skills_data.get("experience_summary", ""),
         "suggested_questions": skills_data.get("suggested_questions", []),
     }

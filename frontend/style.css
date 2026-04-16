@@ -345,6 +345,48 @@ body {
 .job-company { font-size: 0.8rem; color: var(--primary); margin-bottom: 0.25rem; }
 .job-skills { font-size: 0.8rem; color: var(--text-muted); }
 
+/* Resume summary panel */
+.resume-summary {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+    text-align: left;
+    font-size: 0.85rem;
+    line-height: 1.45;
+}
+.resume-header {
+    font-weight: 600;
+    color: var(--success);
+    margin-bottom: 0.75rem;
+}
+.resume-section { margin-bottom: 0.65rem; }
+.resume-label {
+    font-weight: 600;
+    color: var(--text);
+    font-size: 0.78rem;
+    margin-bottom: 0.2rem;
+}
+.resume-hint {
+    font-weight: 400;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-style: italic;
+}
+.resume-value { color: var(--text-muted); }
+.resume-value ul, .resume-value ol { padding-left: 1.25rem; }
+.resume-value li { margin-bottom: 0.2rem; }
+.resume-value .chip {
+    display: inline-block;
+    background: var(--bg);
+    color: var(--text);
+    padding: 0.15rem 0.55rem;
+    border-radius: 10px;
+    margin: 0.1rem 0.25rem 0.1rem 0;
+    font-size: 0.72rem;
+    border: 1px solid var(--border);
+}
+
 /* Scrollbar */
 .conversation::-webkit-scrollbar { width: 5px; }
 .conversation::-webkit-scrollbar-track { background: transparent; }
