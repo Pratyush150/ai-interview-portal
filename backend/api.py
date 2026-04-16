@@ -83,7 +83,7 @@ class TurnResponse(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.9.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 @app.post("/api/session", response_model=SessionResponse)
@@ -273,12 +273,29 @@ async def ws_interview(ws: WebSocket, session_id: str):
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
-if FRONTEND_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
-    @app.get("/")
-    def serve_index():
-        index = FRONTEND_DIR / "index.html"
-        if index.exists():
-            return FileResponse(index)
-        return {"message": "Frontend not built yet — see Phase 10"}
+@app.get("/")
+def serve_index():
+    index = FRONTEND_DIR / "index.html"
+    if index.exists():
+        return FileResponse(index, media_type="text/html")
+    return {"message": "Frontend not built yet — see Phase 10"}
+
+
+@app.get("/static/{file_path:path}")
+def serve_static(file_path: str):
+    """Serve frontend static files with correct MIME types."""
+    full_path = FRONTEND_DIR / file_path
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(404, "File not found")
+
+    mime_map = {
+        ".css": "text/css",
+        ".js": "application/javascript",
+        ".html": "text/html",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon",
+    }
+    mime = mime_map.get(full_path.suffix, "application/octet-stream")
+    return FileResponse(full_path, media_type=mime)

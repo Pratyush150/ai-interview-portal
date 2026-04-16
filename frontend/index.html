@@ -3,8 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <title>AI Interview Portal</title>
     <link rel="stylesheet" href="/static/style.css">
+    <style>
+        /* Inline critical styles as fallback if CSS file fails to load */
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
+        .container { max-width: 800px; margin: 0 auto; padding: 1rem; }
+        .screen { display: none; }
+        .screen.active { display: flex; flex-direction: column; }
+    </style>
 </head>
 <body>
     <div class="container">
