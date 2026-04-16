@@ -86,10 +86,14 @@ class StreamingTranscriber:
             if is_final:
                 self.transcript_parts.append(transcript)
                 if self.on_final:
-                    self.on_final(transcript)
+                    result = self.on_final(transcript)
+                    if asyncio.iscoroutine(result):
+                        await result
             else:
                 if self.on_partial:
-                    self.on_partial(transcript)
+                    result = self.on_partial(transcript)
+                    if asyncio.iscoroutine(result):
+                        await result
         except (IndexError, AttributeError):
             pass
 

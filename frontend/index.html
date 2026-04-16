@@ -3,33 +3,36 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <title>AI Interview Portal</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%233b82f6'/><text y='70' x='50' text-anchor='middle' font-size='60' fill='white'>AI</text></svg>">
     <link rel="stylesheet" href="/static/style.css">
-    <style>
-        /* Inline critical styles as fallback if CSS file fails to load */
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
-        .container { max-width: 800px; margin: 0 auto; padding: 1rem; }
-        .screen { display: none; }
-        .screen.active { display: flex; flex-direction: column; }
-    </style>
 </head>
 <body>
     <div class="container">
         <!-- Header -->
         <header class="header">
             <h1>AI Interview Portal</h1>
-            <p class="subtitle">Voice-based Technical Interview</p>
+            <p class="subtitle" id="header-subtitle">AI-Powered Technical Interview Platform</p>
+            <nav class="nav-tabs" id="nav-tabs">
+                <button class="nav-tab active" data-screen="setup-screen">Interview</button>
+                <button class="nav-tab" data-screen="jobs-screen">Jobs</button>
+                <button class="nav-tab" data-screen="company-screen">Company</button>
+            </nav>
         </header>
 
-        <!-- Setup Screen -->
+        <!-- Setup Screen (Interview Start) -->
         <div id="setup-screen" class="screen active">
             <div class="card">
                 <h2>Start Your Interview</h2>
-                <p>This AI interviewer will assess your skills in software engineering, AI/ML, and robotics.</p>
+                <p>Upload your resume and start your AI-powered technical interview.</p>
                 <div class="form-group">
                     <label for="candidate-name">Your Name</label>
                     <input type="text" id="candidate-name" placeholder="Enter your name" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="resume-upload">Upload Resume (PDF)</label>
+                    <input type="file" id="resume-upload" accept=".pdf" class="file-input">
+                    <div id="resume-status" class="upload-status"></div>
                 </div>
                 <div class="form-group">
                     <label>
@@ -38,6 +41,82 @@
                     </label>
                 </div>
                 <button id="start-btn" class="btn btn-primary">Start Interview</button>
+            </div>
+        </div>
+
+        <!-- Jobs Screen -->
+        <div id="jobs-screen" class="screen">
+            <div class="card" style="max-width:640px">
+                <h2>Open Positions</h2>
+                <div id="jobs-list" class="jobs-list">
+                    <p class="text-muted">Loading jobs...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Job Apply Screen -->
+        <div id="apply-screen" class="screen">
+            <div class="card">
+                <h2>Apply for: <span id="apply-job-title"></span></h2>
+                <div class="form-group">
+                    <label for="apply-name">Your Name</label>
+                    <input type="text" id="apply-name" placeholder="Full name" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="apply-email">Email</label>
+                    <input type="text" id="apply-email" placeholder="your@email.com" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="apply-resume">Resume (PDF)</label>
+                    <input type="file" id="apply-resume" accept=".pdf" class="file-input">
+                </div>
+                <button id="apply-submit-btn" class="btn btn-primary">Submit Application</button>
+                <div id="apply-result" class="upload-status" style="margin-top:1rem"></div>
+            </div>
+        </div>
+
+        <!-- Company Dashboard Screen -->
+        <div id="company-screen" class="screen">
+            <div class="card" style="max-width:640px">
+                <h2>Company Dashboard</h2>
+                <div id="company-auth">
+                    <div class="form-group">
+                        <label for="company-name">Company Name</label>
+                        <input type="text" id="company-name" placeholder="Your company" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="company-email">Contact Email</label>
+                        <input type="text" id="company-email" placeholder="hr@company.com" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="company-password">Password</label>
+                        <input type="password" id="company-password" placeholder="Create or enter password" autocomplete="off">
+                    </div>
+                    <div style="display:flex;gap:0.5rem;margin-bottom:1.5rem">
+                        <button id="register-company-btn" class="btn btn-primary" style="flex:1">Register</button>
+                        <button id="login-company-btn" class="btn btn-primary" style="flex:1;background:var(--surface-hover)">Login</button>
+                    </div>
+                </div>
+                <div id="company-panel" style="display:none">
+                    <p id="company-welcome" style="color:var(--success);margin-bottom:1rem;font-weight:600"></p>
+                    <h3 style="margin-bottom:1rem">Create Job Posting</h3>
+                    <div class="form-group">
+                        <label for="job-title">Job Title</label>
+                        <input type="text" id="job-title" placeholder="Senior Software Engineer" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="job-desc">Description</label>
+                        <textarea id="job-desc" placeholder="Job description..." rows="3" class="text-area"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label for="job-skills">Required Skills (comma-separated)</label>
+                        <input type="text" id="job-skills" placeholder="Python, React, AWS" autocomplete="off">
+                    </div>
+                    <button id="create-job-btn" class="btn btn-primary">Create Job</button>
+                    <div id="company-jobs" class="jobs-list" style="margin-top:1.5rem"></div>
+                    <h3 style="margin:1.5rem 0 1rem">Applications</h3>
+                    <div id="company-apps" class="jobs-list"></div>
+                </div>
             </div>
         </div>
 
@@ -59,9 +138,43 @@
                 </div>
             </div>
 
-            <!-- Conversation -->
-            <div id="conversation" class="conversation">
-                <!-- Messages rendered here -->
+            <!-- Interview Layout -->
+            <div class="interview-layout">
+                <!-- Left: Video panel -->
+                <div class="video-panel">
+                    <div class="video-card interviewer-card">
+                        <div class="video-label">Interviewer</div>
+                        <div class="interviewer-avatar">
+                            <svg viewBox="0 0 120 120" width="90" height="90">
+                                <circle cx="60" cy="40" r="24" fill="#3b82f6"/>
+                                <circle cx="60" cy="40" r="20" fill="#1e293b"/>
+                                <circle cx="60" cy="38" r="14" fill="#64748b"/>
+                                <ellipse cx="60" cy="95" rx="35" ry="22" fill="#3b82f6"/>
+                                <ellipse cx="60" cy="95" rx="31" ry="18" fill="#1e293b"/>
+                                <path d="M36 38 Q36 18 60 18 Q84 18 84 38" stroke="#3b82f6" stroke-width="3" fill="none"/>
+                                <rect x="32" y="34" width="8" height="12" rx="3" fill="#3b82f6"/>
+                                <rect x="80" y="34" width="8" height="12" rx="3" fill="#3b82f6"/>
+                            </svg>
+                            <div class="avatar-name">AI Interviewer</div>
+                            <div id="speaking-indicator" class="speaking-indicator">Speaking...</div>
+                        </div>
+                    </div>
+                    <div class="video-card candidate-card">
+                        <div class="video-label">You</div>
+                        <video id="camera-feed" class="hidden" autoplay muted playsinline></video>
+                        <div id="camera-placeholder" class="camera-placeholder">
+                            <svg viewBox="0 0 24 24" width="32" height="32" fill="#64748b">
+                                <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+                            </svg>
+                            <span>Camera loading...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Conversation -->
+                <div class="chat-panel">
+                    <div id="conversation" class="conversation"></div>
+                </div>
             </div>
 
             <!-- Controls -->
@@ -70,16 +183,26 @@
                     <span id="mic-indicator" class="indicator"></span>
                     <span id="mic-text">Click to speak</span>
                 </div>
-                <button id="mic-btn" class="btn btn-mic" title="Hold to speak">
-                    <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
-                        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-                    </svg>
-                </button>
-
-                <!-- Text input fallback -->
+                <div class="controls-row">
+                    <button id="camera-btn" class="btn btn-camera" title="Toggle camera">
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+                            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+                        </svg>
+                    </button>
+                    <button id="mic-btn" class="btn btn-mic" title="Click to speak">
+                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
+                            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                        </svg>
+                    </button>
+                    <button id="speaker-btn" class="btn btn-speaker active" title="Toggle interviewer voice">
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
+                            <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+                        </svg>
+                    </button>
+                </div>
                 <div class="text-input-row">
-                    <input type="text" id="text-input" placeholder="Type your answer (or use mic)..." autocomplete="off">
+                    <input type="text" id="text-input" placeholder="Type your answer..." autocomplete="off">
                     <button id="send-btn" class="btn btn-send">Send</button>
                 </div>
             </div>
@@ -87,7 +210,7 @@
 
         <!-- Results Screen -->
         <div id="results-screen" class="screen">
-            <div class="card">
+            <div class="card" style="max-width:560px">
                 <h2>Interview Complete</h2>
                 <div id="results-summary"></div>
                 <button id="restart-btn" class="btn btn-primary">Start New Interview</button>
@@ -95,6 +218,7 @@
         </div>
     </div>
 
+    <script src="/static/anticheat.js"></script>
     <script src="/static/app.js"></script>
 </body>
 </html>

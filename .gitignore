@@ -12,3 +12,4 @@ tests/audio/output_*.wav
 tests/audio/output_*.mp3
 tests/audio/reply*.mp3
 tests/audio/sessions/
+data/
