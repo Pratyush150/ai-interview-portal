@@ -12,7 +12,7 @@
 | 7 | Structured JSON LLM output | ✅ done | `v0.7-structured` |
 | 8 | Deepgram streaming upgrade | ✅ done | `v0.8-streaming` |
 | 9 | FastAPI wrap + browser mic | ✅ done | `v0.9-api` |
-| 10 | Frontend | ⚪ not started | `v1.0-ui` |
+| 10 | Frontend | ✅ done | `v1.0-ui` |
 
 ## Decisions log
 - **LLM:** Groq cloud API (`llama-3.3-70b-versatile`) — local Ollama blocked by 3.7GB RAM / no GPU. Module is provider-agnostic; swap to Ollama later on better hardware.

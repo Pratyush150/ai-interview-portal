@@ -8,7 +8,8 @@ Voice-based AI technical interviewer for software engineering, AI/ML, and roboti
 - **STT:** Deepgram (`nova-2`)
 - **LLM:** Groq cloud API (`llama-3.3-70b-versatile`) — chosen over local Ollama due to hardware constraints on prototype machine. Provider-agnostic `backend/llm/` makes swap trivial.
 - **TTS:** ElevenLabs (`eleven_turbo_v2_5`, voice: Rachel)
-- **Backend:** Python 3.10+, FastAPI (Phase 9)
+- **Backend:** Python 3.10+, FastAPI
+- **Frontend:** Vanilla HTML/CSS/JS (no build step)
 
 ## Setup
 
@@ -82,6 +83,10 @@ backend/
   interview/engine.py        # Phase 6 — interview state machine
   api.py                      # Phase 9 — FastAPI server
   main.py                    # Phase 5 pipeline + interview mode
+frontend/
+  index.html                   # Phase 10 — interview UI
+  style.css                    # Dark theme styles
+  app.js                       # Client-side logic + mic capture
 tests/
   smoke_*.py                 # one per service
   audio/                     # test .wav files

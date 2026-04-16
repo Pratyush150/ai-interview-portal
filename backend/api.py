@@ -17,6 +17,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -39,7 +40,15 @@ async def lifespan(app: FastAPI):
     sessions.clear()
 
 
-app = FastAPI(title="AI Interview Portal", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="AI Interview Portal", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # --- Pydantic models ---
