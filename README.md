@@ -38,6 +38,13 @@ python tests/smoke_tts.py              # ElevenLabs → tests/audio/output_tts.m
 # Drop a short .wav at tests/audio/sample.wav first:
 python tests/smoke_stt.py              # Deepgram → transcript
 python tests/smoke_pipeline.py         # Full STT → LLM → TTS pipeline
+python tests/smoke_engine.py           # Interview engine stages + memory
+```
+
+## Interview mode (text, Phase 6+)
+
+```bash
+python -m backend.main --interview     # Interactive text-based interview
 ```
 
 ## Progress

@@ -8,7 +8,7 @@
 | 3 | ElevenLabs TTS module | ✅ done | `v0.3-tts` |
 | 4 | Groq LLM client | ✅ done | `v0.4-llm` |
 | 5 | Audio pipeline echo-bot | ✅ done | `v0.5-pipeline` |
-| 6 | Interview engine with stages + memory | ⚪ not started | `v0.6-engine` |
+| 6 | Interview engine with stages + memory | ✅ done | `v0.6-engine` |
 | 7 | Structured JSON LLM output | ⚪ not started | `v0.7-structured` |
 | 8 | Deepgram streaming upgrade | ⚪ not started | `v0.8-streaming` |
 | 9 | FastAPI wrap + browser mic | ⚪ not started | `v0.9-api` |
