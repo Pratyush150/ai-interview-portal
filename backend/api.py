@@ -32,10 +32,10 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from backend.interview.engine import InterviewSession, Stage, auto_calibrate
+from backend.interview.engine import InterviewSession, Stage
 from backend.tts.elevenlabs_tts import synthesize
 from backend.stt.deepgram_stt import transcribe_file
 from backend.stt.deepgram_streaming import StreamingTranscriber
@@ -83,7 +83,6 @@ class SessionCreate(BaseModel):
     resume_id: str | None = None
     job_id: str | None = None
     invite_token: str | None = None
-    persona: str | None = None  # mentor | senior | cto
 
 class SessionResponse(BaseModel):
     session_id: str
@@ -150,7 +149,6 @@ def create_session(req: SessionCreate):
     job_skills = []
     job_description = ""
     candidate_name = req.candidate_name
-    experience_years: float | None = None
 
     # Load resume context if provided
     if req.resume_id:
@@ -164,7 +162,6 @@ def create_session(req: SessionCreate):
                 resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
             if skills_data.get("suggested_questions"):
                 resume_context += f"\nSuggested questions: {'; '.join(skills_data['suggested_questions'][:5])}"
-            experience_years = skills_data.get("experience_years")
 
     # Load job context if provided
     if req.job_id:
@@ -200,13 +197,6 @@ def create_session(req: SessionCreate):
                 resume_context = skills_data.get("experience_summary", app_row["raw_text"][:1000])
                 if skills_data.get("skills"):
                     resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
-                if experience_years is None:
-                    experience_years = skills_data.get("experience_years")
-
-    # Auto-calibrate persona + difficulty from resume experience + JD.
-    # The candidate has no say in this — prevents self-selection into an
-    # easier interview.
-    calibration = auto_calibrate(experience_years, job_title, job_description)
 
     session = InterviewSession(
         session_id=sid,
@@ -216,14 +206,7 @@ def create_session(req: SessionCreate):
         job_title=job_title,
         job_skills=job_skills,
         job_description=job_description,
-        persona=calibration["persona"],
-        difficulty_level=calibration["difficulty_level"],
-        experience_years=experience_years,
     )
-    # Explicit persona override still works (e.g. from an admin / company
-    # dashboard) but is not exposed to the candidate UI.
-    if req.persona:
-        session.set_persona(req.persona)
     sessions[sid] = session
 
     # Persist to DB
@@ -297,64 +280,6 @@ async def text_turn(session_id: str, req: TextTurnRequest):
     )
 
 
-@app.post("/api/session/{session_id}/turn-stream")
-async def turn_stream(session_id: str, req: TextTurnRequest):
-    """SSE: stream the spoken reply token-by-token so the frontend can
-    start speaking on the first word. Scoring runs in the background
-    after the reply is fully emitted."""
-    session = sessions.get(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    loop = asyncio.get_event_loop()
-
-    async def event_stream():
-        # Groq streaming is synchronous, so we bridge via to_thread + a
-        # small queue. Tokens are forwarded as SSE "data:" lines.
-        queue: asyncio.Queue = asyncio.Queue()
-        SENTINEL = object()
-
-        def producer():
-            try:
-                for tok in session.turn_stream(req.text):
-                    loop.call_soon_threadsafe(queue.put_nowait, tok)
-            except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, {"_error": str(e)})
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
-
-        loop.run_in_executor(None, producer)
-
-        while True:
-            item = await queue.get()
-            if item is SENTINEL:
-                break
-            if isinstance(item, dict) and "_error" in item:
-                yield f"event: error\ndata: {json.dumps(item)}\n\n"
-                return
-            yield f"event: token\ndata: {json.dumps({'text': item})}\n\n"
-
-        status = session.get_status()
-        yield (
-            "event: done\n"
-            f"data: {json.dumps({'stage': status['stage'], 'total_turns': status['total_turns'], 'is_finished': status['is_finished']})}\n\n"
-        )
-
-        # Schedule the structured scoring call AFTER the SSE response is
-        # fully flushed so we don't block the candidate's UX.
-        async def _score():
-            await asyncio.to_thread(
-                session.score_last_turn, req.time_to_respond_ms, req.is_voice_input
-            )
-        asyncio.create_task(_score())
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 @app.post("/api/session/{session_id}/audio-turn", response_model=TurnResponse)
 async def audio_turn(session_id: str, audio: UploadFile = File(...)):
     session = sessions.get(session_id)
@@ -396,79 +321,6 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
         total_turns=status["total_turns"],
         is_finished=status["is_finished"],
         audio_url=audio_url,
-    )
-
-
-@app.post("/api/session/{session_id}/audio-turn-stream")
-async def audio_turn_stream(session_id: str, audio: UploadFile = File(...)):
-    """SSE: transcribe the audio then stream the reply. Saves ~500 ms
-    over ``/audio-turn`` because the candidate hears the first word the
-    moment Groq emits it instead of waiting for the whole reply."""
-    session = sessions.get(session_id)
-    if not session:
-        raise HTTPException(404, "Session not found")
-
-    suffix = ".webm" if "webm" in (audio.content_type or "") else ".wav"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await audio.read()
-        tmp.write(content)
-        tmp_path = Path(tmp.name)
-    try:
-        transcript = await asyncio.to_thread(transcribe_file, str(tmp_path))
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-    # Empty-transcript cases (silence, background hum, accidental tap) used
-    # to raise 400, which breaks the streaming consumer. Return a 200 SSE
-    # with a silent "empty" event instead — the UI discards it.
-    if not transcript or not transcript.strip():
-        async def empty_stream():
-            yield f"event: empty\ndata: {json.dumps({'reason': 'no_speech'})}\n\n"
-        return StreamingResponse(empty_stream(), media_type="text/event-stream")
-
-    loop = asyncio.get_event_loop()
-
-    async def event_stream():
-        # First event: the transcript itself so the UI can render "[user said]".
-        yield f"event: transcript\ndata: {json.dumps({'text': transcript.strip()})}\n\n"
-
-        queue: asyncio.Queue = asyncio.Queue()
-        SENTINEL = object()
-
-        def producer():
-            try:
-                for tok in session.turn_stream(transcript.strip()):
-                    loop.call_soon_threadsafe(queue.put_nowait, tok)
-            except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, {"_error": str(e)})
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
-
-        loop.run_in_executor(None, producer)
-
-        while True:
-            item = await queue.get()
-            if item is SENTINEL:
-                break
-            if isinstance(item, dict) and "_error" in item:
-                yield f"event: error\ndata: {json.dumps(item)}\n\n"
-                return
-            yield f"event: token\ndata: {json.dumps({'text': item})}\n\n"
-
-        status = session.get_status()
-        yield (
-            "event: done\n"
-            f"data: {json.dumps({'stage': status['stage'], 'total_turns': status['total_turns'], 'is_finished': status['is_finished']})}\n\n"
-        )
-
-        async def _score():
-            await asyncio.to_thread(session.score_last_turn, 0, True)
-        asyncio.create_task(_score())
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

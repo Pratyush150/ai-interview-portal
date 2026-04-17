@@ -9,6 +9,7 @@ const jobsScreen      = document.getElementById('jobs-screen');
 const applyScreen     = document.getElementById('apply-screen');
 const companyScreen   = document.getElementById('company-screen');
 const candidateName   = document.getElementById('candidate-name');
+const useStructured   = document.getElementById('use-structured');
 const startBtn        = document.getElementById('start-btn');
 const micBtn          = document.getElementById('mic-btn');
 const micIndicator    = document.getElementById('mic-indicator');
@@ -45,27 +46,25 @@ let companyId = null;
 let companyToken = null;
 let currentTypingAnimation = null;
 
-// --- Mic state ---
-// After the interviewer finishes speaking we auto-arm the mic (1s delay).
-// The candidate speaks freely — no silence-based auto-submit. When they
-// are done they click the mic button to end the turn. We still keep an
-// AnalyserNode on the stream to detect barge-in during interviewer TTS.
+// --- VAD (Voice Activity Detection) state ---
 let vad = {
-    muted: false,
+    enabled: true,
+    muted: false,              // user toggled the mic off
     audioCtx: null,
     analyser: null,
     sourceNode: null,
     rafId: null,
     recorder: null,
     chunks: [],
-    recordingStartAt: 0,
-    processing: false,
-    interviewerSpeaking: false,
-    armTimer: null,            // pending auto-start timer
+    speaking: false,           // candidate is currently producing speech
+    speechStartAt: 0,
+    lastSpeechAt: 0,
+    processing: false,         // we're uploading / waiting for a reply
+    interviewerSpeaking: false // we pause VAD while the interviewer talks
 };
-const AUTO_LISTEN_DELAY_MS = 1000;   // after interviewer finishes
-const BARGE_IN_RMS = 0.022;          // sustained energy to cut off TTS
-const MIN_UTTERANCE_MS = 500;        // discard fat-finger taps shorter than this
+const VAD_RMS_THRESHOLD = 0.022;   // energy above this = probable speech
+const VAD_SILENCE_MS = 1400;       // end-of-utterance after this much silence
+const VAD_MIN_UTTERANCE_MS = 700;  // discard blips shorter than this
 
 // --- Screen management ---
 function showScreen(screen) {
@@ -93,12 +92,6 @@ if (navTabs) {
 }
 
 // --- API helpers ---
-// Track the currently-streaming turn so VAD can cancel it on barge-in.
-let currentStreamCtrl = null;
-let currentAssistantContent = null;  // DOM node to append tokens to
-let currentSpeechSentences = [];     // sentences still waiting to be spoken
-let currentSpeechBuffer = '';        // unflushed token stream
-
 async function apiPost(path, body, authToken) {
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
@@ -193,16 +186,13 @@ function speakText(text, contentEl) {
     window.speechSynthesis.speak(utterance);
 }
 
-// Called both when TTS finishes and when the typed-text animation
-// completes. Schedules the auto-arm: 1 second later the mic starts
-// recording the candidate's next answer.
+// Called both when TTS finishes and when the typed-text animation completes.
+// Resumes VAD so the candidate can respond without clicking.
 function onSpeechFinished() {
     vad.interviewerSpeaking = false;
-    speakingIndicator.classList.remove('active');
     if (!sessionId) return;
     if (vad.audioCtx && !vad.muted) {
-        setMicState('idle');
-        scheduleAutoListen();
+        setMicState('listening');
     }
 }
 
@@ -283,11 +273,16 @@ function setMicState(state) {
     micIndicator.className = 'indicator';
     switch (state) {
         case 'idle':
-            micText.textContent = vad.muted ? 'Mic muted — click to unmute' : 'Waiting...';
+            micText.textContent = vad.muted ? 'Mic muted — click to unmute' : 'Mic off';
             micBtn.classList.remove('recording');
             break;
         case 'listening':
-            micText.textContent = 'Listening — click mic to finish';
+            micText.textContent = 'Listening — just speak, pause when done';
+            micIndicator.classList.add('listening');
+            micBtn.classList.add('recording');
+            break;
+        case 'speaking':
+            micText.textContent = 'Hearing you...';
             micIndicator.classList.add('listening');
             micBtn.classList.add('recording');
             break;
@@ -388,18 +383,17 @@ function renderResumeSummary(data) {
     const skills = chips(data.skills);
     const domains = chips(data.domains);
     const projects = (data.key_projects || []).map(p => `<li>${esc(p)}</li>`).join('');
-    // Deliberately do NOT expose `suggested_questions` to the candidate.
-    // Those are used internally by the interviewer and showing them lets
-    // a candidate rehearse answers before the interview starts.
+    const suggestions = (data.suggested_questions || []).slice(0, 5).map(q => `<li>${esc(q)}</li>`).join('');
     return `
       <div class="resume-summary">
         <div class="resume-header">Resume parsed successfully</div>
-        ${section('Skills', skills || '<em>none detected</em>')}
-        ${section('Experience', data.experience_years ? `${esc(data.experience_years)} years` : '')}
-        ${section('Domains', domains)}
-        ${section('Education', esc(data.education))}
-        ${section('Summary', esc(data.experience_summary))}
-        ${projects ? section('Key projects', `<ul>${projects}</ul>`) : ''}
+        ${section('Skills', skills || '<em>none detected</em>', 'used to tailor technical questions')}
+        ${section('Experience', data.experience_years ? `${esc(data.experience_years)} years` : '', 'calibrates question difficulty')}
+        ${section('Domains', domains, 'biases topic selection (backend, ML, mobile, etc.)')}
+        ${section('Education', esc(data.education), 'context for theoretical questions')}
+        ${section('Summary', esc(data.experience_summary), 'shown to the interviewer LLM as background')}
+        ${projects ? section('Key projects', `<ul>${projects}</ul>`, 'the interviewer will drill into these') : ''}
+        ${suggestions ? section('Suggested questions', `<ol>${suggestions}</ol>`, 'seeded into the interview topic pool') : ''}
       </div>
     `;
 }
@@ -431,14 +425,12 @@ if (resumeUpload) {
 // --- Session lifecycle ---
 async function startSession() {
     const name = candidateName.value.trim() || null;
-    // Difficulty + interviewer persona are resolved server-side from the
-    // resume + job description. The candidate has no say in what level they
-    // are interviewed at — this is intentional and prevents self-selection.
+    const structured = useStructured.checked;
     startBtn.disabled = true;
     startBtn.textContent = 'Starting...';
     try {
         const data = await apiPost('/api/session', {
-            candidate_name: name, use_structured: true, resume_id: resumeId, job_id: jobId,
+            candidate_name: name, use_structured: structured, resume_id: resumeId, job_id: jobId,
         });
         sessionId = data.session_id;
         updateStatus(data.stage, data.total_turns, data.avg_score);
@@ -450,7 +442,7 @@ async function startSession() {
         // Kick off always-on mic. The VAD loop auto-pauses while the
         // interviewer is speaking so the greeting won't be captured.
         startVAD();
-        await streamTextTurn('Hello, I am ready for the interview.');
+        await sendTextTurn('Hello, I am ready for the interview.');
     } catch (err) {
         alert('Failed to start session: ' + err.message);
     } finally {
@@ -495,7 +487,44 @@ async function showResults() {
             apiGet(`/api/session/${sessionId}`),
             apiGet(`/api/session/${sessionId}/evaluations`),
         ]);
-        resultsSummary.innerHTML = renderXrayDashboard(session, evals);
+        let html = '';
+        if (evals.avg_score != null) {
+            html += `<div class="score-big">${evals.avg_score.toFixed(1)}/10</div>`;
+        }
+        if (evals.avg_ai_likelihood != null && evals.avg_ai_likelihood > 0) {
+            const aiPct = (evals.avg_ai_likelihood * 100).toFixed(0);
+            const aiColor = evals.avg_ai_likelihood > 0.5 ? 'var(--danger)' : evals.avg_ai_likelihood > 0.3 ? 'var(--warning)' : 'var(--success)';
+            html += `<div class="result-row"><span class="result-label">AI Detection</span><span class="result-value" style="color:${aiColor}">${aiPct}% likelihood</span></div>`;
+        }
+        if (evals.cheating_flags_count > 0) {
+            html += `<div class="result-row"><span class="result-label">Integrity Flags</span><span class="result-value" style="color:var(--warning)">${evals.cheating_flags_count} violations</span></div>`;
+        }
+        html += `
+            <div class="result-row"><span class="result-label">Total Turns</span><span class="result-value">${session.total_turns}</span></div>
+            <div class="result-row"><span class="result-label">Final Stage</span><span class="result-value">${session.stage}</span></div>
+            <div class="result-row"><span class="result-label">Evaluations</span><span class="result-value">${session.evaluations_count}</span></div>
+        `;
+        if (evals.evaluations && evals.evaluations.length > 0) {
+            html += '<h3 style="margin-top:1.5rem;margin-bottom:0.5rem">Turn-by-Turn Evaluation</h3>';
+            evals.evaluations.forEach((e) => {
+                const aiFlag = e.ai_likelihood > 0.5 ? ' [AI suspected]' : '';
+                html += `<div class="result-row">
+                    <span class="result-label">Turn ${e.turn} (${e.stage})${aiFlag}</span>
+                    <span class="result-value">${e.score}/10</span>
+                </div>`;
+                if (e.correctness != null) {
+                    html += `<div style="font-size:0.75rem;color:var(--text-muted);padding-left:1rem">
+                        C:${e.correctness} D:${e.depth} Cm:${e.communication} R:${e.relevance}</div>`;
+                }
+                if (e.strengths && e.strengths.length) {
+                    html += `<div style="color:var(--success);font-size:0.8rem;padding-left:1rem">+ ${e.strengths.join(', ')}</div>`;
+                }
+                if (e.weaknesses && e.weaknesses.length) {
+                    html += `<div style="color:var(--warning);font-size:0.8rem;padding-left:1rem">- ${e.weaknesses.join(', ')}</div>`;
+                }
+            });
+        }
+        resultsSummary.innerHTML = html;
         showScreen(resultsScreen);
     } catch (err) {
         resultsSummary.innerHTML = '<p>Interview complete. Could not load detailed results.</p>';
@@ -503,168 +532,16 @@ async function showResults() {
     }
 }
 
-// Recruiter X-ray dashboard — SVG radar of rubric dimensions, per-turn
-// score timeline, AI-similarity summary, cheating-flag breakdown.
-function renderXrayDashboard(session, evals) {
-    const items = (evals.evaluations || []).filter(e => e.score != null);
-    const avg = (key) => {
-        const v = items.map(e => e[key]).filter(x => x != null);
-        return v.length ? (v.reduce((a, b) => a + b, 0) / v.length) : 0;
-    };
-    const dims = {
-        Correctness:   avg('correctness'),
-        Depth:         avg('depth'),
-        Communication: avg('communication'),
-        Relevance:     avg('relevance'),
-    };
-
-    let html = '';
-    if (evals.avg_score != null) {
-        html += `<div class="score-big">${evals.avg_score.toFixed(1)}/10</div>`;
-    }
-
-    // --- Radar chart ---
-    if (items.length > 0) {
-        html += `<h3 class="xray-h">Skill Radar</h3>`;
-        html += radarSVG(dims);
-    }
-
-    // --- Per-turn score timeline ---
-    if (items.length > 1) {
-        html += `<h3 class="xray-h">Score Timeline</h3>`;
-        html += timelineSVG(items);
-    }
-
-    // --- AI-similarity summary ---
-    if (evals.avg_ai_likelihood != null && evals.avg_ai_likelihood > 0) {
-        const pct = (evals.avg_ai_likelihood * 100).toFixed(0);
-        const color = evals.avg_ai_likelihood > 0.5 ? 'var(--danger)'
-                    : evals.avg_ai_likelihood > 0.3 ? 'var(--warning)'
-                    : 'var(--success)';
-        html += `<h3 class="xray-h">AI-Answer Similarity</h3>
-                 <div class="xray-bar" style="background:linear-gradient(to right, ${color} ${pct}%, var(--surface-hover) ${pct}%)">
-                   <span>${pct}% — average likelihood this candidate used an AI assistant</span>
-                 </div>`;
-    }
-
-    // --- Cheating flag breakdown ---
-    if (evals.cheating_flags && evals.cheating_flags.length) {
-        const counts = {};
-        evals.cheating_flags.forEach(f => { counts[f.type] = (counts[f.type] || 0) + 1; });
-        const max = Math.max(...Object.values(counts));
-        html += `<h3 class="xray-h">Integrity Flags (${evals.cheating_flags.length})</h3><div class="xray-flags">`;
-        for (const [type, n] of Object.entries(counts).sort((a, b) => b[1] - a[1])) {
-            const w = (n / max * 100).toFixed(0);
-            html += `<div class="xray-flag-row">
-                       <span class="xray-flag-label">${type.replace(/_/g, ' ')}</span>
-                       <div class="xray-flag-bar"><div style="width:${w}%"></div></div>
-                       <span class="xray-flag-count">${n}</span>
-                     </div>`;
-        }
-        html += '</div>';
-    }
-
-    // --- Stats row ---
-    html += `
-        <div class="result-row"><span class="result-label">Total Turns</span><span class="result-value">${session.total_turns}</span></div>
-        <div class="result-row"><span class="result-label">Final Stage</span><span class="result-value">${session.stage}</span></div>
-        <div class="result-row"><span class="result-label">Calibrated level</span><span class="result-value">${session.difficulty_level || '—'}${session.experience_years ? ` · ${session.experience_years} yrs` : ''}</span></div>
-        <div class="result-row"><span class="result-label">Interviewer persona</span><span class="result-value">${session.persona || '—'}</span></div>
-        <div class="result-row"><span class="result-label">Long-term claims captured</span><span class="result-value">${session.key_claims_count || 0}</span></div>
-    `;
-
-    // --- Turn-by-turn detail ---
-    if (items.length) {
-        html += '<h3 class="xray-h">Turn-by-turn detail</h3>';
-        items.forEach((e) => {
-            const aiFlag = e.ai_likelihood > 0.5 ? ' <span style="color:var(--danger)">[AI suspected]</span>' : '';
-            html += `<div class="result-row">
-                <span class="result-label">Turn ${e.turn} · ${e.stage}${e.topic ? ' · ' + e.topic : ''}${aiFlag}</span>
-                <span class="result-value">${e.score}/10</span>
-            </div>`;
-            if (e.correctness != null) {
-                html += `<div class="xray-dim-row">C:${e.correctness} D:${e.depth} Cm:${e.communication} R:${e.relevance}</div>`;
-            }
-            if (e.strengths && e.strengths.length) {
-                html += `<div class="xray-strength">+ ${e.strengths.join(', ')}</div>`;
-            }
-            if (e.weaknesses && e.weaknesses.length) {
-                html += `<div class="xray-weakness">- ${e.weaknesses.join(', ')}</div>`;
-            }
-        });
-    }
-
-    return html;
-}
-
-function radarSVG(dims) {
-    const labels = Object.keys(dims);
-    const values = Object.values(dims);
-    const N = labels.length;
-    const cx = 150, cy = 140, R = 100;
-    const point = (i, r) => {
-        const a = -Math.PI / 2 + (i * 2 * Math.PI / N);
-        return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
-    };
-    // Grid rings at 2/4/6/8/10
-    let grid = '';
-    for (let ring = 2; ring <= 10; ring += 2) {
-        const pts = labels.map((_, i) => point(i, R * ring / 10).join(',')).join(' ');
-        grid += `<polygon points="${pts}" fill="none" stroke="var(--border)" stroke-width="1" />`;
-    }
-    // Axes + labels
-    let axes = '';
-    labels.forEach((lbl, i) => {
-        const [x, y] = point(i, R);
-        axes += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="var(--border)" stroke-width="1"/>`;
-        const [lx, ly] = point(i, R + 18);
-        axes += `<text x="${lx}" y="${ly}" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="var(--text-muted)">${lbl} ${values[i].toFixed(1)}</text>`;
-    });
-    // Data polygon
-    const poly = values.map((v, i) => point(i, R * v / 10).join(',')).join(' ');
-    return `<svg viewBox="0 0 300 280" class="xray-svg" xmlns="http://www.w3.org/2000/svg">
-              ${grid}${axes}
-              <polygon points="${poly}" fill="var(--primary)" fill-opacity="0.25" stroke="var(--primary)" stroke-width="2"/>
-            </svg>`;
-}
-
-function timelineSVG(items) {
-    const W = 300, H = 120, pad = 24;
-    const n = items.length;
-    const xs = (i) => pad + (i * (W - 2 * pad) / Math.max(n - 1, 1));
-    const ys = (v) => H - pad - (v / 10) * (H - 2 * pad);
-    let grid = '';
-    for (let g = 0; g <= 10; g += 2) {
-        const y = ys(g);
-        grid += `<line x1="${pad}" y1="${y}" x2="${W - pad}" y2="${y}" stroke="var(--border)" stroke-width="0.5"/>`;
-        grid += `<text x="4" y="${y + 3}" font-size="9" fill="var(--text-muted)">${g}</text>`;
-    }
-    let path = '';
-    let dots = '';
-    items.forEach((e, i) => {
-        const x = xs(i), y = ys(e.score);
-        path += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
-        const color = e.ai_likelihood > 0.5 ? 'var(--danger)' : 'var(--primary)';
-        dots += `<circle cx="${x}" cy="${y}" r="3.5" fill="${color}"><title>Turn ${e.turn}: ${e.score}/10</title></circle>`;
-    });
-    return `<svg viewBox="0 0 ${W} ${H}" class="xray-svg" xmlns="http://www.w3.org/2000/svg">
-              ${grid}
-              <path d="${path}" fill="none" stroke="var(--primary)" stroke-width="1.5"/>
-              ${dots}
-            </svg>`;
-}
-
-// --- Auto-arm mic, click-to-finish ---
+// --- Always-on mic with Voice Activity Detection ---
 //
-// The interviewer finishes speaking → after 1s the mic auto-arms and a
-// MediaRecorder starts capturing. The candidate speaks as long as they
-// need — the system never cuts them off on silence. They click the mic
-// button to end the turn, which stops the recorder and submits the blob.
-// The AnalyserNode stays attached so we can still detect barge-in (the
-// candidate starting to talk while the interviewer is still speaking).
+// Once the interview starts we hold an open audio stream and continuously
+// analyze RMS energy. When energy rises above VAD_RMS_THRESHOLD we start a
+// MediaRecorder; when energy stays below the threshold for VAD_SILENCE_MS
+// we stop the recorder and submit the utterance as a turn. The mic button
+// becomes a mute toggle instead of a push-to-talk button.
 
 async function startVAD() {
-    if (vad.audioCtx) return;
+    if (vad.audioCtx) return; // already running
     try {
         audioStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -677,22 +554,22 @@ async function startVAD() {
         });
     } catch (err) {
         alert('Microphone access denied. Please allow mic access to continue.');
+        vad.enabled = false;
         return;
     }
+
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     vad.audioCtx = new AudioCtx();
     vad.sourceNode = vad.audioCtx.createMediaStreamSource(audioStream);
     vad.analyser = vad.audioCtx.createAnalyser();
     vad.analyser.fftSize = 1024;
     vad.sourceNode.connect(vad.analyser);
-    setMicState('idle');
-    bargeInLoop();
+    setMicState('listening');
+    vadLoop();
 }
 
-// Only watches for barge-in — does NOT auto-stop recording.
-function bargeInLoop() {
+function vadLoop() {
     const buf = new Float32Array(vad.analyser.fftSize);
-    let bargeInStart = 0;
     const tick = () => {
         if (!vad.audioCtx) return;
         vad.analyser.getFloatTimeDomainData(buf);
@@ -700,76 +577,76 @@ function bargeInLoop() {
         for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
         const rms = Math.sqrt(sum / buf.length);
         const now = performance.now();
-        if (vad.interviewerSpeaking && !vad.muted && !vad.processing) {
-            if (rms > BARGE_IN_RMS) {
-                if (!bargeInStart) bargeInStart = now;
-                else if (now - bargeInStart > 350) {
-                    interruptInterviewer();
-                    bargeInStart = 0;
-                    scheduleAutoListen(0);  // start recording right away
+
+        const blocked = vad.muted || vad.processing || vad.interviewerSpeaking;
+        const above = rms > VAD_RMS_THRESHOLD;
+
+        if (!blocked) {
+            if (above) {
+                vad.lastSpeechAt = now;
+                if (!vad.speaking) {
+                    vad.speaking = true;
+                    vad.speechStartAt = now;
+                    startUtteranceRecording();
                 }
-            } else {
-                bargeInStart = 0;
+            } else if (vad.speaking && (now - vad.lastSpeechAt) > VAD_SILENCE_MS) {
+                const duration = now - vad.speechStartAt;
+                vad.speaking = false;
+                if (duration >= VAD_MIN_UTTERANCE_MS) {
+                    finishUtteranceRecording();
+                } else {
+                    discardUtteranceRecording();
+                }
             }
-        } else {
-            bargeInStart = 0;
         }
+
+        // Visual feedback — subtle indicator animation
+        if (!blocked) {
+            if (vad.speaking) setMicState('speaking');
+            else setMicState('listening');
+        }
+
         vad.rafId = requestAnimationFrame(tick);
     };
     vad.rafId = requestAnimationFrame(tick);
 }
 
-// Auto-arm mic ``AUTO_LISTEN_DELAY_MS`` after the interviewer finishes
-// speaking. Clears any existing pending timer first.
-function scheduleAutoListen(delay = AUTO_LISTEN_DELAY_MS) {
-    if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
-    vad.armTimer = setTimeout(() => {
-        vad.armTimer = null;
-        if (!sessionId || vad.muted || vad.processing || vad.interviewerSpeaking) return;
-        if (vad.recorder) return;
-        startRecordingTurn();
-    }, delay);
-}
-
-function startRecordingTurn() {
-    if (!audioStream || vad.recorder) return;
+function startUtteranceRecording() {
+    if (!audioStream) return;
     try {
         vad.chunks = [];
         vad.recorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm;codecs=opus' });
         vad.recorder.ondataavailable = (e) => { if (e.data.size > 0) vad.chunks.push(e.data); };
-        vad.recordingStartAt = performance.now();
         vad.recorder.start();
         isRecording = true;
-        setMicState('listening');
     } catch (_) {
         vad.recorder = null;
     }
 }
 
-// Candidate clicked the mic button to end the turn, or the button was
-// pressed programmatically after an interviewer interruption.
-function stopAndSubmitTurn() {
+function finishUtteranceRecording() {
     if (!vad.recorder) return;
     const recorder = vad.recorder;
     vad.recorder = null;
-    const duration = performance.now() - vad.recordingStartAt;
     isRecording = false;
     recorder.onstop = async () => {
         const blob = new Blob(vad.chunks, { type: 'audio/webm' });
         vad.chunks = [];
-        if (duration < MIN_UTTERANCE_MS || blob.size < 3000) {
-            // Nothing meaningful recorded — re-arm for the next attempt.
-            setMicState('idle');
-            scheduleAutoListen();
-            return;
-        }
         await sendAudioAsFile(blob);
     };
     try { recorder.stop(); } catch (_) {}
 }
 
+function discardUtteranceRecording() {
+    if (!vad.recorder) return;
+    const recorder = vad.recorder;
+    vad.recorder = null;
+    vad.chunks = [];
+    isRecording = false;
+    try { recorder.stop(); } catch (_) {}
+}
+
 function stopVAD() {
-    if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
     if (vad.rafId) cancelAnimationFrame(vad.rafId);
     vad.rafId = null;
     if (vad.recorder) {
@@ -786,6 +663,7 @@ function stopVAD() {
         audioStream.getTracks().forEach(t => t.stop());
         audioStream = null;
     }
+    vad.speaking = false;
     vad.processing = false;
     vad.interviewerSpeaking = false;
     isRecording = false;
@@ -793,237 +671,32 @@ function stopVAD() {
 
 async function sendAudioAsFile(blob) {
     if (!sessionId || !blob || blob.size < 2000) return; // guard empty/tiny blobs
-    await streamAudioTurn(blob);
-}
-
-// --- Streaming turn consumers ---
-//
-// Both text and audio paths converge on consumeSSE(). Tokens arrive on
-// event: token, the transcript (voice only) on event: transcript, and the
-// final status on event: done. We feed complete sentences to the Web
-// Speech API as they become available so the interviewer starts
-// speaking ~200 ms after the candidate stops.
-
-async function streamTextTurn(text) {
-    if (!sessionId || !text.trim()) return;
-    const isGreeting = text === 'Hello, I am ready for the interview.';
-    if (!isGreeting) addMessage('user', text);
-    textInput.value = '';
-    setMicState('processing');
-    const responseTime = questionShownAt ? Date.now() - questionShownAt : 0;
-    try {
-        const ctrl = new AbortController();
-        currentStreamCtrl = ctrl;
-        const res = await fetch(`${API}/api/session/${sessionId}/turn-stream`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, time_to_respond_ms: responseTime, is_voice_input: false }),
-            signal: ctrl.signal,
-        });
-        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-        await consumeSSE(res);
-    } catch (err) {
-        if (err.name !== 'AbortError') addMessage('assistant', 'Error: ' + err.message);
-    } finally {
-        currentStreamCtrl = null;
-        // The reply is streaming and TTS is playing — do not arm the mic
-        // here. onSpeechFinished() will call scheduleAutoListen().
-        setMicState('idle');
-        pollEvaluations();
-    }
-}
-
-async function streamAudioTurn(blob) {
     vad.processing = true;
     setMicState('processing');
     try {
         const formData = new FormData();
         formData.append('audio', blob, 'recording.webm');
-        const ctrl = new AbortController();
-        currentStreamCtrl = ctrl;
-        const res = await fetch(`${API}/api/session/${sessionId}/audio-turn-stream`, {
-            method: 'POST',
-            body: formData,
-            signal: ctrl.signal,
-        });
-        if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
-        await consumeSSE(res);
+        const res = await fetch(`${API}/api/session/${sessionId}/audio-turn`, { method: 'POST', body: formData });
+        if (!res.ok) {
+            const detail = await res.text();
+            throw new Error(`${res.status}: ${detail}`);
+        }
+        const data = await res.json();
+        addMessage('user', '[voice input]');
+        updateStatus(data.stage, data.total_turns, null);
+        addMessage('assistant', data.reply, data.audio_url);
+        try {
+            const evalData = await apiGet(`/api/session/${sessionId}/evaluations`);
+            avgScore.textContent = evalData.avg_score != null ? evalData.avg_score.toFixed(1) : '--';
+        } catch (_) {}
+        if (data.is_finished) { showResults(); return; }
     } catch (err) {
-        if (err.name !== 'AbortError') addMessage('assistant', 'Error: ' + err.message);
+        addMessage('assistant', 'Error: ' + err.message);
     } finally {
-        currentStreamCtrl = null;
         vad.processing = false;
-        setMicState('idle');
-        pollEvaluations();
+        if (vad.audioCtx && !vad.muted) setMicState('listening');
+        else setMicState('idle');
     }
-}
-
-async function pollEvaluations() {
-    if (!sessionId) return;
-    try {
-        const evalData = await apiGet(`/api/session/${sessionId}/evaluations`);
-        avgScore.textContent = evalData.avg_score != null ? evalData.avg_score.toFixed(1) : '--';
-    } catch (_) {}
-}
-
-async function consumeSSE(res) {
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let userMsgShown = false;
-    let doneStatus = null;
-    let emptyNoSpeech = false;
-
-    beginStreamingAssistantMessage();
-
-    while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE messages (double-newline separated)
-        let idx;
-        while ((idx = buffer.indexOf('\n\n')) !== -1) {
-            const raw = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 2);
-            const evt = parseSSEBlock(raw);
-            if (!evt) continue;
-            if (evt.event === 'transcript' && !userMsgShown) {
-                addMessage('user', evt.data.text || '[voice input]');
-                userMsgShown = true;
-            } else if (evt.event === 'token') {
-                appendStreamToken(evt.data.text || '');
-            } else if (evt.event === 'done') {
-                doneStatus = evt.data;
-            } else if (evt.event === 'empty') {
-                // Deepgram returned nothing — silence or noise. Silently
-                // drop the assistant bubble and re-arm the mic.
-                emptyNoSpeech = true;
-            } else if (evt.event === 'error') {
-                appendStreamToken('\n[error: ' + (evt.data._error || 'unknown') + ']');
-            }
-        }
-    }
-    if (emptyNoSpeech) {
-        // Remove the empty assistant bubble we optimistically appended,
-        // clear the speaking flag, and re-arm the mic.
-        if (currentAssistantContent && currentAssistantContent.parentElement) {
-            currentAssistantContent.parentElement.remove();
-        }
-        currentAssistantContent = null;
-        vad.interviewerSpeaking = false;
-        speakingIndicator.classList.remove('active');
-        scheduleAutoListen();
-        return;
-    }
-    finishStreamingAssistantMessage();
-    if (doneStatus) {
-        updateStatus(doneStatus.stage, doneStatus.total_turns, null);
-        if (doneStatus.is_finished) { setTimeout(showResults, 2000); }
-    }
-}
-
-function parseSSEBlock(raw) {
-    const lines = raw.split('\n');
-    let event = 'message';
-    const dataLines = [];
-    for (const line of lines) {
-        if (line.startsWith('event:')) event = line.slice(6).trim();
-        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
-    }
-    if (dataLines.length === 0) return null;
-    try { return { event, data: JSON.parse(dataLines.join('\n')) }; }
-    catch (_) { return null; }
-}
-
-function beginStreamingAssistantMessage() {
-    const div = document.createElement('div');
-    div.className = 'message assistant';
-    const sender = document.createElement('div');
-    sender.className = 'sender';
-    sender.textContent = 'Interviewer';
-    div.appendChild(sender);
-    const content = document.createElement('div');
-    div.appendChild(content);
-    conversation.appendChild(div);
-    conversation.scrollTop = conversation.scrollHeight;
-
-    currentAssistantContent = content;
-    currentSpeechSentences = [];
-    currentSpeechBuffer = '';
-    vad.interviewerSpeaking = true;
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
-    speakingIndicator.classList.add('active');
-    questionShownAt = Date.now();
-}
-
-function appendStreamToken(tok) {
-    if (!currentAssistantContent) return;
-    currentAssistantContent.textContent += tok;
-    conversation.scrollTop = conversation.scrollHeight;
-    currentSpeechBuffer += tok;
-    // Flush complete sentences to TTS
-    const re = /[^.!?\n]+[.!?]+[\s]*/g;
-    let m;
-    let lastIdx = 0;
-    while ((m = re.exec(currentSpeechBuffer)) !== null) {
-        enqueueSpeech(m[0].trim());
-        lastIdx = re.lastIndex;
-    }
-    if (lastIdx > 0) currentSpeechBuffer = currentSpeechBuffer.slice(lastIdx);
-}
-
-function finishStreamingAssistantMessage() {
-    if (currentSpeechBuffer.trim()) enqueueSpeech(currentSpeechBuffer.trim());
-    currentSpeechBuffer = '';
-    currentAssistantContent = null;
-    // If the queue is empty and nothing is playing, clear the speaking flag.
-    if (!window.speechSynthesis || (!window.speechSynthesis.speaking && currentSpeechSentences.length === 0)) {
-        vad.interviewerSpeaking = false;
-        speakingIndicator.classList.remove('active');
-    }
-}
-
-function enqueueSpeech(sentence) {
-    if (!isSpeakerOn || !('speechSynthesis' in window) || !sentence) return;
-    currentSpeechSentences.push(sentence);
-    if (!window.speechSynthesis.speaking) playNextSentence();
-}
-
-function playNextSentence() {
-    if (currentSpeechSentences.length === 0) {
-        vad.interviewerSpeaking = false;
-        speakingIndicator.classList.remove('active');
-        return;
-    }
-    const text = currentSpeechSentences.shift();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.2;
-    u.pitch = 1.0;
-    const voices = window.speechSynthesis.getVoices();
-    const preferred = voices.find(v => v.name.includes('Google') && v.lang.startsWith('en'))
-                   || voices.find(v => v.lang.startsWith('en-US'))
-                   || voices.find(v => v.lang.startsWith('en'));
-    if (preferred) u.voice = preferred;
-    u.onend = () => playNextSentence();
-    u.onerror = () => playNextSentence();
-    window.speechSynthesis.speak(u);
-}
-
-// Called by the VAD loop when the candidate starts speaking over the
-// interviewer. Cancels the in-flight SSE request, drops the TTS queue,
-// clears the speaking flag, and logs the barge-in to anti-cheat.
-function interruptInterviewer() {
-    if (currentStreamCtrl) {
-        try { currentStreamCtrl.abort(); } catch (_) {}
-        currentStreamCtrl = null;
-    }
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
-    currentSpeechSentences = [];
-    currentSpeechBuffer = '';
-    vad.interviewerSpeaking = false;
-    speakingIndicator.classList.remove('active');
-    if (antiCheat && antiCheat._record) antiCheat._record('interruption', {});
 }
 
 // --- Jobs ---
@@ -1210,23 +883,16 @@ window.sendInvite = async function(appId) {
 // --- Event listeners ---
 startBtn.addEventListener('click', startSession);
 
-// Mic button:
-//   - while recording: stop + submit (end-of-turn).
-//   - while waiting / processing: toggle mute.
+// Mic button = mute/unmute toggle (no push-to-talk; VAD does the work).
 micBtn.addEventListener('click', () => {
     if (!sessionId) return;
-    if (vad.recorder) {
-        stopAndSubmitTurn();
-        return;
-    }
     vad.muted = !vad.muted;
     if (vad.muted) {
-        if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
+        if (vad.recorder) discardUtteranceRecording();
         setMicState('muted');
     } else {
         if (!vad.audioCtx) startVAD();
-        setMicState('idle');
-        if (!vad.interviewerSpeaking && !vad.processing) scheduleAutoListen(0);
+        else setMicState('listening');
     }
 });
 cameraBtn.addEventListener('click', () => {
@@ -1255,12 +921,12 @@ speakerBtn.addEventListener('click', () => {
     if (!isSpeakerOn && window.speechSynthesis) window.speechSynthesis.cancel();
 });
 
-sendBtn.addEventListener('click', () => streamTextTurn(textInput.value));
+sendBtn.addEventListener('click', () => sendTextTurn(textInput.value));
 
 textInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        streamTextTurn(textInput.value);
+        sendTextTurn(textInput.value);
     }
 });
 

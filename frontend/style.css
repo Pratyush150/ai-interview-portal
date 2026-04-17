@@ -387,37 +387,6 @@ body {
     border: 1px solid var(--border);
 }
 
-/* Recruiter X-ray dashboard */
-.xray-h {
-    font-size: 0.9rem;
-    font-weight: 600;
-    margin: 1.25rem 0 0.5rem;
-    color: var(--text);
-    letter-spacing: 0.02em;
-}
-.xray-svg {
-    display: block;
-    width: 100%;
-    max-width: 340px;
-    margin: 0 auto 0.5rem;
-}
-.xray-bar {
-    padding: 0.55rem 0.8rem;
-    border-radius: 6px;
-    font-size: 0.82rem;
-    color: var(--text);
-    border: 1px solid var(--border);
-}
-.xray-flags { display: flex; flex-direction: column; gap: 0.3rem; }
-.xray-flag-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.78rem; }
-.xray-flag-label { flex: 0 0 40%; color: var(--text-muted); text-transform: capitalize; }
-.xray-flag-bar { flex: 1; background: var(--surface-hover); height: 8px; border-radius: 4px; overflow: hidden; }
-.xray-flag-bar > div { background: var(--warning); height: 100%; }
-.xray-flag-count { flex: 0 0 2rem; text-align: right; color: var(--text); font-weight: 600; }
-.xray-dim-row { font-size: 0.75rem; color: var(--text-muted); padding-left: 1rem; }
-.xray-strength { color: var(--success); font-size: 0.8rem; padding-left: 1rem; }
-.xray-weakness { color: var(--warning); font-size: 0.8rem; padding-left: 1rem; }
-
 /* Scrollbar */
 .conversation::-webkit-scrollbar { width: 5px; }
 .conversation::-webkit-scrollbar-track { background: transparent; }
