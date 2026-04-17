@@ -37,7 +37,7 @@ that watches the camera, the keyboard, and the tab.
 6. [Interview stage machine](#interview-stage-machine)
 7. [LLM pipeline](#llm-pipeline)
 8. [Speech pipeline — STT & TTS](#speech-pipeline)
-9. [Always-on microphone + VAD](#always-on-microphone--vad)
+9. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
 10. [Anti-cheat subsystem](#anti-cheat-subsystem)
 11. [AI-generated-answer detection](#ai-generated-answer-detection)
 12. [Scoring rubric](#scoring-rubric)
@@ -315,42 +315,55 @@ Server path (`USE_SERVER_TTS=1`):
 
 ---
 
-## Always-on microphone + VAD
+## Always-on microphone + click-to-finish
 
-File: `frontend/app.js` (the `vad` object + `startVAD` / `vadLoop`)
+File: `frontend/app.js` (the `vad` object + `startVAD` / `scheduleAutoListen` /
+`startRecordingTurn` / `stopAndSubmitTurn`)
 
-Design: the mic opens once at session start and stays open. The browser's
-`AnalyserNode` feeds a 1024-sample buffer every animation frame; we compute
-RMS energy per frame. Two thresholds:
+Design: the mic stream is requested once at session start and stays open.
+Recording is driven by **explicit turn boundaries**, not silence detection —
+silence-based VAD too aggressively cut off candidates mid-thought.
 
-| constant              | value     | meaning                                     |
-|-----------------------|-----------|---------------------------------------------|
-| `VAD_RMS_THRESHOLD`   | `0.022`   | energy above this counts as speech          |
-| `VAD_SILENCE_MS`      | `1400`    | silence window that ends an utterance       |
-| `VAD_MIN_UTTERANCE_MS`| `700`     | discard blips (coughs, pops) shorter than this |
+| constant             | value   | meaning                                            |
+|----------------------|---------|----------------------------------------------------|
+| `AUTO_LISTEN_DELAY_MS` | `800` | gap between interviewer finishing and mic arming   |
+| `MIN_UTTERANCE_MS`   | `500`   | discard accidental taps shorter than this          |
 
 Flow:
 
 ```
-IDLE (listening)
-  │ rms > 0.022  ─▶ start MediaRecorder, mark speechStartAt
+interviewer TTS finishes
+  │
+  │ wait AUTO_LISTEN_DELAY_MS (800 ms)
   ▼
-SPEAKING
-  │ every frame rms > 0.022 ─▶ refresh lastSpeechAt
-  │ no speech for VAD_SILENCE_MS ─▶ stop recorder
+RECORDING  ─  "Listening — click mic when finished"
+  │ (candidate speaks for as long as they need — no silence cutoff)
+  │
+  │ candidate clicks mic button (or presses Space)
   ▼
-[duration < 700ms]  ─▶ discard blob
-[duration >= 700ms] ─▶ POST /audio-turn  (sets vad.processing = true)
-                       on response, resume IDLE
+[duration < 500 ms or blob < 3 KB] ─▶ discard, show "I didn't hear anything", re-arm
+[otherwise]                        ─▶ POST /audio-turn
+                                       ├─ 400 "no speech detected" ─▶ show hint, re-arm
+                                       └─ 200 ─▶ render reply, TTS, re-arm after
 ```
 
-**Why VAD is blocked during TTS.** When the interviewer's voice plays out
-of the speakers the mic would pick it up and re-transcribe it. Before we
-render an assistant message we set `vad.interviewerSpeaking = true`;
-`onSpeechFinished()` (fired by both the Web Speech API's `onend` and the
-`<audio>` `onended` event) clears it.
+**Why recording is blocked during TTS.** When the interviewer's voice
+plays out of the speakers the mic would pick it up. Before we render an
+assistant message we set `vad.interviewerSpeaking = true`;
+`onSpeechFinished()` (fired by the Web Speech API's `onend`, the
+`<audio>` `onended` event, or a safety timeout that defeats Chrome's
+silent-fail TTS bug) clears it and triggers the auto-arm.
 
-**Mic button** is now a mute toggle (or spacebar). No push-to-talk.
+**Mic button behavior:**
+
+| State                          | Click action              |
+|--------------------------------|---------------------------|
+| Recording (red, pulsing)       | Stop recording + submit   |
+| Waiting (interviewer speaking) | Mute toggle               |
+| Idle (between turns)           | Mute toggle / unmute+arm  |
+
+Spacebar is bound to the same handler, so the candidate can finish their
+answer hands-free.
 
 ---
 
@@ -551,22 +564,23 @@ Password hashing uses a random 16-byte salt with SHA-256 → stored as
 
 End-to-end turn latency, voice path, measured on a typical WSL2 dev box:
 
-| Hop                       | Latency    | Notes                                      |
-|---------------------------|------------|--------------------------------------------|
-| VAD detects end-of-utterance | +1.4 s  | `VAD_SILENCE_MS`; lowering risks cutoffs   |
-| Blob upload to `/audio-turn` | 50–200 ms | depends on Opus blob size                |
-| Deepgram STT              | 300–800 ms | `nova-2` file mode                         |
-| Groq LLM (70b)            | 500–1800 ms| halved on stages running the 8b fast model |
-| Server TTS (if enabled)   | 500–1500 ms| ElevenLabs turbo_v2_5                      |
-| Browser TTS (default)     | ~0 ms      | Web Speech API, starts immediately         |
+| Hop                          | Latency    | Notes                                    |
+|------------------------------|------------|------------------------------------------|
+| Candidate clicks mic to stop | instant    | explicit turn boundary, no silence wait  |
+| Blob upload to `/audio-turn` | 50–200 ms  | depends on Opus blob size                |
+| Deepgram STT                 | 300–800 ms | `nova-2` file mode                       |
+| Groq LLM (70b)               | 500–1800 ms| halved on stages running the 8b fast model |
+| Server TTS (if enabled)      | 500–1500 ms| ElevenLabs turbo_v2_5                    |
+| Browser TTS (default)        | ~0 ms      | Web Speech API, starts immediately       |
+| Auto-arm after interviewer   | +800 ms    | `AUTO_LISTEN_DELAY_MS`                   |
 
-Total with `USE_SERVER_TTS=0`: ~2.3–4.2 s from the moment the candidate
-stops speaking to the moment the interviewer starts replying.
+Total with `USE_SERVER_TTS=0`: ~0.9–2.8 s from the moment the candidate
+clicks to stop to the moment the interviewer starts replying.
 
 Knobs to turn if a turn still feels slow:
-- Shrink `VAD_SILENCE_MS` (default 1400 ms) — but watch for the system
-  submitting half-finished thoughts.
 - Move more stages onto `GROQ_FAST_MODEL` in `structured.py`.
 - Keep `USE_SERVER_TTS=0` unless voice quality is required.
 - Reduce the history window (`structured.py` currently keeps the last 8
   messages). Going below 6 starts to cost continuity.
+- Shrink `AUTO_LISTEN_DELAY_MS` in `app.js` (default 800 ms) — but too
+  low can re-arm before the candidate realizes the interviewer finished.

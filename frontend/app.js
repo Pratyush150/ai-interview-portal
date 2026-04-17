@@ -46,22 +46,22 @@ let companyId = null;
 let companyToken = null;
 let currentTypingAnimation = null;
 
-// --- VAD (Voice Activity Detection) state ---
+// --- Mic state (click-to-finish model) ---
+// After the interviewer finishes speaking the mic auto-arms and starts
+// recording. The candidate speaks for as long as they need and clicks
+// the mic button to end the turn — no silence-based auto-submit.
 let vad = {
-    enabled: true,
     muted: false,              // user toggled the mic off
-    audioCtx: null,
-    analyser: null,
-    sourceNode: null,
-    rafId: null,
-    recorder: null,
+    recorder: null,            // active MediaRecorder (truthy while recording)
     chunks: [],
-    speaking: false,           // candidate is currently producing speech
-    speechStartAt: 0,
-    lastSpeechAt: 0,
+    recordingStartAt: 0,
     processing: false,         // we're uploading / waiting for a reply
-    interviewerSpeaking: false // we pause VAD while the interviewer talks
+    interviewerSpeaking: false,// paused while the interviewer talks
+    armTimer: null,            // pending auto-start timer
+    streamReady: false,        // audioStream has been obtained
 };
+const AUTO_LISTEN_DELAY_MS = 800; // gap between interviewer end and mic arm
+const MIN_UTTERANCE_MS = 500;      // discard fat-finger taps shorter than this
 const VAD_RMS_THRESHOLD = 0.022;   // energy above this = probable speech
 const VAD_SILENCE_MS = 1400;       // end-of-utterance after this much silence
 const VAD_MIN_UTTERANCE_MS = 700;  // discard blips shorter than this
@@ -116,6 +116,7 @@ async function apiGet(path, authToken) {
 }
 
 // --- Browser TTS with word-by-word sync ---
+let speechSafetyTimer = null;
 function speakText(text, contentEl) {
     if (!isSpeakerOn || !('speechSynthesis' in window)) {
         // No speech — just reveal all text immediately
@@ -139,16 +140,12 @@ function speakText(text, contentEl) {
     speakingIndicator.classList.add('active');
 
     // Word-by-word typing animation synced with speech duration
+    const words = text.split(' ');
+    const msPerWord = Math.max(60, (60000 / (150 * utterance.rate)) * 0.9);
     if (contentEl) {
-        const words = text.split(' ');
-        // Estimate speech duration: ~150 words/min at rate 1.3 => ~115ms per word adjusted
-        const msPerWord = Math.max(60, (60000 / (150 * utterance.rate)) * 0.9);
         contentEl.textContent = '';
         let wordIndex = 0;
-
-        // Cancel any previous animation
         if (currentTypingAnimation) clearInterval(currentTypingAnimation);
-
         currentTypingAnimation = setInterval(() => {
             if (wordIndex < words.length) {
                 contentEl.textContent += (wordIndex > 0 ? ' ' : '') + words[wordIndex];
@@ -161,38 +158,45 @@ function speakText(text, contentEl) {
         }, msPerWord);
     }
 
-    utterance.onend = () => {
+    let finished = false;
+    const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (speechSafetyTimer) { clearTimeout(speechSafetyTimer); speechSafetyTimer = null; }
         speakingIndicator.classList.remove('active');
-        // Ensure all text is revealed when speech ends
-        if (contentEl) {
-            if (currentTypingAnimation) {
-                clearInterval(currentTypingAnimation);
-                currentTypingAnimation = null;
-            }
-            contentEl.textContent = text;
-        }
-        onSpeechFinished();
-    };
-    utterance.onerror = () => {
-        speakingIndicator.classList.remove('active');
-        if (contentEl) contentEl.textContent = text;
         if (currentTypingAnimation) {
             clearInterval(currentTypingAnimation);
             currentTypingAnimation = null;
         }
+        if (contentEl) contentEl.textContent = text;
         onSpeechFinished();
     };
+
+    utterance.onend = finish;
+    utterance.onerror = finish;
+
+    // Safety net: Chrome's speechSynthesis sometimes never fires onend
+    // (known bug — especially on the first call before voices load, or
+    // for >15s utterances). Without this, vad.interviewerSpeaking stays
+    // true forever and the mic never re-arms. Fall back to the typing
+    // animation's expected duration + a 2s cushion.
+    const expectedMs = words.length * msPerWord + 2000;
+    if (speechSafetyTimer) clearTimeout(speechSafetyTimer);
+    speechSafetyTimer = setTimeout(finish, Math.max(expectedMs, 3000));
 
     window.speechSynthesis.speak(utterance);
 }
 
-// Called both when TTS finishes and when the typed-text animation completes.
-// Resumes VAD so the candidate can respond without clicking.
+// Called when the interviewer's TTS finishes (or the safety timeout fires).
+// Schedules the auto-arm: after AUTO_LISTEN_DELAY_MS the mic begins
+// recording the candidate's answer. The recording stops only when the
+// candidate clicks the mic button.
 function onSpeechFinished() {
     vad.interviewerSpeaking = false;
     if (!sessionId) return;
-    if (vad.audioCtx && !vad.muted) {
-        setMicState('listening');
+    if (!vad.muted && !vad.processing) {
+        setMicState('idle');
+        scheduleAutoListen();
     }
 }
 
@@ -226,7 +230,6 @@ function addMessage(role, text, audioUrl) {
             // Server TTS available — play it hidden, type along
             const audio = new Audio(audioUrl.startsWith('blob:') ? audioUrl : `${API}${audioUrl}`);
             audio.play().catch(() => {});
-            // Still do typing animation
             const words = text.split(' ');
             const msPerWord = 100;
             content.textContent = '';
@@ -243,7 +246,10 @@ function addMessage(role, text, audioUrl) {
                 }
             }, msPerWord);
             speakingIndicator.classList.add('active');
-            audio.onended = () => {
+            let audioFinished = false;
+            const finishAudio = () => {
+                if (audioFinished) return;
+                audioFinished = true;
                 speakingIndicator.classList.remove('active');
                 if (currentTypingAnimation) {
                     clearInterval(currentTypingAnimation);
@@ -252,6 +258,10 @@ function addMessage(role, text, audioUrl) {
                 content.textContent = text;
                 onSpeechFinished();
             };
+            audio.onended = finishAudio;
+            audio.onerror = finishAudio;
+            // Safety net in case the audio element never fires 'ended'
+            setTimeout(finishAudio, words.length * msPerWord + 3000);
         } else {
             // Browser TTS — typing animation synced with speech
             speakText(text, content);
@@ -273,16 +283,11 @@ function setMicState(state) {
     micIndicator.className = 'indicator';
     switch (state) {
         case 'idle':
-            micText.textContent = vad.muted ? 'Mic muted — click to unmute' : 'Mic off';
+            micText.textContent = vad.muted ? 'Mic muted — click to unmute' : 'Waiting...';
             micBtn.classList.remove('recording');
             break;
         case 'listening':
-            micText.textContent = 'Listening — just speak, pause when done';
-            micIndicator.classList.add('listening');
-            micBtn.classList.add('recording');
-            break;
-        case 'speaking':
-            micText.textContent = 'Hearing you...';
+            micText.textContent = 'Listening — click mic when finished';
             micIndicator.classList.add('listening');
             micBtn.classList.add('recording');
             break;
@@ -439,9 +444,10 @@ async function startSession() {
         antiCheat = new AntiCheatMonitor(sessionId, API);
         antiCheat.start();
         questionShownAt = Date.now();
-        // Kick off always-on mic. The VAD loop auto-pauses while the
-        // interviewer is speaking so the greeting won't be captured.
-        startVAD();
+        // Request mic permission and open the audio stream BEFORE sending
+        // the greeting — otherwise the greeting's TTS can finish before
+        // audioStream is ready, and the auto-arm would silently bail.
+        await startVAD();
         await sendTextTurn('Hello, I am ready for the interview.');
     } catch (err) {
         alert('Failed to start session: ' + err.message);
@@ -532,16 +538,16 @@ async function showResults() {
     }
 }
 
-// --- Always-on mic with Voice Activity Detection ---
+// --- Click-to-finish mic ---
 //
-// Once the interview starts we hold an open audio stream and continuously
-// analyze RMS energy. When energy rises above VAD_RMS_THRESHOLD we start a
-// MediaRecorder; when energy stays below the threshold for VAD_SILENCE_MS
-// we stop the recorder and submit the utterance as a turn. The mic button
-// becomes a mute toggle instead of a push-to-talk button.
+// Interviewer finishes speaking → after AUTO_LISTEN_DELAY_MS the mic
+// auto-arms and a MediaRecorder starts capturing. The candidate speaks
+// as long as they need — the system never cuts them off on silence.
+// They click the mic button to end the turn, which stops the recorder
+// and submits the blob.
 
 async function startVAD() {
-    if (vad.audioCtx) return; // already running
+    if (vad.streamReady) return;
     try {
         audioStream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -552,131 +558,112 @@ async function startVAD() {
                 autoGainControl: true,
             }
         });
+        vad.streamReady = true;
     } catch (err) {
         alert('Microphone access denied. Please allow mic access to continue.');
-        vad.enabled = false;
         return;
     }
-
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    vad.audioCtx = new AudioCtx();
-    vad.sourceNode = vad.audioCtx.createMediaStreamSource(audioStream);
-    vad.analyser = vad.audioCtx.createAnalyser();
-    vad.analyser.fftSize = 1024;
-    vad.sourceNode.connect(vad.analyser);
-    setMicState('listening');
-    vadLoop();
+    setMicState('idle');
 }
 
-function vadLoop() {
-    const buf = new Float32Array(vad.analyser.fftSize);
-    const tick = () => {
-        if (!vad.audioCtx) return;
-        vad.analyser.getFloatTimeDomainData(buf);
-        let sum = 0;
-        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
-        const rms = Math.sqrt(sum / buf.length);
-        const now = performance.now();
-
-        const blocked = vad.muted || vad.processing || vad.interviewerSpeaking;
-        const above = rms > VAD_RMS_THRESHOLD;
-
-        if (!blocked) {
-            if (above) {
-                vad.lastSpeechAt = now;
-                if (!vad.speaking) {
-                    vad.speaking = true;
-                    vad.speechStartAt = now;
-                    startUtteranceRecording();
-                }
-            } else if (vad.speaking && (now - vad.lastSpeechAt) > VAD_SILENCE_MS) {
-                const duration = now - vad.speechStartAt;
-                vad.speaking = false;
-                if (duration >= VAD_MIN_UTTERANCE_MS) {
-                    finishUtteranceRecording();
-                } else {
-                    discardUtteranceRecording();
-                }
-            }
-        }
-
-        // Visual feedback — subtle indicator animation
-        if (!blocked) {
-            if (vad.speaking) setMicState('speaking');
-            else setMicState('listening');
-        }
-
-        vad.rafId = requestAnimationFrame(tick);
-    };
-    vad.rafId = requestAnimationFrame(tick);
+function scheduleAutoListen(delay = AUTO_LISTEN_DELAY_MS) {
+    if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
+    vad.armTimer = setTimeout(() => {
+        vad.armTimer = null;
+        if (!sessionId || vad.muted || vad.processing || vad.interviewerSpeaking) return;
+        if (vad.recorder) return;
+        startRecordingTurn();
+    }, delay);
 }
 
-function startUtteranceRecording() {
-    if (!audioStream) return;
+function startRecordingTurn() {
+    if (!audioStream || vad.recorder) return;
     try {
         vad.chunks = [];
         vad.recorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm;codecs=opus' });
         vad.recorder.ondataavailable = (e) => { if (e.data.size > 0) vad.chunks.push(e.data); };
+        vad.recordingStartAt = performance.now();
         vad.recorder.start();
         isRecording = true;
+        setMicState('listening');
     } catch (_) {
         vad.recorder = null;
     }
 }
 
-function finishUtteranceRecording() {
+// Candidate clicked mic to end the turn.
+function stopAndSubmitTurn() {
     if (!vad.recorder) return;
     const recorder = vad.recorder;
     vad.recorder = null;
+    const duration = performance.now() - vad.recordingStartAt;
     isRecording = false;
     recorder.onstop = async () => {
         const blob = new Blob(vad.chunks, { type: 'audio/webm' });
         vad.chunks = [];
+        if (duration < MIN_UTTERANCE_MS || blob.size < 3000) {
+            // Accidental tap / nothing recorded — re-arm instead of submitting.
+            setMicState('idle');
+            scheduleAutoListen();
+            return;
+        }
         await sendAudioAsFile(blob);
     };
     try { recorder.stop(); } catch (_) {}
 }
 
-function discardUtteranceRecording() {
-    if (!vad.recorder) return;
-    const recorder = vad.recorder;
-    vad.recorder = null;
-    vad.chunks = [];
-    isRecording = false;
-    try { recorder.stop(); } catch (_) {}
-}
-
 function stopVAD() {
-    if (vad.rafId) cancelAnimationFrame(vad.rafId);
-    vad.rafId = null;
+    if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
     if (vad.recorder) {
         try { vad.recorder.stop(); } catch (_) {}
         vad.recorder = null;
     }
-    if (vad.audioCtx) {
-        try { vad.audioCtx.close(); } catch (_) {}
-    }
-    vad.audioCtx = null;
-    vad.analyser = null;
-    vad.sourceNode = null;
     if (audioStream) {
         audioStream.getTracks().forEach(t => t.stop());
         audioStream = null;
     }
-    vad.speaking = false;
+    vad.streamReady = false;
     vad.processing = false;
     vad.interviewerSpeaking = false;
     isRecording = false;
 }
 
+function showTurnHint(text) {
+    let el = document.getElementById('turn-hint');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'turn-hint';
+        el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);padding:8px 16px;background:#f59e0b;color:white;border-radius:8px;font-size:0.9rem;z-index:9999;transition:opacity 0.4s;box-shadow:0 2px 8px rgba(0,0,0,0.2)';
+        document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.style.opacity = '1';
+    clearTimeout(el._hideTimer);
+    el._hideTimer = setTimeout(() => { el.style.opacity = '0'; }, 3000);
+}
+
 async function sendAudioAsFile(blob) {
-    if (!sessionId || !blob || blob.size < 2000) return; // guard empty/tiny blobs
+    if (!sessionId || !blob || blob.size < 2000) {
+        showTurnHint("I didn't hear anything — please speak up and try again.");
+        setMicState('idle');
+        scheduleAutoListen();
+        return;
+    }
     vad.processing = true;
     setMicState('processing');
     try {
         const formData = new FormData();
         formData.append('audio', blob, 'recording.webm');
         const res = await fetch(`${API}/api/session/${sessionId}/audio-turn`, { method: 'POST', body: formData });
+        if (res.status === 400) {
+            // "No speech detected" — Deepgram couldn't transcribe. Re-arm
+            // silently without poisoning the conversation with an error bubble.
+            showTurnHint("I didn't catch that — please try again.");
+            vad.processing = false;
+            setMicState('idle');
+            scheduleAutoListen();
+            return;
+        }
         if (!res.ok) {
             const detail = await res.text();
             throw new Error(`${res.status}: ${detail}`);
@@ -691,11 +678,11 @@ async function sendAudioAsFile(blob) {
         } catch (_) {}
         if (data.is_finished) { showResults(); return; }
     } catch (err) {
-        addMessage('assistant', 'Error: ' + err.message);
+        showTurnHint('Network error — please try again.');
+        setMicState('idle');
+        scheduleAutoListen();
     } finally {
         vad.processing = false;
-        if (vad.audioCtx && !vad.muted) setMicState('listening');
-        else setMicState('idle');
     }
 }
 
@@ -883,16 +870,23 @@ window.sendInvite = async function(appId) {
 // --- Event listeners ---
 startBtn.addEventListener('click', startSession);
 
-// Mic button = mute/unmute toggle (no push-to-talk; VAD does the work).
+// Mic button:
+//   - while recording: stop + submit (end-of-turn).
+//   - while waiting / processing: toggle mute.
 micBtn.addEventListener('click', () => {
     if (!sessionId) return;
+    if (vad.recorder) {
+        stopAndSubmitTurn();
+        return;
+    }
     vad.muted = !vad.muted;
     if (vad.muted) {
-        if (vad.recorder) discardUtteranceRecording();
+        if (vad.armTimer) { clearTimeout(vad.armTimer); vad.armTimer = null; }
         setMicState('muted');
     } else {
-        if (!vad.audioCtx) startVAD();
-        else setMicState('listening');
+        if (!vad.streamReady) startVAD();
+        setMicState('idle');
+        if (!vad.interviewerSpeaking && !vad.processing) scheduleAutoListen(0);
     }
 });
 cameraBtn.addEventListener('click', () => {
