@@ -27,6 +27,53 @@ class Stage(str, Enum):
     FINISHED = "finished"
 
 
+def auto_calibrate(experience_years: float | None, job_title: str, job_description: str) -> dict:
+    """Resolve ``persona`` + ``difficulty_level`` from resume experience
+    and the job posting. This is the single source of truth used at
+    session creation so the candidate cannot self-select an easier
+    interview."""
+    years = float(experience_years or 0)
+    blob = f"{job_title or ''} {job_description or ''}".lower()
+    is_lead = any(k in blob for k in (
+        "lead", "staff", "principal", "director", "head of", "architect",
+        "cto", " chief "
+    ))
+    is_senior_role = any(k in blob for k in ("senior", "sr.", "sr "))
+    is_junior_role = any(k in blob for k in ("junior", "intern", "entry", "fresher"))
+
+    if is_lead or years >= 10:
+        return {"persona": "cto", "difficulty_level": "senior"}
+    if is_senior_role or years >= 6:
+        return {"persona": "senior", "difficulty_level": "senior"}
+    if is_junior_role or years < 2:
+        return {"persona": "mentor", "difficulty_level": "junior"}
+    return {"persona": "senior", "difficulty_level": "mid"}
+
+
+DIFFICULTY_DIRECTIVES = {
+    "junior": (
+        "Difficulty calibration: JUNIOR. Ask foundational questions — "
+        "language fundamentals, basic data structures, how one specific "
+        "system works end-to-end. Keep scenarios small (single service, "
+        "one database). Expect the candidate to know WHAT, sometimes WHY, "
+        "rarely deep HOW."
+    ),
+    "mid": (
+        "Difficulty calibration: MID-LEVEL. Ask questions that require "
+        "design trade-offs on a single component — caching strategy, "
+        "schema choice, concurrency primitives. Probe for production "
+        "experience: 'have you run this at scale? what broke?'"
+    ),
+    "senior": (
+        "Difficulty calibration: SENIOR. Ask multi-component system "
+        "design, distributed-systems trade-offs (CAP, consistency "
+        "models, failure modes), cost/latency envelopes with concrete "
+        "numbers. Expect the candidate to own the decision framework, "
+        "not just name the technology."
+    ),
+}
+
+
 STAGE_TURN_LIMITS = {
     Stage.INTRO: 2,
     Stage.BACKGROUND: 4,
@@ -142,6 +189,12 @@ class InterviewSession:
     key_claims: list[str] = field(default_factory=list)
     # Persona drives the interviewer's tone (mentor / senior / cto).
     persona: str = DEFAULT_PERSONA
+    # Difficulty calibration, resolved from resume years + job title:
+    # "junior" | "mid" | "senior". Injected into the system prompt so
+    # the LLM targets the right question depth. The candidate cannot
+    # pick this — preventing self-selection into an easier interview.
+    difficulty_level: str = "mid"
+    experience_years: float | None = None
     # True when the last answer was judged vague; next turn will drill
     # deeper rather than moving on.
     last_answer_was_vague: bool = False
@@ -153,6 +206,9 @@ class InterviewSession:
     def _system_prompt(self) -> str:
         stage_overlay = STAGE_PROMPTS.get(self.stage, "")
         parts = [BASE_SYSTEM_PROMPT, f"\n\nCurrent stage: {self.stage.value}.", stage_overlay]
+        diff_directive = DIFFICULTY_DIRECTIVES.get(self.difficulty_level)
+        if diff_directive:
+            parts.append(diff_directive)
         if self.candidate_name:
             parts.append(f"\nCandidate name: {self.candidate_name}.")
         if self.resume_context:
@@ -328,6 +384,7 @@ class InterviewSession:
             asked_topics=self.asked_topics,
             key_claims=self.key_claims,
             vague_last_answer=self.last_answer_was_vague,
+            difficulty_level=self.difficulty_level,
         ):
             token_buffer.append(tok)
             yield tok
@@ -454,6 +511,8 @@ class InterviewSession:
             "cheating_flags_count": len(self.cheating_flags),
             "topics_covered": self.asked_topics,
             "persona": self.persona,
+            "difficulty_level": self.difficulty_level,
+            "experience_years": self.experience_years,
             "key_claims_count": len(self.key_claims),
         }
 

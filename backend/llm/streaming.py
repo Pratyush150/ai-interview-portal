@@ -58,6 +58,13 @@ SPOKEN_SYSTEM_PROMPT_BASE = (
 )
 
 
+DIFFICULTY_HINTS = {
+    "junior": "Target junior level: fundamentals, single-component questions.",
+    "mid": "Target mid level: design trade-offs, production experience.",
+    "senior": "Target senior level: distributed systems, CAP, concrete numbers.",
+}
+
+
 def build_spoken_system_prompt(
     stage: str,
     persona: str,
@@ -66,9 +73,11 @@ def build_spoken_system_prompt(
     asked_topics: list[str] | None = None,
     key_claims: list[str] | None = None,
     vague_last_answer: bool = False,
+    difficulty_level: str = "mid",
 ) -> str:
     parts = [SPOKEN_SYSTEM_PROMPT_BASE]
     parts.append(PERSONAS.get(persona, PERSONAS[DEFAULT_PERSONA]))
+    parts.append(DIFFICULTY_HINTS.get(difficulty_level, DIFFICULTY_HINTS["mid"]))
     parts.append(f"Current stage: {stage}.")
     if resume_context:
         parts.append(f"Candidate background:\n{resume_context}")
@@ -106,6 +115,7 @@ def stream_spoken_reply(
     asked_topics: list[str] | None,
     key_claims: list[str] | None,
     vague_last_answer: bool,
+    difficulty_level: str = "mid",
 ) -> Iterator[str]:
     """Synchronous generator yielding reply tokens from Groq streaming."""
     api_key = os.getenv("GROQ_API_KEY")
@@ -123,6 +133,7 @@ def stream_spoken_reply(
         asked_topics=asked_topics,
         key_claims=key_claims,
         vague_last_answer=vague_last_answer,
+        difficulty_level=difficulty_level,
     )
     trimmed_history = history[-8:] if history and len(history) > 8 else history
     messages = [{"role": "system", "content": system_content}]

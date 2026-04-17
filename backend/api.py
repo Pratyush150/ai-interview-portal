@@ -35,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from backend.interview.engine import InterviewSession, Stage
+from backend.interview.engine import InterviewSession, Stage, auto_calibrate
 from backend.tts.elevenlabs_tts import synthesize
 from backend.stt.deepgram_stt import transcribe_file
 from backend.stt.deepgram_streaming import StreamingTranscriber
@@ -150,6 +150,7 @@ def create_session(req: SessionCreate):
     job_skills = []
     job_description = ""
     candidate_name = req.candidate_name
+    experience_years: float | None = None
 
     # Load resume context if provided
     if req.resume_id:
@@ -163,6 +164,7 @@ def create_session(req: SessionCreate):
                 resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
             if skills_data.get("suggested_questions"):
                 resume_context += f"\nSuggested questions: {'; '.join(skills_data['suggested_questions'][:5])}"
+            experience_years = skills_data.get("experience_years")
 
     # Load job context if provided
     if req.job_id:
@@ -198,6 +200,13 @@ def create_session(req: SessionCreate):
                 resume_context = skills_data.get("experience_summary", app_row["raw_text"][:1000])
                 if skills_data.get("skills"):
                     resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
+                if experience_years is None:
+                    experience_years = skills_data.get("experience_years")
+
+    # Auto-calibrate persona + difficulty from resume experience + JD.
+    # The candidate has no say in this — prevents self-selection into an
+    # easier interview.
+    calibration = auto_calibrate(experience_years, job_title, job_description)
 
     session = InterviewSession(
         session_id=sid,
@@ -207,7 +216,12 @@ def create_session(req: SessionCreate):
         job_title=job_title,
         job_skills=job_skills,
         job_description=job_description,
+        persona=calibration["persona"],
+        difficulty_level=calibration["difficulty_level"],
+        experience_years=experience_years,
     )
+    # Explicit persona override still works (e.g. from an admin / company
+    # dashboard) but is not exposed to the candidate UI.
     if req.persona:
         session.set_persona(req.persona)
     sessions[sid] = session
@@ -404,8 +418,13 @@ async def audio_turn_stream(session_id: str, audio: UploadFile = File(...)):
     finally:
         tmp_path.unlink(missing_ok=True)
 
+    # Empty-transcript cases (silence, background hum, accidental tap) used
+    # to raise 400, which breaks the streaming consumer. Return a 200 SSE
+    # with a silent "empty" event instead — the UI discards it.
     if not transcript or not transcript.strip():
-        raise HTTPException(400, "No speech detected in audio")
+        async def empty_stream():
+            yield f"event: empty\ndata: {json.dumps({'reason': 'no_speech'})}\n\n"
+        return StreamingResponse(empty_stream(), media_type="text/event-stream")
 
     loop = asyncio.get_event_loop()
 
