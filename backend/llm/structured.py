@@ -109,6 +109,8 @@ def ask_llm_structured(
     resume_context: str = "",
     job_context: str = "",
     asked_topics: list[str] | None = None,
+    role_profile=None,
+    seniority: str | None = None,
 ) -> InterviewResponse:
     """Send a prompt and parse the structured JSON response."""
     api_key = os.getenv("GROQ_API_KEY")
@@ -117,22 +119,30 @@ def ask_llm_structured(
         raise RuntimeError("GROQ_API_KEY missing in .env")
 
     system_content = f"{STRUCTURED_SYSTEM_PROMPT}\n\nCurrent interview stage: {stage}."
+    if role_profile is not None:
+        system_content += (
+            f"\n\nROLE FAMILY: {role_profile.display_name} ({seniority or 'mid'}).\n"
+            f"{role_profile.interviewer_persona}\n"
+            f"Topic rotation set for this role: {', '.join(role_profile.topic_categories)}."
+        )
     if resume_context:
         system_content += f"\n\nCandidate resume context:\n{resume_context}"
         system_content += "\nTailor questions to the candidate's specific experience and skills, but VARY the topics."
     if job_context:
         system_content += f"\n\nJob context:\n{job_context}"
-        system_content += "\nFocus technical questions on the required skills for this role."
+        system_content += "\nFocus core-stage questions on the required skills and role competencies above."
 
-    # Topic diversity enforcement
+    # Topic diversity enforcement — prefer the role-specific rotation when we have one.
     if asked_topics:
+        rotation = (
+            ", ".join(role_profile.topic_categories)
+            if role_profile is not None
+            else "system design, algorithms, databases, APIs, testing, DevOps, security, code quality"
+        )
         system_content += (
             f"\n\nCRITICAL — TOPIC DIVERSITY: These topics have already been covered: "
             f"{', '.join(asked_topics)}. "
-            f"You MUST ask about a DIFFERENT topic now. Do NOT repeat or revisit these areas. "
-            f"Pick a completely new technical area from the candidate's skills or the job requirements. "
-            f"Vary between: system design, algorithms, databases, APIs, testing, DevOps, security, "
-            f"code quality, concurrency, networking, CI/CD, monitoring."
+            f"You MUST ask about a DIFFERENT topic now. Rotate through: {rotation}."
         )
 
     # Trim history to last 8 messages — shorter context means fewer input

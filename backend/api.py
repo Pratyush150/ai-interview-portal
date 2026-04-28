@@ -36,8 +36,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from backend.interview.engine import InterviewSession, Stage
+from backend.interview.role_profiles import (
+    list_role_families, ALL_PROFILES, SENIORITY_TIERS, infer_seniority,
+)
 from backend.tts.elevenlabs_tts import synthesize
-from backend.stt.deepgram_stt import transcribe_file
+from backend.stt.deepgram_stt import transcribe_file, STTTimeout
 from backend.stt.deepgram_streaming import StreamingTranscriber
 from backend.database import init_db, get_db, hash_password, verify_password
 from backend.resume_parser import extract_text_from_pdf, analyze_resume
@@ -105,6 +108,9 @@ class TurnResponse(BaseModel):
     total_turns: int
     is_finished: bool
     audio_url: str | None = None
+    # Populated on /audio-turn so the frontend can render the candidate's
+    # own transcribed words instead of a "[voice input]" placeholder.
+    transcript: str | None = None
 
 class CompanyCreate(BaseModel):
     name: str
@@ -119,6 +125,12 @@ class JobCreate(BaseModel):
     title: str
     description: str = ""
     required_skills: str = ""
+    role_family: str = "software_engineering"
+    seniority: str = "mid"
+    min_experience_years: float = 0
+    max_experience_years: float = 40
+    department: str = ""
+    employment_type: str = "full_time"
 
 class JobApply(BaseModel):
     candidate_name: str
@@ -148,7 +160,10 @@ def create_session(req: SessionCreate):
     job_title = ""
     job_skills = []
     job_description = ""
+    role_family = "software_engineering"
+    seniority = "mid"
     candidate_name = req.candidate_name
+    candidate_experience_years: float | None = None
 
     # Load resume context if provided
     if req.resume_id:
@@ -162,22 +177,35 @@ def create_session(req: SessionCreate):
                 resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
             if skills_data.get("suggested_questions"):
                 resume_context += f"\nSuggested questions: {'; '.join(skills_data['suggested_questions'][:5])}"
+            if skills_data.get("experience_years") is not None:
+                try:
+                    candidate_experience_years = float(skills_data["experience_years"])
+                except (TypeError, ValueError):
+                    pass
 
     # Load job context if provided
     if req.job_id:
         db = get_db()
-        row = db.execute("SELECT title, description, required_skills FROM jobs WHERE id=?", (req.job_id,)).fetchone()
+        row = db.execute(
+            "SELECT title, description, required_skills, role_family, seniority, "
+            "min_experience_years, max_experience_years FROM jobs WHERE id=?",
+            (req.job_id,)
+        ).fetchone()
         db.close()
         if row:
             job_title = row["title"]
             job_description = row["description"] or ""
             job_skills = [s.strip() for s in (row["required_skills"] or "").split(",") if s.strip()]
+            role_family = row["role_family"] or role_family
+            seniority = row["seniority"] or seniority
 
     # Validate invite token if provided
     if req.invite_token:
         db = get_db()
         app_row = db.execute(
-            "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, r.raw_text, r.skills_json "
+            "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, "
+            "j.role_family, j.seniority, j.min_experience_years, j.max_experience_years, "
+            "r.raw_text, r.skills_json "
             "FROM applications a "
             "JOIN candidates c ON a.candidate_id=c.id "
             "LEFT JOIN jobs j ON a.job_id=j.id "
@@ -192,11 +220,25 @@ def create_session(req: SessionCreate):
                 job_title = app_row["title"]
                 job_description = app_row["description"] or ""
                 job_skills = [s.strip() for s in (app_row["required_skills"] or "").split(",") if s.strip()]
+                role_family = app_row["role_family"] or role_family
+                seniority = app_row["seniority"] or seniority
             if app_row["raw_text"]:
                 skills_data = json.loads(app_row["skills_json"]) if app_row["skills_json"] else {}
                 resume_context = skills_data.get("experience_summary", app_row["raw_text"][:1000])
                 if skills_data.get("skills"):
                     resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
+                if skills_data.get("experience_years") is not None:
+                    try:
+                        candidate_experience_years = float(skills_data["experience_years"])
+                    except (TypeError, ValueError):
+                        pass
+
+    # If the candidate's experience is clearly outside the posted range, nudge
+    # seniority toward the candidate's actual level. Tough-but-fair: we don't
+    # want a 10-year staff engineer getting intern-depth questions just because
+    # they applied for a listing filed as "mid".
+    if candidate_experience_years is not None:
+        seniority = infer_seniority(candidate_experience_years)
 
     session = InterviewSession(
         session_id=sid,
@@ -206,6 +248,9 @@ def create_session(req: SessionCreate):
         job_title=job_title,
         job_skills=job_skills,
         job_description=job_description,
+        role_family=role_family,
+        seniority=seniority,
+        candidate_experience_years=candidate_experience_years,
     )
     sessions[sid] = session
 
@@ -293,8 +338,28 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
         tmp_path = Path(tmp.name)
 
     try:
-        # Run STT in thread pool
+        # Run STT in a thread pool so the event loop stays free for other
+        # requests while Deepgram is uploading / processing the audio.
         transcript = await asyncio.to_thread(transcribe_file, str(tmp_path))
+    except STTTimeout as e:
+        # All Deepgram retries exhausted. Surface this to the client as a
+        # 503 with a stable error code so the frontend can retry the whole
+        # /audio-turn request (the blob is still cached in the browser)
+        # rather than discarding the candidate's answer.
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "stt_timeout", "message": str(e)},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Any other STT failure — expose as 502 with a stable code so the
+        # frontend can distinguish "service problem, retry" from genuine
+        # "no speech" 400s.
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "stt_failed", "message": str(e)},
+        )
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -321,6 +386,7 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
         total_turns=status["total_turns"],
         is_finished=status["is_finished"],
         audio_url=audio_url,
+        transcript=transcript.strip(),
     )
 
 
@@ -463,6 +529,13 @@ def company_login(req: CompanyLogin):
 @app.post("/api/company/{company_id}/jobs")
 def create_job(company_id: str, req: JobCreate, request: Request):
     verify_company_auth(company_id, request)
+    # Light validation: reject unknown role families so the prompt selection
+    # never silently falls back to software engineering.
+    if req.role_family not in ALL_PROFILES:
+        raise HTTPException(400, f"Unknown role_family: {req.role_family}")
+    if req.seniority not in SENIORITY_TIERS:
+        raise HTTPException(400, f"Unknown seniority: {req.seniority}")
+
     jid = uuid.uuid4().hex[:12]
     db = get_db()
     co = db.execute("SELECT id FROM companies WHERE id=?", (company_id,)).fetchone()
@@ -470,8 +543,19 @@ def create_job(company_id: str, req: JobCreate, request: Request):
         db.close()
         raise HTTPException(404, "Company not found")
     db.execute(
-        "INSERT INTO jobs (id, company_id, title, description, required_skills) VALUES (?,?,?,?,?)",
-        (jid, company_id, req.title, req.description, req.required_skills),
+        """
+        INSERT INTO jobs
+          (id, company_id, title, description, required_skills,
+           role_family, seniority, min_experience_years, max_experience_years,
+           department, employment_type)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            jid, company_id, req.title, req.description, req.required_skills,
+            req.role_family, req.seniority,
+            req.min_experience_years, req.max_experience_years,
+            req.department, req.employment_type,
+        ),
     )
     db.commit()
     db.close()
@@ -479,13 +563,64 @@ def create_job(company_id: str, req: JobCreate, request: Request):
 
 
 @app.get("/api/jobs")
-def list_jobs():
+def list_jobs(
+    role_family: Optional[str] = None,
+    seniority: Optional[str] = None,
+    min_experience_years: Optional[float] = None,
+    max_experience_years: Optional[float] = None,
+    skill: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    """List active jobs with two core filters (experience + role/skills) plus extras.
+
+    - role_family: exact match on role family (e.g. "software_engineering").
+    - seniority:   exact match on seniority tier.
+    - min_experience_years / max_experience_years: candidate's YoE — we return
+      jobs whose posted range overlaps the candidate's point.
+    - skill: case-insensitive substring match against required_skills.
+    - q: free-text match against title/description.
+    """
+    sql = [
+        "SELECT j.*, c.name as company_name FROM jobs j",
+        "JOIN companies c ON j.company_id=c.id",
+        "WHERE j.status='active'",
+    ]
+    params: list = []
+    if role_family:
+        sql.append("AND j.role_family=?")
+        params.append(role_family)
+    if seniority:
+        sql.append("AND j.seniority=?")
+        params.append(seniority)
+    # Experience filter: "I have X years" -> job whose range contains X.
+    # We accept either bound and treat the missing one as open-ended.
+    if min_experience_years is not None:
+        sql.append("AND j.max_experience_years >= ?")
+        params.append(min_experience_years)
+    if max_experience_years is not None:
+        sql.append("AND j.min_experience_years <= ?")
+        params.append(max_experience_years)
+    if skill:
+        sql.append("AND LOWER(j.required_skills) LIKE ?")
+        params.append(f"%{skill.lower()}%")
+    if q:
+        sql.append("AND (LOWER(j.title) LIKE ? OR LOWER(j.description) LIKE ?)")
+        params.extend([f"%{q.lower()}%", f"%{q.lower()}%"])
+    sql.append("ORDER BY j.created_at DESC")
+
     db = get_db()
-    rows = db.execute(
-        "SELECT j.*, c.name as company_name FROM jobs j JOIN companies c ON j.company_id=c.id WHERE j.status='active' ORDER BY j.created_at DESC"
-    ).fetchall()
+    rows = db.execute(" ".join(sql), params).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/roles")
+def get_roles():
+    """Catalog used by the frontend to render role/seniority filters."""
+    return {
+        "role_families": list_role_families(),
+        "seniority_tiers": SENIORITY_TIERS,
+    }
 
 
 @app.get("/api/jobs/{job_id}")

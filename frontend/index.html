@@ -2,54 +2,174 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Interview Portal</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%233b82f6'/><text y='70' x='50' text-anchor='middle' font-size='60' fill='white'>AI</text></svg>">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#fafaf8" id="meta-theme-color">
+    <!-- Apply the stored theme BEFORE the stylesheet paints so dark-mode
+         users don't see a light-mode flash on load. Default is light. -->
+    <script>
+        (function () {
+            try {
+                var t = localStorage.getItem('ai_portal_theme') || 'light';
+                document.documentElement.setAttribute('data-theme', t);
+            } catch (e) {
+                document.documentElement.setAttribute('data-theme', 'light');
+            }
+        })();
+    </script>
+    <title>Interview</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%231d1d1f'/><text x='16' y='22' text-anchor='middle' font-family='-apple-system,Inter,sans-serif' font-size='14' font-weight='700' fill='%23fafaf8' letter-spacing='-0.03em'>AI</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://models.readyplayer.me" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <div class="container">
-        <!-- Header -->
+        <!-- Top bar: translucent, always-present -->
         <header class="header">
+            <div class="header-brand">
+                <span class="mark">AI</span>
+                <span>Interview</span>
+            </div>
             <h1>AI Interview Portal</h1>
             <p class="subtitle" id="header-subtitle">AI-Powered Technical Interview Platform</p>
+
+            <!-- Interview-only status block (shown during active session) -->
+            <div id="header-status" class="header-status" style="display:none">
+                <span class="hs-stage" id="stage-badge">intro</span>
+                <span class="dot">·</span>
+                <span class="hs-turn">Turn <span id="turn-count">0</span></span>
+                <span class="dot">·</span>
+                <span class="hs-timer" id="elapsed-timer">00:00</span>
+            </div>
+
+            <div class="header-spacer"></div>
+
+            <div id="header-score" class="header-score" style="display:none">
+                <span>Score</span>
+                <span class="score num" id="avg-score">—</span>
+            </div>
+
             <nav class="nav-tabs" id="nav-tabs">
                 <button class="nav-tab active" data-screen="setup-screen">Interview</button>
                 <button class="nav-tab" data-screen="jobs-screen">Jobs</button>
                 <button class="nav-tab" data-screen="company-screen">Company</button>
             </nav>
+
+            <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme" title="Toggle theme">
+                <svg class="icon-sun"  viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="12" cy="12" r="4"/>
+                    <path stroke-linecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+                </svg>
+                <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M21 12.8A9 9 0 0 1 11.2 3a7 7 0 1 0 9.8 9.8z"/>
+                </svg>
+            </button>
         </header>
 
-        <!-- Setup Screen (Interview Start) -->
+        <!-- Setup Screen -->
         <div id="setup-screen" class="screen active">
             <div class="card">
-                <h2>Start Your Interview</h2>
-                <p>Upload your resume and start your AI-powered technical interview.</p>
+                <h2>Start your interview</h2>
+                <p>Upload your resume and we'll tailor the technical questions to your background.</p>
                 <div class="form-group">
-                    <label for="candidate-name">Your Name</label>
-                    <input type="text" id="candidate-name" placeholder="Enter your name" autocomplete="off">
+                    <label for="candidate-name">Your name</label>
+                    <input type="text" id="candidate-name" placeholder="Full name" autocomplete="off">
                 </div>
                 <div class="form-group">
-                    <label for="resume-upload">Upload Resume (PDF)</label>
+                    <label for="resume-upload">Resume (PDF)</label>
                     <input type="file" id="resume-upload" accept=".pdf" class="file-input">
                     <div id="resume-status" class="upload-status"></div>
                 </div>
-                <div class="form-group">
+                <div class="form-group" style="display:none">
                     <label>
                         <input type="checkbox" id="use-structured" checked>
                         Enable evaluation scoring
                     </label>
                 </div>
-                <button id="start-btn" class="btn btn-primary">Start Interview</button>
+
+                <div class="voice-test">
+                    <div class="voice-test-row">
+                        <button id="test-tone-btn" class="btn btn-secondary" type="button" title="Play a short 440 Hz tone">
+                            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+                                 style="stroke:currentColor;stroke-width:1.75;fill:none;stroke-linecap:round;stroke-linejoin:round">
+                                <path d="M11 5L6 9H2v6h4l5 4zM15.5 8.5a5 5 0 010 7M19 5a9 9 0 010 14"/>
+                            </svg>
+                            Test tone
+                        </button>
+                        <button id="test-voice-btn" class="btn btn-secondary" type="button">
+                            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+                                 style="stroke:currentColor;stroke-width:1.75;fill:none;stroke-linecap:round;stroke-linejoin:round">
+                                <path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/>
+                            </svg>
+                            Test voice
+                        </button>
+                        <span id="voice-test-status" class="voice-test-status" aria-live="polite"></span>
+                    </div>
+
+                    <div class="form-grid-2" id="audio-device-row" style="margin-top:var(--s-4);margin-bottom:0">
+                        <div class="form-group">
+                            <label for="audio-output-select">Output device</label>
+                            <select id="audio-output-select">
+                                <option value="default">System default</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="audio-input-select">Microphone</label>
+                            <select id="audio-input-select">
+                                <option value="default">System default</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <p class="voice-test-hint">
+                        <strong>Test tone</strong> plays a short beep via your sound card — if you don't
+                        hear it, the problem is your system volume or output device selection.
+                        <strong>Test voice</strong> uses browser speech synthesis to verify the interviewer
+                        voice itself. Browser speech always goes to your <em>system default</em> output;
+                        change that in Windows/macOS sound settings if needed.
+                    </p>
+                </div>
+
+                <button id="start-btn" class="btn btn-primary">Start interview</button>
             </div>
         </div>
 
         <!-- Jobs Screen -->
         <div id="jobs-screen" class="screen">
-            <div class="card" style="max-width:640px">
-                <h2>Open Positions</h2>
+            <div class="card jobs-card">
+                <h2>Open positions</h2>
+                <p>Filter by role, your years of experience, or a specific skill — then apply in one click.</p>
+
+                <div class="filter-bar">
+                    <div class="form-group">
+                        <label for="filter-role-family">Role / function</label>
+                        <select id="filter-role-family">
+                            <option value="">All roles</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="filter-experience">Your experience</label>
+                        <input type="number" id="filter-experience" placeholder="e.g. 3 yrs" min="0" max="40" step="0.5">
+                    </div>
+                    <div class="form-group">
+                        <label for="filter-skill">Skill / keyword</label>
+                        <div class="input-with-icon">
+                            <span class="input-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5" stroke-linecap="round"/></svg>
+                            </span>
+                            <input type="text" id="filter-skill" placeholder="Python, SQL, DCF…">
+                        </div>
+                    </div>
+                    <div class="filter-action">
+                        <button id="apply-filter-btn" class="btn btn-primary" style="width:auto">Filter</button>
+                        <button id="reset-filter-btn" class="btn btn-ghost">Reset</button>
+                    </div>
+                </div>
+
                 <div id="jobs-list" class="jobs-list">
-                    <p class="text-muted">Loading jobs...</p>
+                    <p class="text-muted">Loading jobs…</p>
                 </div>
             </div>
         </div>
@@ -57,64 +177,127 @@
         <!-- Job Apply Screen -->
         <div id="apply-screen" class="screen">
             <div class="card">
-                <h2>Apply for: <span id="apply-job-title"></span></h2>
-                <div class="form-group">
-                    <label for="apply-name">Your Name</label>
-                    <input type="text" id="apply-name" placeholder="Full name" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label for="apply-email">Email</label>
-                    <input type="text" id="apply-email" placeholder="your@email.com" autocomplete="off">
+                <h2>Apply for <span id="apply-job-title"></span></h2>
+                <p>We'll parse your resume and tailor the interview questions to your experience.</p>
+                <div class="form-grid-2">
+                    <div class="form-group">
+                        <label for="apply-name">Your name</label>
+                        <input type="text" id="apply-name" placeholder="Full name" autocomplete="name">
+                    </div>
+                    <div class="form-group">
+                        <label for="apply-email">Email</label>
+                        <input type="text" id="apply-email" placeholder="you@domain.com" autocomplete="email">
+                    </div>
                 </div>
                 <div class="form-group">
                     <label for="apply-resume">Resume (PDF)</label>
                     <input type="file" id="apply-resume" accept=".pdf" class="file-input">
                 </div>
-                <button id="apply-submit-btn" class="btn btn-primary">Submit Application</button>
-                <div id="apply-result" class="upload-status" style="margin-top:1rem"></div>
+                <button id="apply-submit-btn" class="btn btn-primary">Submit application</button>
+                <div id="apply-result" class="upload-status"></div>
             </div>
         </div>
 
-        <!-- Company Dashboard Screen -->
+        <!-- Company Dashboard -->
         <div id="company-screen" class="screen">
             <div class="card" style="max-width:640px">
-                <h2>Company Dashboard</h2>
+                <h2>Company portal</h2>
                 <div id="company-auth">
-                    <div class="form-group">
-                        <label for="company-name">Company Name</label>
-                        <input type="text" id="company-name" placeholder="Your company" autocomplete="off">
+                    <p>Post jobs, review candidates, and manage interviews.</p>
+
+                    <div class="auth-tabs" role="tablist" aria-label="Authentication">
+                        <button class="auth-tab active" data-auth-mode="signin" role="tab">Sign in</button>
+                        <button class="auth-tab" data-auth-mode="register" role="tab">Register</button>
                     </div>
+
+                    <div class="sso-stack">
+                        <button class="btn-sso" id="sso-google-btn" type="button">
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                                <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.99.66-2.25 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                                <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                                <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84C6.71 7.31 9.14 5.38 12 5.38z"/>
+                            </svg>
+                            Continue with Google
+                        </button>
+                        <button class="btn-sso" id="sso-microsoft-btn" type="button">
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <rect x="2"  y="2"  width="9.5" height="9.5" fill="#F25022"/>
+                                <rect x="12.5" y="2"  width="9.5" height="9.5" fill="#7FBA00"/>
+                                <rect x="2"  y="12.5" width="9.5" height="9.5" fill="#00A4EF"/>
+                                <rect x="12.5" y="12.5" width="9.5" height="9.5" fill="#FFB900"/>
+                            </svg>
+                            Continue with Microsoft
+                        </button>
+                    </div>
+
+                    <div class="sso-divider" aria-hidden="true">or with email</div>
+
                     <div class="form-group">
-                        <label for="company-email">Contact Email</label>
-                        <input type="text" id="company-email" placeholder="hr@company.com" autocomplete="off">
+                        <label for="company-name">Company name</label>
+                        <input type="text" id="company-name" placeholder="Your company" autocomplete="organization">
+                    </div>
+                    <div class="form-group" data-auth-field="register">
+                        <label for="company-email">Contact email</label>
+                        <input type="text" id="company-email" placeholder="hr@company.com" autocomplete="email">
                     </div>
                     <div class="form-group">
                         <label for="company-password">Password</label>
-                        <input type="password" id="company-password" placeholder="Create or enter password" autocomplete="off">
+                        <input type="password" id="company-password" placeholder="Enter password" autocomplete="current-password">
                     </div>
-                    <div style="display:flex;gap:0.5rem;margin-bottom:1.5rem">
-                        <button id="register-company-btn" class="btn btn-primary" style="flex:1">Register</button>
-                        <button id="login-company-btn" class="btn btn-primary" style="flex:1;background:var(--surface-hover)">Login</button>
-                    </div>
+                    <button id="login-company-btn" class="btn btn-primary" data-auth-mode="signin">Sign in</button>
+                    <button id="register-company-btn" class="btn btn-primary" data-auth-mode="register" style="display:none">Create account</button>
+
+                    <p class="auth-footnote">
+                        Try it with the demo account: <strong>DemoCorp</strong> · <code>demo1234</code>.
+                        SSO requires OAuth credentials to be configured on the server.
+                    </p>
                 </div>
+
                 <div id="company-panel" style="display:none">
-                    <p id="company-welcome" style="color:var(--success);margin-bottom:1rem;font-weight:600"></p>
-                    <h3 style="margin-bottom:1rem">Create Job Posting</h3>
+                    <p id="company-welcome" style="color:var(--success);margin-bottom:16px;font-weight:600"></p>
+
+                    <h3>Create job posting</h3>
                     <div class="form-group">
-                        <label for="job-title">Job Title</label>
-                        <input type="text" id="job-title" placeholder="Senior Software Engineer" autocomplete="off">
+                        <label for="job-title">Job title</label>
+                        <input type="text" id="job-title" placeholder="Senior Software Engineer">
+                    </div>
+                    <div class="form-grid-2">
+                        <div class="form-group">
+                            <label for="job-role-family">Role family</label>
+                            <select id="job-role-family"></select>
+                        </div>
+                        <div class="form-group">
+                            <label for="job-seniority">Seniority</label>
+                            <select id="job-seniority"></select>
+                        </div>
+                    </div>
+                    <div class="form-grid-3">
+                        <div class="form-group">
+                            <label for="job-min-exp">Min experience (yrs)</label>
+                            <input type="number" id="job-min-exp" placeholder="2" min="0" max="40" step="0.5">
+                        </div>
+                        <div class="form-group">
+                            <label for="job-max-exp">Max experience (yrs)</label>
+                            <input type="number" id="job-max-exp" placeholder="5" min="0" max="40" step="0.5">
+                        </div>
+                        <div class="form-group">
+                            <label for="job-department">Department</label>
+                            <input type="text" id="job-department" placeholder="Engineering">
+                        </div>
                     </div>
                     <div class="form-group">
                         <label for="job-desc">Description</label>
-                        <textarea id="job-desc" placeholder="Job description..." rows="3" class="text-area"></textarea>
+                        <textarea id="job-desc" placeholder="What will the hire own? Team, scope, stack, outcomes…" rows="4" class="text-area"></textarea>
                     </div>
                     <div class="form-group">
-                        <label for="job-skills">Required Skills (comma-separated)</label>
-                        <input type="text" id="job-skills" placeholder="Python, React, AWS" autocomplete="off">
+                        <label for="job-skills">Required skills (comma-separated)</label>
+                        <input type="text" id="job-skills" placeholder="Python, React, AWS">
                     </div>
-                    <button id="create-job-btn" class="btn btn-primary">Create Job</button>
-                    <div id="company-jobs" class="jobs-list" style="margin-top:1.5rem"></div>
-                    <h3 style="margin:1.5rem 0 1rem">Applications</h3>
+                    <button id="create-job-btn" class="btn btn-primary">Post job</button>
+
+                    <div id="company-jobs" class="jobs-list" style="margin-top:24px"></div>
+                    <h3 style="margin-top:32px">Applications</h3>
                     <div id="company-apps" class="jobs-list"></div>
                 </div>
             </div>
@@ -122,102 +305,90 @@
 
         <!-- Interview Screen -->
         <div id="interview-screen" class="screen">
-            <!-- Status Bar -->
-            <div class="status-bar">
-                <div class="status-item">
-                    <span class="label">Stage</span>
-                    <span id="stage-badge" class="badge">intro</span>
-                </div>
-                <div class="status-item">
-                    <span class="label">Turn</span>
-                    <span id="turn-count">0</span>
-                </div>
-                <div class="status-item">
-                    <span class="label">Score</span>
-                    <span id="avg-score">--</span>
-                </div>
-            </div>
-
-            <!-- Interview Layout -->
-            <div class="interview-layout">
-                <!-- Left: Video panel -->
-                <div class="video-panel">
-                    <div class="video-card interviewer-card">
-                        <div class="video-label">Interviewer</div>
-                        <div class="interviewer-avatar">
-                            <svg viewBox="0 0 120 120" width="90" height="90">
-                                <circle cx="60" cy="40" r="24" fill="#3b82f6"/>
-                                <circle cx="60" cy="40" r="20" fill="#1e293b"/>
-                                <circle cx="60" cy="38" r="14" fill="#64748b"/>
-                                <ellipse cx="60" cy="95" rx="35" ry="22" fill="#3b82f6"/>
-                                <ellipse cx="60" cy="95" rx="31" ry="18" fill="#1e293b"/>
-                                <path d="M36 38 Q36 18 60 18 Q84 18 84 38" stroke="#3b82f6" stroke-width="3" fill="none"/>
-                                <rect x="32" y="34" width="8" height="12" rx="3" fill="#3b82f6"/>
-                                <rect x="80" y="34" width="8" height="12" rx="3" fill="#3b82f6"/>
-                            </svg>
-                            <div class="avatar-name">AI Interviewer</div>
-                            <div id="speaking-indicator" class="speaking-indicator">Speaking...</div>
+            <div class="interview-stage">
+                <!-- Equal-sized AI avatar and candidate camera tiles, each
+                     taking half the stage. The orb is kept inside the
+                     avatar tile as a fallback for when the 3D GLB can't
+                     load (network, WebGL disabled). -->
+                <div class="conversation-stage two-up">
+                    <div class="person-tile interviewer-tile" id="interviewer-tile">
+                        <div id="avatar-canvas" class="avatar-canvas"></div>
+                        <div id="pip-avatar" class="siri-orb avatar-fallback-orb" aria-label="AI interviewer">
+                            <div class="orb-halo"></div>
+                            <div class="orb-ring orb-ring-1"></div>
+                            <div class="orb-ring orb-ring-2"></div>
+                            <div class="orb-ring orb-ring-3"></div>
+                            <div class="orb-core"></div>
+                            <div class="orb-sheen"></div>
                         </div>
+                        <div class="tile-nameplate">
+                            <span class="interviewer-chip" id="interviewer-chip" data-state="idle">
+                                <span class="chip-dot" aria-hidden="true"></span>
+                                <span class="chip-name">Morgan</span>
+                                <span class="chip-sep" aria-hidden="true">·</span>
+                                <span class="chip-state" id="interviewer-chip-state">Ready</span>
+                            </span>
+                        </div>
+                        <div id="speaking-indicator" class="speaking-indicator" style="display:none"></div>
                     </div>
-                    <div class="video-card candidate-card">
-                        <div class="video-label">You</div>
+
+                    <div class="person-tile candidate-tile">
                         <video id="camera-feed" class="hidden" autoplay muted playsinline></video>
                         <div id="camera-placeholder" class="camera-placeholder">
-                            <svg viewBox="0 0 24 24" width="32" height="32" fill="#64748b">
-                                <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
-                            </svg>
-                            <span>Camera loading...</span>
+                            <svg viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                            <span>Camera starting…</span>
                         </div>
+                        <div class="tile-nameplate">You</div>
                     </div>
                 </div>
 
-                <!-- Right: Conversation -->
-                <div class="chat-panel">
-                    <div id="conversation" class="conversation"></div>
+                <!-- Live captions: last interviewer Q (solid) + current user A (faded) -->
+                <div class="caption-stage">
+                    <div id="caption-question" class="caption caption-question"></div>
+                    <div id="caption-answer" class="caption caption-answer"></div>
+                </div>
+
+                <!-- Status line + waveform -->
+                <div class="turn-state">
+                    <div class="turn-status-text" id="mic-text">Preparing…</div>
+                    <div class="wave" id="mic-wave"><span></span><span></span><span></span></div>
+
+                    <!-- The hero mic button -->
+                    <button id="mic-btn" class="mic-hero" aria-label="Mic — click when finished">
+                        <svg id="mic-icon" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 1a3 3 0 013 3v8a3 3 0 01-6 0V4a3 3 0 013-3z"/><path stroke-linecap="round" stroke-linejoin="round" d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/></svg>
+                        <span id="mic-indicator" class="indicator" style="display:none"></span>
+                    </button>
+                    <div class="mic-hero-hint" id="mic-hero-hint"></div>
                 </div>
             </div>
 
-            <!-- Controls -->
-            <div class="controls">
-                <div id="mic-status" class="mic-status">
-                    <span id="mic-indicator" class="indicator"></span>
-                    <span id="mic-text">Click to speak</span>
-                </div>
-                <div class="controls-row">
-                    <button id="camera-btn" class="btn btn-camera" title="Toggle camera">
-                        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
-                        </svg>
-                    </button>
-                    <button id="mic-btn" class="btn btn-mic" title="Click to speak">
-                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
-                            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-                        </svg>
-                    </button>
-                    <button id="speaker-btn" class="btn btn-speaker active" title="Toggle interviewer voice">
-                        <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                            <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
-                        </svg>
-                    </button>
-                </div>
-                <div class="text-input-row">
-                    <input type="text" id="text-input" placeholder="Type your answer..." autocomplete="off">
-                    <button id="send-btn" class="btn btn-send">Send</button>
-                </div>
-            </div>
+            <!-- Hidden conversation log — the canonical transcript lives here
+                 so addMessage() keeps working, but it's kept offscreen. The
+                 on-screen caption surfaces the current question + live answer. -->
+            <div id="conversation" class="conversation conversation-hidden" aria-hidden="true"></div>
         </div>
 
         <!-- Results Screen -->
         <div id="results-screen" class="screen">
-            <div class="card" style="max-width:560px">
-                <h2>Interview Complete</h2>
+            <div class="card" style="max-width:600px">
+                <h2>Interview complete</h2>
+                <p>Here's a summary of how the session went.</p>
                 <div id="results-summary"></div>
-                <button id="restart-btn" class="btn btn-primary">Start New Interview</button>
+                <button id="restart-btn" class="btn btn-primary">Start new interview</button>
             </div>
         </div>
     </div>
 
+    <!-- three.js loaded via importmap; avatar.js uses it to render the GLB. -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module" src="/static/avatar.js"></script>
     <script src="/static/anticheat.js"></script>
     <script src="/static/app.js"></script>
 </body>

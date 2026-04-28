@@ -2,9 +2,14 @@
 import hashlib
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "data" / "portal.db"
+
+DEMO_COMPANY_NAME = "DemoCorp"
+DEMO_COMPANY_PASSWORD = "demo1234"
+DEMO_COMPANY_EMAIL = "hr@democorp.test"
 
 
 def get_db() -> sqlite3.Connection:
@@ -14,6 +19,13 @@ def get_db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str):
+    """Lightweight migration — add column if missing."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def init_db():
@@ -47,6 +59,12 @@ def init_db():
             title TEXT,
             description TEXT,
             required_skills TEXT,
+            role_family TEXT DEFAULT 'software_engineering',
+            seniority TEXT DEFAULT 'mid',
+            min_experience_years REAL DEFAULT 0,
+            max_experience_years REAL DEFAULT 40,
+            department TEXT DEFAULT '',
+            employment_type TEXT DEFAULT 'full_time',
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -98,8 +116,76 @@ def init_db():
             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+
+    # Migrations for older DBs that were created before these columns existed.
+    for col, decl in [
+        ("role_family",           "TEXT DEFAULT 'software_engineering'"),
+        ("seniority",             "TEXT DEFAULT 'mid'"),
+        ("min_experience_years",  "REAL DEFAULT 0"),
+        ("max_experience_years",  "REAL DEFAULT 40"),
+        ("department",            "TEXT DEFAULT ''"),
+        ("employment_type",       "TEXT DEFAULT 'full_time'"),
+    ]:
+        _ensure_column(conn, "jobs", col, decl)
+
     conn.commit()
+    _seed_demo_company(conn)
     conn.close()
+
+
+def _seed_demo_company(conn: sqlite3.Connection) -> None:
+    """Seed a mock company + one JD per role family if not already present.
+
+    Running this is idempotent — we look up by company name and only insert
+    missing JDs (matched by exact title).
+    """
+    # Import inside the function so this module doesn't import the profiles
+    # package at top level (avoids any future circular-import risk).
+    from backend.interview.role_profiles import MOCK_JDS
+
+    row = conn.execute(
+        "SELECT id FROM companies WHERE name=?", (DEMO_COMPANY_NAME,)
+    ).fetchone()
+    if row:
+        company_id = row["id"]
+    else:
+        company_id = uuid.uuid4().hex[:12]
+        conn.execute(
+            "INSERT INTO companies (id, name, email, password_hash, auth_token) VALUES (?,?,?,?,?)",
+            (
+                company_id,
+                DEMO_COMPANY_NAME,
+                DEMO_COMPANY_EMAIL,
+                hash_password(DEMO_COMPANY_PASSWORD),
+                uuid.uuid4().hex,
+            ),
+        )
+
+    existing_titles = {
+        r["title"] for r in conn.execute(
+            "SELECT title FROM jobs WHERE company_id=?", (company_id,)
+        ).fetchall()
+    }
+    for jd in MOCK_JDS:
+        if jd["title"] in existing_titles:
+            continue
+        conn.execute(
+            """
+            INSERT INTO jobs
+                (id, company_id, title, description, required_skills,
+                 role_family, seniority, min_experience_years, max_experience_years,
+                 department, employment_type, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?, 'active')
+            """,
+            (
+                uuid.uuid4().hex[:12], company_id,
+                jd["title"], jd["description"], jd["required_skills"],
+                jd["role_family"], jd["seniority"],
+                jd["min_experience_years"], jd["max_experience_years"],
+                jd.get("department", ""), jd.get("employment_type", "full_time"),
+            ),
+        )
+    conn.commit()
 
 
 def hash_password(password: str) -> str:

@@ -1,27 +1,34 @@
 # AI Interview Portal full
 
-An end-to-end, voice-first AI interviewer for software engineering roles. A
-candidate uploads a resume, gets matched to a job, and sits through a staged
-interview with a senior-engineer-personality LLM — audio in, audio out,
-realtime scoring, AI-answer detection, and a browser-side anti-cheat layer
-that watches the camera, the keyboard, and the tab.
+An end-to-end, voice-first AI interviewer that adapts to the **role and
+seniority** of the job posting. A candidate uploads a resume, gets matched to
+a job, and sits through a staged interview with a role-specific persona — a
+staff SRE for a senior infra job, a consulting partner for an MBA case, a
+mechanical design lead for a hardware role. Audio in, audio out, a 3D
+animated avatar with lip-sync, realtime scoring, AI-answer detection, and a
+browser-side anti-cheat layer that watches the camera, the keyboard, and the
+tab.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                         AI INTERVIEW PORTAL                               │
 │                                                                           │
-│  Browser (vanilla JS)                           FastAPI backend           │
+│  Browser (vanilla JS + three.js)                FastAPI backend           │
 │  ┌──────────────┐   audio   ┌────────────────┐   ┌───────────────────┐    │
-│  │ mic + VAD    │──────────▶│ /audio-turn    │──▶│ Deepgram STT      │    │
-│  │ camera feed  │           │ /turn          │   │ Groq LLM (struct) │    │
-│  │ anti-cheat   │──violations▶│ /cheating     │   │ ElevenLabs TTS   │    │
-│  │ TTS player   │◀──reply+url┤ (Turn JSON)   │◀──│ (optional)        │    │
-│  └──────────────┘           └────────────────┘   └───────────────────┘    │
-│                                     │                                     │
+│  │ 3D avatar    │──────────▶│ /audio-turn    │──▶│ Deepgram STT      │    │
+│  │ mic + VAD    │           │ /turn          │   │ Groq LLM (struct) │    │
+│  │ camera feed  │──violations▶│ /cheating     │   │ ElevenLabs TTS   │    │
+│  │ anti-cheat   │◀──reply+url┤ (Turn JSON)   │◀──│ (optional)        │    │
+│  │ TTS player   │           └────────────────┘   └───────────────────┘    │
+│  └──────────────┘                   │                                     │
 │                                     ▼                                     │
 │                              SQLite (portal.db)                           │
-│                    candidates • resumes • jobs • applications •           │
-│                    interview_sessions • eval_records • email_log          │
+│                    candidates • resumes • jobs (role_family,              │
+│                    seniority) • applications • interview_sessions •       │
+│                    eval_records • email_log                               │
+│                                                                           │
+│  22 role families  ×  6 seniority tiers  →  role-specific stage prompts,  │
+│                                              topics, depth, rubric weights│
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,17 +41,19 @@ that watches the camera, the keyboard, and the tab.
 3. [Running locally](#running-locally)
 4. [Environment variables](#environment-variables)
 5. [End-to-end data flows](#end-to-end-data-flows)
-6. [Interview stage machine](#interview-stage-machine)
-7. [LLM pipeline](#llm-pipeline)
-8. [Speech pipeline — STT & TTS](#speech-pipeline)
-9. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
-10. [Anti-cheat subsystem](#anti-cheat-subsystem)
-11. [AI-generated-answer detection](#ai-generated-answer-detection)
-12. [Scoring rubric](#scoring-rubric)
-13. [Resume parser](#resume-parser)
-14. [Database schema](#database-schema)
-15. [HTTP / WebSocket API](#http--websocket-api)
-16. [Performance notes](#performance-notes)
+6. [Role profiles & seniority](#role-profiles--seniority)
+7. [Interview stage machine](#interview-stage-machine)
+8. [LLM pipeline](#llm-pipeline)
+9. [Speech pipeline — STT & TTS](#speech-pipeline)
+10. [3D avatar interviewer](#3d-avatar-interviewer)
+11. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
+12. [Anti-cheat subsystem](#anti-cheat-subsystem)
+13. [AI-generated-answer detection](#ai-generated-answer-detection)
+14. [Scoring rubric](#scoring-rubric)
+15. [Resume parser](#resume-parser)
+16. [Database schema](#database-schema)
+17. [HTTP / WebSocket API](#http--websocket-api)
+18. [Performance notes](#performance-notes)
 
 ---
 
@@ -58,6 +67,7 @@ that watches the camera, the keyboard, and the tab.
 | TTS         | ElevenLabs `eleven_turbo_v2_5` (optional)     | highest quality; optional because browser Web Speech is instant and free |
 | Backend     | Python 3.10+, FastAPI, SQLite, uvicorn        | zero-ops, one-file DB, async-friendly                         |
 | Frontend    | Vanilla HTML / CSS / JS, Web Audio API        | no build step, smaller attack surface                         |
+| 3D avatar   | three.js 0.160 + GLTFLoader, local GLB        | morph-target lip sync driven by audio amplitude, idle blinks/gaze |
 | PDF parse   | PyMuPDF (`fitz`)                              | fastest and most reliable text extractor for resumes          |
 | Auth        | Salt + SHA-256 + bearer token                 | company dashboard only; candidates use signed invite tokens   |
 
@@ -68,28 +78,31 @@ that watches the camera, the keyboard, and the tab.
 ```
 backend/
   api.py                      REST + WebSocket entry point
-  database.py                 SQLite schema + helpers (hash/verify password)
+  database.py                 SQLite schema, helpers, demo-company seeding, online migrations
   resume_parser.py            PDF → text → LLM-structured resume JSON
   email_service.py            invite-email dispatcher
   ai_detection.py             heuristic AI-answer detector
   scoring_rubric.py           LLM prompt text: rubric + AI-detection guidance
   interview/
     engine.py                 InterviewSession class + stage machine
+    role_profiles.py          22 role families × 6 seniority tiers, mock JDs
   llm/
     groq_client.py            raw chat call
-    structured.py             structured-JSON call + topic-diversity prompting
+    structured.py             structured-JSON call + role-aware topic rotation
   stt/
-    deepgram_stt.py           file-upload transcription
+    deepgram_stt.py           file-upload transcription with retry + STTTimeout
     deepgram_streaming.py     WebSocket streaming transcriber
   tts/
     elevenlabs_tts.py         synthesize(text, path) → MP3
 frontend/
   index.html                  all screens in one SPA-ish page
   app.js                      session + VAD + resume render + screens
+  avatar.js                   three.js 3D avatar: lip-sync, blinks, gaze
+  avatar.glb                  4.7 MB Ready-Player-Me-style mesh, served locally
   anticheat.js                tab, copy, motion, phone, camera-off watchers
   style.css                   dark theme
 data/
-  portal.db                   auto-created SQLite file
+  portal.db                   auto-created SQLite file (seeds demo company on first run)
 tests/
   smoke_*.py                  one-off scripts for each subsystem
 ```
@@ -104,6 +117,11 @@ cp .env.example .env           # fill in keys
 uvicorn backend.api:app --reload --port 8000
 # open http://localhost:8000/
 ```
+
+On first launch the database is created and seeded with a `DemoCorp` company
+plus one mock job description per role family (~23 JDs). Login: `hr@democorp.test` /
+`demo1234`. Already-seeded JDs are detected by exact title and skipped on
+subsequent boots, so seeding is idempotent.
 
 Optional headless smoke tests (each validates one subsystem):
 
@@ -199,26 +217,85 @@ verbatim onto `InterviewSession.cheating_flags`, which is surfaced in the
 
 ---
 
+## Role profiles & seniority
+
+File: `backend/interview/role_profiles.py`.
+
+Every interview is parameterised by a `(role_family, seniority)` pair which
+selects a `RoleProfile`: a persona, five stage prompt templates, a topic
+rotation, default skills, and a rubric weighting. The same engine therefore
+runs a meaningfully different interview for an MBA case vs. a staff SRE
+deep-dive — not just cosmetic prompt tweaks.
+
+### Role families (22)
+
+| Bucket             | Families                                                                       |
+|--------------------|--------------------------------------------------------------------------------|
+| Software & data    | software_engineering, data_engineering, data_science, machine_learning         |
+| Infra & platform   | devops_sre, security_engineering, qa_testing                                   |
+| Hardware           | embedded_systems, mechanical_engineering, electrical_engineering, civil_engineering |
+| Mobile             | mobile_engineering                                                             |
+| Product & design   | product_management, ux_ui_design                                               |
+| Business / MBA     | consulting, investment_banking_finance, marketing, hr_people, operations_management, business_analyst, product_marketing, sales |
+
+### Seniority tiers
+
+`intern → entry → mid → senior → lead → principal`. Each tier carries:
+
+- a **turn budget** scaling from 8 (intern) to 32 (principal) total questions,
+  split across stages — see `TURN_BUDGETS` in `role_profiles.py`,
+- a **depth instruction** appended to the core-stage prompt (intern = textbook
+  level, principal = "challenge every claim, no hand-waving"),
+- automatic **detection from the resume**: `infer_seniority(years)` overrides
+  the JD's posted level when the candidate is clearly above or below it
+  (e.g. a 10-YoE applicant on a "mid" listing gets senior-depth questions).
+
+### Rubric weighting
+
+Each role family declares per-dimension weights that sum to 1.0. Engineering
+roles weight correctness/depth; consulting and design lean on communication
+and relevance; security and embedded weight correctness highest. Weights
+are passed into the LLM's job context so scoring respects the role.
+
+### Mock JDs
+
+`MOCK_JDS` in `role_profiles.py` ships ~23 ready-to-use job descriptions
+spanning every role family. These are seeded into `DemoCorp` on first DB
+init so the dashboard and apply flow have content out of the box.
+
+---
+
 ## Interview stage machine
 
 ```
         ┌──────┐     ┌──────────┐     ┌───────────┐     ┌───────────┐     ┌─────────┐     ┌──────────┐
-        │INTRO │───▶│BACKGROUND│───▶│ TECHNICAL │───▶│ FOLLOW_UP │───▶│ WRAP_UP │───▶│ FINISHED │
+        │INTRO │───▶│BACKGROUND│───▶│   CORE    │───▶│ FOLLOW_UP │───▶│ WRAP_UP │───▶│ FINISHED │
         └──────┘     └──────────┘     └───────────┘     └───────────┘     └─────────┘     └──────────┘
-         2 turns       4 turns          9 turns          5 turns          2 turns
 ```
 
+The "core" stage is exposed on the wire as the legacy `technical` enum value
+for backward compatibility, but the engine treats it role-agnostically — it
+can be a system design block, a finance valuation drill, or a consulting
+case. Per-stage turn counts come from the seniority's turn budget:
+
+| Stage      | intern | entry | mid | senior | lead | principal |
+|------------|--------|-------|-----|--------|------|-----------|
+| intro      |   1    |   1   |  2  |   2    |   2  |    2      |
+| background |   2    |   3   |  3  |   4    |   4  |    5      |
+| core       |   3    |   5   |  8  |  11    |  13  |   15      |
+| follow_up  |   1    |   2   |  3  |   5    |   7  |    8      |
+| wrap_up    |   1    |   1   |  2  |   2    |   2  |    2      |
+| **total**  | **8**  | **12**| **18** | **24** | **28** | **32** |
+
 Each stage has:
-- a **turn limit** (`STAGE_TURN_LIMITS` in `backend/interview/engine.py`);
-  exceeding it auto-advances the stage.
-- a **stage-specific prompt overlay** (`STAGE_PROMPTS`) injected into the
-  system prompt. Example: the TECHNICAL overlay tells the LLM to dig deep
-  into one or two topics rather than skim broadly, and always follow up
-  with "why that choice / what if requirements changed / failure modes".
-- **topic-diversity enforcement**: `InterviewSession.asked_topics` grows
-  as the LLM tags each question, and the system prompt carries both the
-  already-covered list and the pool of approved topic categories. The LLM
-  is told to pick a new category and not revisit covered ones.
+- a **turn limit** from the seniority budget; exceeding it auto-advances.
+- a **role-specific stage prompt** pulled from the `RoleProfile`. The core
+  prompt has a `{{depth}}` token that's filled with the seniority depth
+  instruction at request time.
+- **topic-diversity enforcement**: `InterviewSession.asked_topics` grows as
+  the LLM tags each question, and the system prompt carries the
+  already-covered list plus the role profile's `topic_categories` so the
+  LLM rotates through fresh areas.
 
 The LLM itself can also vote to advance the stage early via the
 `meta.suggest_advance` field in its structured JSON response.
@@ -233,11 +310,15 @@ The LLM itself can also vote to advance the stage early via the
 1. `STRUCTURED_SYSTEM_PROMPT` — fixed JSON schema the LLM must obey.
 2. `SCORING_RUBRIC` + `AI_DETECTION_PROMPT` — appended to the system
    prompt, calibrates 0–10 scoring and AI-answer likelihood.
-3. Stage label, resume context, job context.
-4. Asked-topics block that lists already-covered areas and forces
-   diversity.
-5. Last 8 turns from history.
-6. Current user utterance.
+3. **Role-profile block**: `display_name (seniority)`, `interviewer_persona`,
+   the role's `topic_categories`. This is what makes a consulting interview
+   sound different from an embedded-firmware interview.
+4. Stage label, resume context, job context (which now includes the depth
+   instruction and rubric weights for the role).
+5. Asked-topics block that lists already-covered areas and forces
+   rotation through the *role-specific* topic list.
+6. Last 8 turns from history.
+7. Current user utterance.
 
 **Response shape (strict JSON):**
 
@@ -293,11 +374,22 @@ Two integration modes:
 - **File-upload mode** (`stt/deepgram_stt.py`): we post the completed
   WebM/Opus blob produced by the browser MediaRecorder. Simplest path; used
   by the `/audio-turn` REST endpoint. Latency dominated by HTTP round-trip
-  and Deepgram inference (~300–800 ms).
+  and Deepgram inference (~300–800 ms). The httpx client uses 30s connect /
+  60s read+write so 20–40 second answers don't get cut off on slow networks
+  (e.g. WSL2). Up to 3 retries with exponential backoff on
+  `WriteTimeout` / `ReadTimeout` / `ConnectTimeout` / Deepgram 408s.
+  Exhausted retries raise `STTTimeout`, which `/audio-turn` surfaces as
+  HTTP 503 `{error: "stt_timeout"}` so the frontend can replay the
+  still-cached blob instead of dropping the answer; non-timeout failures
+  surface as HTTP 502 `{error: "stt_failed"}`.
 - **Streaming mode** (`stt/deepgram_streaming.py`): opens a WebSocket to
   Deepgram, streams raw Opus bytes, emits partial + final transcripts.
   Used by `/ws/interview/{id}`; partial transcripts fire
   `ws.send_json({type: "transcript", final: false})` for live caption UI.
+
+The `/audio-turn` response now also carries the candidate's transcribed
+`transcript` field, so the UI renders their actual words instead of a
+"[voice input]" placeholder.
 
 ### TTS — browser-first, ElevenLabs-optional
 
@@ -312,6 +404,35 @@ Server path (`USE_SERVER_TTS=1`):
 - Backend returns `audio_url: "/api/audio/<sid>/turn_<n>.mp3"`.
 - Frontend plays the file via a hidden `<audio>` element while the typing
   animation runs.
+
+---
+
+## 3D avatar interviewer
+
+File: `frontend/avatar.js`. Mesh: `frontend/avatar.glb` (~4.7 MB,
+Ready-Player-Me-style, served from `/static/avatar.glb` so no external DNS
+is needed).
+
+three.js 0.160 is loaded via an importmap from a CDN; everything else is
+local. `init(container)` builds a scene + perspective camera + GLTFLoader,
+and starts a `requestAnimationFrame` loop. The container is the
+`#avatar-canvas` tile that lives next to the candidate's webcam feed in
+the interview UI; on load failure we fall back to a CSS Siri-orb so the
+session keeps working.
+
+**Lip sync.** The audio pipeline already feeds an amplitude signal into
+`window.avatar.setAmp(0..1)` — both the Web Speech API path and the
+ElevenLabs `<audio>` path tap the same WebAudio analyser. `avatar.js`
+smooths it (`currentAmp` chases `targetAmp`) and drives morph targets
+named like `viseme_*` or `mouthOpen` if the GLB exposes them.
+
+**Idle behaviour.** Natural blinks at randomised intervals, slight gaze
+shifts, and a low-amplitude breathing oscillation on the head bone keep
+the avatar from looking dead between turns.
+
+**Teardown.** `teardown()` cancels the RAF, disposes geometries,
+materials, and textures, and removes the renderer from the DOM, so
+ending and restarting an interview doesn't leak GPU memory.
 
 ---
 
@@ -509,7 +630,9 @@ All tables live in `data/portal.db` (WAL journal, foreign keys ON).
 candidates(id, name, email, created_at)
 resumes(id, candidate_id, filename, raw_text, skills_json, uploaded_at)
 companies(id, name, email, password_hash, auth_token, created_at)
-jobs(id, company_id, title, description, required_skills, status, created_at)
+jobs(id, company_id, title, description, required_skills,
+     role_family, seniority, min_experience_years, max_experience_years,
+     department, employment_type, status, created_at)
 applications(id, job_id, candidate_id, resume_id, session_id, status,
              invite_token UNIQUE, created_at)
 interview_sessions(id, candidate_id, resume_id, job_id, stage, status,
@@ -522,6 +645,12 @@ email_log(id, to_addr, subject, body, status, sent_at)
 
 Password hashing uses a random 16-byte salt with SHA-256 → stored as
 `salt$hash`. Auth tokens rotate on every login.
+
+`init_db()` runs lightweight online migrations: any missing column on the
+`jobs` table (the role/seniority/experience fields) is added via
+`ALTER TABLE` on boot, so an old `portal.db` from a previous version
+upgrades transparently. Then it seeds `DemoCorp` plus one mock JD per
+role family from `MOCK_JDS`, skipping any title that already exists.
 
 ---
 
@@ -557,6 +686,27 @@ Password hashing uses a random 16-byte salt with SHA-256 → stored as
 | POST   | `/api/company/:id/jobs`                      |
 | GET    | `/api/company/:id/applications`              |
 | POST   | `/api/invite/send`                           |
+
+`POST /api/company/:id/jobs` body:
+
+```json
+{
+  "title": "Senior Software Engineer — Platform",
+  "description": "...",
+  "required_skills": "Go, Kubernetes, gRPC, ...",
+  "role_family": "software_engineering",
+  "seniority": "senior",
+  "min_experience_years": 5,
+  "max_experience_years": 9,
+  "department": "Engineering",
+  "employment_type": "full_time"
+}
+```
+
+`role_family` must be one of the 22 keys in `ALL_PROFILES` and `seniority`
+one of `intern|entry|mid|senior|lead|principal`; unknown values return
+400. The full taxonomy is exposed read-only at runtime via
+`backend.interview.role_profiles.list_role_families()`.
 
 ---
 

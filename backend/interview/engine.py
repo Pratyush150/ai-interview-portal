@@ -1,7 +1,11 @@
 """Interview engine with stages, memory, structured output, and AI detection.
 
-Manages a multi-stage technical interview:
-    INTRO -> BACKGROUND -> TECHNICAL -> FOLLOW_UP -> WRAP_UP
+Manages a multi-stage interview whose stage prompts, turn budget, topic mix,
+and depth are all selected from a role-specific profile in role_profiles.py.
+That way an MBA consulting case and a staff-level SRE deep-dive are genuinely
+different interviews, not cosmetic variants of the same prompt.
+
+Stage order: INTRO -> BACKGROUND -> CORE -> FOLLOW_UP -> WRAP_UP -> FINISHED
 """
 from __future__ import annotations
 
@@ -13,6 +17,13 @@ from groq import Groq
 
 from backend.llm.structured import ask_llm_structured, InterviewResponse
 from backend.ai_detection import analyze_answer
+from backend.interview.role_profiles import (
+    get_profile,
+    get_turn_budget,
+    get_depth_instruction,
+    get_rubric_weights,
+    infer_seniority,
+)
 
 load_dotenv()
 
@@ -20,101 +31,36 @@ load_dotenv()
 class Stage(str, Enum):
     INTRO = "intro"
     BACKGROUND = "background"
+    # The core technical/functional block. Named "technical" for legacy
+    # compatibility with downstream consumers that still read the stage
+    # string, but the engine treats it as role-agnostic "core".
     TECHNICAL = "technical"
     FOLLOW_UP = "follow_up"
     WRAP_UP = "wrap_up"
     FINISHED = "finished"
 
 
-STAGE_TURN_LIMITS = {
-    Stage.INTRO: 2,
-    Stage.BACKGROUND: 4,
-    Stage.TECHNICAL: 9,
-    Stage.FOLLOW_UP: 5,
-    Stage.WRAP_UP: 2,
-}
-
 STAGE_ORDER = [Stage.INTRO, Stage.BACKGROUND, Stage.TECHNICAL, Stage.FOLLOW_UP, Stage.WRAP_UP, Stage.FINISHED]
 
-STAGE_PROMPTS = {
-    Stage.INTRO: (
-        "You are starting the interview. Greet the candidate briefly and warmly, "
-        "then set expectations: this will be a rigorous, in-depth technical interview. "
-        "Ask them to give a concise introduction — who they are, their current role, "
-        "and what they are most proud of building. Do not linger here; keep it to "
-        "one or two exchanges maximum."
-    ),
-    Stage.BACKGROUND: (
-        "You are in the background stage. Your goal is to separate real, deep experience "
-        "from surface-level resume padding. For each project the candidate mentions:\n"
-        "- Ask what THEY specifically did versus what the team did.\n"
-        "- Ask about the architecture: what components existed, how they communicated, "
-        "what databases or message queues were used and WHY those were chosen over alternatives.\n"
-        "- Ask about team size, their exact role, and who they reported to.\n"
-        "- Ask about a specific technical challenge they hit on that project and how they solved it.\n"
-        "- If they mention a technology, ask them to explain how it works under the hood.\n"
-        "Do NOT accept vague answers like 'I worked on the backend.' Push for specifics: "
-        "'What endpoints did you own? What was the request volume? How did you handle failures?'\n"
-        "Ask one question at a time. Reference their previous answers to build continuity."
-    ),
-    Stage.TECHNICAL: (
-        "You are in the technical deep-dive stage. Go DEEP into one or two topics rather than "
-        "skimming across many. Choose topics based on the candidate's background and the job requirements.\n\n"
-        "Pick from these question types and mix them:\n"
-        "- SYSTEM DESIGN: 'Design a system that handles X at scale.' Then probe: database sharding, "
-        "caching strategy, failover, consistency vs availability tradeoffs.\n"
-        "- ALGORITHM & COMPLEXITY: Ask about time/space complexity. 'Can you do better than O(n^2)?'\n"
-        "- DEBUGGING SCENARIOS: 'Your service returns 500 errors for 2%% of requests during peak hours. "
-        "Walk me through your debugging process.'\n"
-        "- CODE REVIEW: 'If you saw a PR that did X, what concerns would you raise?'\n"
-        "- TRADEOFF ANALYSIS: 'Why SQL over NoSQL here? What do you lose?'\n\n"
-        "When the candidate answers, ALWAYS follow up: 'Why that choice? What if requirements changed? "
-        "What are the failure modes?' Never say 'good answer' and move on. Always dig one level deeper."
-    ),
-    Stage.FOLLOW_UP: (
-        "You are in the follow-up stage. Go back to the candidate's earlier answers and find weak spots.\n"
-        "- Pick an answer where the candidate was vague and ask them to be precise.\n"
-        "- Ask 'what if' questions: change a constraint and see how their answer adapts.\n"
-        "- Ask about failure cases and edge cases they did not mention.\n"
-        "- Ask about monitoring, observability, and how they would know the system is healthy.\n"
-        "- Challenge directly but professionally: 'You mentioned X, but Y might be simpler for this scale. "
-        "Convince me why X is the right call.'\n"
-        "Reference specific things the candidate said earlier."
-    ),
-    Stage.WRAP_UP: (
-        "You are wrapping up the interview. Ask these probing closing questions:\n"
-        "- 'Tell me about a technical decision you made that turned out to be wrong. What did you learn?'\n"
-        "- 'What is the hardest bug you have ever debugged? Walk me through the process.'\n"
-        "After their response, give a brief, honest summary of strengths and areas for improvement. "
-        "Then thank them for their time."
-    ),
+# Turn-budget profile keys -> Stage. The turn-budget dict uses "core" for the
+# technical/functional block; the engine's legacy enum uses "technical".
+_BUDGET_KEY = {
+    Stage.INTRO: "intro",
+    Stage.BACKGROUND: "background",
+    Stage.TECHNICAL: "core",
+    Stage.FOLLOW_UP: "follow_up",
+    Stage.WRAP_UP: "wrap_up",
 }
 
-BASE_SYSTEM_PROMPT = (
-    "You are a senior staff engineer at a FAANG company conducting a rigorous technical interview. "
-    "Your interview style:\n"
-    "- NEVER accept surface-level answers. Always dig deeper with 'why', 'how', 'what tradeoffs'.\n"
-    "- Reference the candidate's previous answers when asking follow-ups.\n"
-    "- Use scenario-based questions with concrete numbers and constraints.\n"
-    "- When a candidate gives a weak or vague answer, challenge it professionally.\n"
-    "- Adapt difficulty dynamically based on the candidate's performance.\n"
-    "- Ask ONE question at a time. Keep responses concise (2-3 sentences). Do not lecture.\n"
-    "- Conduct the interview in English.\n"
-    "- Be tough but fair. Assess true depth of knowledge."
+
+BASE_INTERVIEWER_PREFIX = (
+    "You are conducting a rigorous, role-specific interview. Core rules that apply to EVERY role:\n"
+    "- Ask ONE question at a time. Keep spoken_text to 1-3 sentences. Never lecture.\n"
+    "- Reference the candidate's previous answers to build continuity.\n"
+    "- Do not accept hand-waving; always dig: why / how / tradeoffs / failure modes.\n"
+    "- Stay in English unless the candidate switches first.\n"
+    "- Be tough but fair. Assess true depth, not polished delivery.\n"
 )
-
-
-# Topic categories the interviewer should cycle through
-TOPIC_CATEGORIES = [
-    "system design & architecture",
-    "data structures & algorithms",
-    "databases & storage",
-    "APIs & distributed systems",
-    "testing & debugging",
-    "deployment & DevOps",
-    "security & performance",
-    "code quality & best practices",
-]
 
 
 @dataclass
@@ -133,54 +79,110 @@ class InterviewSession:
     job_skills: list[str] = field(default_factory=list)
     job_description: str = ""
     cheating_flags: list[dict] = field(default_factory=list)
-    asked_topics: list[str] = field(default_factory=list)  # track covered topics
+    asked_topics: list[str] = field(default_factory=list)
+    # Role / seniority metadata (drives stage prompts + turn budget).
+    role_family: str = "software_engineering"
+    seniority: str = "mid"
+    candidate_experience_years: float | None = None
+
+    def __post_init__(self):
+        # Auto-detect seniority from candidate YOE if not explicitly set.
+        if self.seniority == "mid" and self.candidate_experience_years is not None:
+            self.seniority = infer_seniority(self.candidate_experience_years)
 
     @property
     def is_finished(self) -> bool:
         return self.stage == Stage.FINISHED
 
+    @property
+    def _profile(self):
+        return get_profile(self.role_family)
+
+    @property
+    def _turn_budget(self):
+        return get_turn_budget(self.seniority)
+
+    def _stage_prompt(self) -> str:
+        p = self._profile
+        depth = get_depth_instruction(self.seniority)
+        template = {
+            Stage.INTRO: p.intro_prompt,
+            Stage.BACKGROUND: p.background_prompt,
+            Stage.TECHNICAL: p.core_prompt,
+            Stage.FOLLOW_UP: p.follow_up_prompt,
+            Stage.WRAP_UP: p.wrap_up_prompt,
+        }.get(self.stage, "")
+        return template.replace("{{depth}}", depth)
+
     def _system_prompt(self) -> str:
-        stage_overlay = STAGE_PROMPTS.get(self.stage, "")
-        parts = [BASE_SYSTEM_PROMPT, f"\n\nCurrent stage: {self.stage.value}.", stage_overlay]
+        p = self._profile
+        parts = [
+            BASE_INTERVIEWER_PREFIX,
+            p.interviewer_persona,
+            f"\nRole being interviewed for: {p.display_name} ({self.seniority}).",
+            f"Current stage: {self.stage.value}.",
+            self._stage_prompt(),
+        ]
         if self.candidate_name:
             parts.append(f"\nCandidate name: {self.candidate_name}.")
+        if self.candidate_experience_years is not None:
+            parts.append(f"Candidate reports ~{self.candidate_experience_years:.1f} years of experience.")
         if self.resume_context:
-            parts.append(f"\nCandidate resume context: {self.resume_context}")
-            parts.append("Tailor questions to the candidate's specific experience and skills.")
+            parts.append(f"\nCandidate resume context:\n{self.resume_context}")
+            parts.append("Tailor questions to the candidate's specific experience. Probe their actual claims.")
         if self.job_title:
-            parts.append(f"\nThis interview is for the position: {self.job_title}.")
+            parts.append(f"\nJob title: {self.job_title}.")
         if self.job_skills:
             parts.append(f"Required skills: {', '.join(self.job_skills)}.")
+        if self.job_description:
+            parts.append(f"Job description (truncated): {self.job_description[:600]}")
 
-        # Topic diversity instruction
+        # Topic diversity guidance — rotate through the role-specific topic mix.
         if self.asked_topics:
             parts.append(
-                f"\n\nIMPORTANT — TOPIC DIVERSITY: You have already asked about these topics: "
+                "\nTOPIC DIVERSITY: You have already covered these topics: "
                 f"{', '.join(self.asked_topics)}. "
-                f"Do NOT ask another question about the same topic area. "
-                f"Switch to a DIFFERENT topic. Choose from areas you have NOT covered yet. "
-                f"Vary between: {', '.join(TOPIC_CATEGORIES)}."
+                f"Do NOT repeat them. Pick from the remaining areas for this role: "
+                f"{', '.join(p.topic_categories)}."
+            )
+        else:
+            parts.append(
+                f"\nRotate questions across these topic areas: {', '.join(p.topic_categories)}."
             )
 
         parts.append(
             f"\nThis is turn {self.stage_turn_count + 1} of the {self.stage.value} stage. "
-            f"Total interview turns so far: {self.total_turns}."
+            f"Total turns so far: {self.total_turns}."
         )
         return " ".join(parts)
 
     def _job_context(self) -> str:
-        if not self.job_title:
-            return ""
-        parts = [f"Position: {self.job_title}"]
+        p = self._profile
+        parts = [f"Role family: {p.display_name} ({self.seniority})"]
+        if self.job_title:
+            parts.append(f"Position: {self.job_title}")
+        if self.candidate_experience_years is not None:
+            parts.append(f"Candidate YoE: ~{self.candidate_experience_years:.1f}")
         if self.job_skills:
             parts.append(f"Required skills: {', '.join(self.job_skills)}")
         if self.job_description:
             parts.append(f"Description: {self.job_description[:500]}")
+        # Hand the LLM the depth instruction and rubric weights for this role.
+        parts.append(f"Depth bar: {get_depth_instruction(self.seniority)}")
+        weights = get_rubric_weights(self.role_family)
+        parts.append(
+            "Rubric weighting for this role — "
+            + ", ".join(f"{k}:{v}" for k, v in weights.items())
+            + ". Weight scores accordingly."
+        )
         return "\n".join(parts)
 
+    def _turn_limit(self) -> int:
+        key = _BUDGET_KEY.get(self.stage, "core")
+        return int(self._turn_budget.get(key, 3))
+
     def _should_advance(self) -> bool:
-        limit = STAGE_TURN_LIMITS.get(self.stage, 3)
-        return self.stage_turn_count >= limit
+        return self.stage_turn_count >= self._turn_limit()
 
     def _advance_stage(self) -> None:
         idx = STAGE_ORDER.index(self.stage)
@@ -230,7 +232,6 @@ class InterviewSession:
         if self.is_finished:
             return InterviewResponse(spoken_text="The interview has concluded. Thank you for participating!")
 
-        # Pass asked_topics so the LLM knows what to avoid
         resp = ask_llm_structured(
             user_text,
             stage=self.stage.value,
@@ -238,18 +239,14 @@ class InterviewSession:
             resume_context=self.resume_context,
             job_context=self._job_context(),
             asked_topics=self.asked_topics,
+            role_profile=self._profile,
+            seniority=self.seniority,
         )
 
-        # Run heuristic AI detection. For short answers (< MIN_WORDS_FOR_DETECTION)
-        # the heuristic is not confident — in that case we also discount the
-        # LLM's guess, since the LLM tends to default to 0.2-0.3 on short
-        # ambiguous inputs which produces noisy false positives.
         heuristic = analyze_answer(user_text, time_to_respond_ms, is_voice_input)
         if not heuristic.confident:
             combined_ai = 0.0
         else:
-            # Weighted blend, but require at least one signal to exceed 0.2
-            # before we report anything above 0.1 overall.
             blended = 0.5 * heuristic.likelihood + 0.5 * resp.ai_likelihood
             if heuristic.likelihood < 0.2 and resp.ai_likelihood < 0.4:
                 blended *= 0.3
@@ -260,7 +257,6 @@ class InterviewSession:
         self.stage_turn_count += 1
         self.total_turns += 1
 
-        # Track the topic to prevent repetition
         if resp.topic and resp.topic not in self.asked_topics:
             self.asked_topics.append(resp.topic)
 
@@ -299,6 +295,7 @@ class InterviewSession:
     def get_status(self) -> dict:
         scores = [e["score"] for e in self.evaluations if e.get("score") is not None]
         ai_scores = [e["ai_likelihood"] for e in self.evaluations if e.get("ai_likelihood") is not None]
+        total_budget = sum(self._turn_budget.values())
         return {
             "session_id": self.session_id,
             "stage": self.stage.value,
@@ -311,4 +308,7 @@ class InterviewSession:
             "avg_ai_likelihood": round(sum(ai_scores) / len(ai_scores), 2) if ai_scores else None,
             "cheating_flags_count": len(self.cheating_flags),
             "topics_covered": self.asked_topics,
+            "role_family": self.role_family,
+            "seniority": self.seniority,
+            "expected_total_turns": total_budget,
         }
