@@ -16,6 +16,30 @@
             }
         })();
     </script>
+    <!-- Pre-fill candidate name/email from URL params if a logged-in candidate
+         was redirected here from the Next.js shell at /candidate-login.
+         Runs once DOM is ready, before app.js wires its own listeners. -->
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            try {
+                var params = new URLSearchParams(window.location.search);
+                var name = params.get('name');
+                var email = params.get('email');
+                if (name) {
+                    var nameEl = document.getElementById('candidate-name');
+                    if (nameEl && !nameEl.value) nameEl.value = name;
+                    // Also pre-fill the apply-screen name (in case they
+                    // navigate to Jobs → Apply within this session).
+                    var applyName = document.getElementById('apply-name');
+                    if (applyName && !applyName.value) applyName.value = name;
+                }
+                if (email) {
+                    var applyEmail = document.getElementById('apply-email');
+                    if (applyEmail && !applyEmail.value) applyEmail.value = email;
+                }
+            } catch (e) { /* ignore */ }
+        });
+    </script>
     <title>Interview</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%231d1d1f'/><text x='16' y='22' text-anchor='middle' font-family='-apple-system,Inter,sans-serif' font-size='14' font-weight='700' fill='%23fafaf8' letter-spacing='-0.03em'>AI</text></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -312,8 +336,9 @@
                      load (network, WebGL disabled). -->
                 <div class="conversation-stage two-up">
                     <div class="person-tile interviewer-tile" id="interviewer-tile">
-                        <div id="avatar-canvas" class="avatar-canvas"></div>
-                        <div id="pip-avatar" class="siri-orb avatar-fallback-orb" aria-label="AI interviewer">
+                        <!-- 3D avatar removed by request — voice-only with the
+                             Siri orb as the visual presence indicator. -->
+                        <div id="pip-avatar" class="siri-orb avatar-fallback-orb avatar-only" aria-label="AI interviewer">
                             <div class="orb-halo"></div>
                             <div class="orb-ring orb-ring-1"></div>
                             <div class="orb-ring orb-ring-2"></div>
@@ -324,7 +349,7 @@
                         <div class="tile-nameplate">
                             <span class="interviewer-chip" id="interviewer-chip" data-state="idle">
                                 <span class="chip-dot" aria-hidden="true"></span>
-                                <span class="chip-name">Morgan</span>
+                                <span class="chip-name">Sara</span>
                                 <span class="chip-sep" aria-hidden="true">·</span>
                                 <span class="chip-state" id="interviewer-chip-state">Ready</span>
                             </span>
@@ -379,16 +404,9 @@
         </div>
     </div>
 
-    <!-- three.js loaded via importmap; avatar.js uses it to render the GLB. -->
-    <script type="importmap">
-    {
-        "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-        }
-    }
-    </script>
-    <script type="module" src="/static/avatar.js"></script>
+    <!-- 3D avatar removed by request. The interview is voice-only; the orb
+         in the interviewer tile reacts to amplitude. avatar.js no longer
+         loaded. -->
     <script src="/static/anticheat.js"></script>
     <script src="/static/app.js"></script>
 </body>

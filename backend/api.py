@@ -26,6 +26,8 @@ import json
 import asyncio
 import base64
 import tempfile
+import secrets
+from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -33,21 +35,63 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.interview.engine import InterviewSession, Stage
 from backend.interview.role_profiles import (
     list_role_families, ALL_PROFILES, SENIORITY_TIERS, infer_seniority,
+    TOTAL_DURATION_MIN_DEFAULT, get_interviewer_name,
 )
-from backend.tts.elevenlabs_tts import synthesize
+from backend.interview.preflight import build_interview_brief
+from backend.interview.report import synthesize_report
+from backend.tts.elevenlabs_tts import synthesize as elevenlabs_synthesize
+from backend.tts.edge_tts_provider import synthesize as edge_synthesize
 from backend.stt.deepgram_stt import transcribe_file, STTTimeout
 from backend.stt.deepgram_streaming import StreamingTranscriber
-from backend.database import init_db, get_db, hash_password, verify_password
+from backend.database import (
+    init_db, get_db, hash_password, verify_password, slugify, unique_slug,
+    log_event, audit,
+)
 from backend.resume_parser import extract_text_from_pdf, analyze_resume
-from backend.email_service import send_interview_invite
+from backend.email_service import (
+    send_interview_invite, send_lead_notification, send_owner_setup_email,
+)
 
 # In-memory session store (hot cache)
 sessions: dict[str, InterviewSession] = {}
+
+
+# ── Simple in-process rate limiter ─────────────────────────────────────
+#
+# Sliding-window counter keyed by (bucket, ip). Good enough for a single
+# uvicorn worker and abuse-prevention on public endpoints. For multi-worker
+# deploys, swap this for a Redis-backed limiter. We deliberately keep it
+# in-process to avoid adding Redis as a dependency.
+import time as _time
+_rate_buckets: dict[tuple[str, str], list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(request: Request, *, bucket: str, max_calls: int, window_s: float) -> None:
+    """Raise 429 if the caller exceeds `max_calls` in the last `window_s`."""
+    now = _time.monotonic()
+    ip = _client_ip(request)
+    key = (bucket, ip)
+    history = _rate_buckets.setdefault(key, [])
+    cutoff = now - window_s
+    # Keep only the recent entries — bounded memory per IP.
+    while history and history[0] < cutoff:
+        history.pop(0)
+    if len(history) >= max_calls:
+        raise HTTPException(429, "Too many requests — slow down.")
+    history.append(now)
 
 AUDIO_DIR = Path("tests/audio/sessions")
 
@@ -56,7 +100,22 @@ AUDIO_DIR = Path("tests/audio/sessions")
 # server synthesis entirely for lower latency. Flip USE_SERVER_TTS=1 in
 # .env to restore ElevenLabs voice.
 import os
-USE_SERVER_TTS = os.getenv("USE_SERVER_TTS", "0") in ("1", "true", "True", "yes")
+from dotenv import load_dotenv
+
+# Load .env before reading any env vars.
+load_dotenv()
+
+# Server-side TTS is on by default. We use Microsoft Edge TTS (free, no key,
+# natural neural female voice — Aria) as the primary path. ElevenLabs is the
+# alternate and is only attempted if TTS_PROVIDER=elevenlabs is set explicitly.
+# Set USE_SERVER_TTS=0 to force the browser Web Speech API instead.
+_tts_override = os.getenv("USE_SERVER_TTS")
+if _tts_override is None:
+    USE_SERVER_TTS = True  # Edge TTS works without any key
+else:
+    USE_SERVER_TTS = _tts_override in ("1", "true", "True", "yes")
+
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").lower()  # "edge" | "elevenlabs"
 
 
 @asynccontextmanager
@@ -78,6 +137,56 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def static_cache_headers(request, call_next):
+    """Cache headers tuned for the Next.js static export.
+
+    Why this matters: Next.js writes content-hashed bundle names like
+    `chunks/255-fbf9dcd7d44e3455.js`. Each rebuild changes hashes for any
+    chunk whose source touched. If a browser caches an old `index.html` that
+    references chunks from a previous build, the JS 404s and the page goes
+    blank — exactly the "home page not loading" bug we hit.
+
+    Strategy:
+      - `/_next/static/*`  → cached forever, immutable. The hash in the URL
+        already invalidates on change.
+      - HTML pages         → `no-cache` so browsers always revalidate (304
+        on no change, 200 on a rebuild). Cheap, and prevents stale-shell.
+      - Everything else    → leave defaults.
+    """
+    response = await call_next(request)
+    p = request.url.path
+    if p.startswith("/_next/static/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif p == "/" or p.endswith(".html") or p.endswith("/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.middleware("http")
+async def rsc_payload_redirect(request, call_next):
+    """Next.js static-export emits an `index.txt` RSC payload alongside every
+    `index.html`. The Next.js client router fetches these via fetch() during
+    client-side navigation. If a *browser* lands on one directly (cached link,
+    extension prefetch, manual URL), it shows the raw payload as plain text.
+
+    This redirects user-facing navigations to the parent directory; the JS
+    router still works because `fetch()` doesn't send `Sec-Fetch-Dest: document`.
+    """
+    path = request.url.path
+    if path.endswith("/index.txt") and request.method in ("GET", "HEAD"):
+        sec_dest = request.headers.get("sec-fetch-dest", "")
+        accept = request.headers.get("accept", "")
+        is_navigation = sec_dest == "document" or (
+            "text/html" in accept and sec_dest != "empty"
+        )
+        if is_navigation:
+            from fastapi.responses import RedirectResponse
+            target = path[: -len("index.txt")] or "/"
+            return RedirectResponse(target, status_code=308)
+    return await call_next(request)
+
+
 # --- Pydantic models ---
 
 class SessionCreate(BaseModel):
@@ -86,6 +195,7 @@ class SessionCreate(BaseModel):
     resume_id: str | None = None
     job_id: str | None = None
     invite_token: str | None = None
+    target_duration_min: float | None = None  # defaults to TOTAL_DURATION_MIN_DEFAULT
 
 class SessionResponse(BaseModel):
     session_id: str
@@ -96,6 +206,15 @@ class SessionResponse(BaseModel):
     avg_score: float | None
     avg_ai_likelihood: float | None = None
     cheating_flags_count: int = 0
+    # Surface time-budget + interviewer info to the frontend so it can show
+    # the timer / progress / "Hi, I'm Sara" without an extra round-trip.
+    target_duration_min: float = float(TOTAL_DURATION_MIN_DEFAULT)
+    elapsed_min: float = 0.0
+    remaining_min: float = float(TOTAL_DURATION_MIN_DEFAULT)
+    stage_remaining_min: float = 0.0
+    interviewer_name: str = "Sara"
+    role_family: str = "backend_engineering"
+    seniority: str = "mid"
 
 class TextTurnRequest(BaseModel):
     text: str
@@ -111,6 +230,12 @@ class TurnResponse(BaseModel):
     # Populated on /audio-turn so the frontend can render the candidate's
     # own transcribed words instead of a "[voice input]" placeholder.
     transcript: str | None = None
+    # Per-turn score and time-remaining surface so the UI can show a chip
+    # and update its progress bar without polling.
+    last_turn_score: float | None = None
+    elapsed_min: float = 0.0
+    remaining_min: float = 0.0
+    stage_remaining_min: float = 0.0
 
 class CompanyCreate(BaseModel):
     name: str
@@ -157,13 +282,17 @@ def create_session(req: SessionCreate):
     sid = uuid.uuid4().hex[:12]
 
     resume_context = ""
+    resume_json: dict = {}
+    job_row_for_brief: dict | None = None
     job_title = ""
-    job_skills = []
+    job_skills: list[str] = []
     job_description = ""
-    role_family = "software_engineering"
+    role_family = "backend_engineering"
     seniority = "mid"
     candidate_name = req.candidate_name
     candidate_experience_years: float | None = None
+    session_company_id: str | None = None
+    session_application_id: str | None = None
 
     # Load resume context if provided
     if req.resume_id:
@@ -171,15 +300,15 @@ def create_session(req: SessionCreate):
         row = db.execute("SELECT raw_text, skills_json FROM resumes WHERE id=?", (req.resume_id,)).fetchone()
         db.close()
         if row:
-            skills_data = json.loads(row["skills_json"]) if row["skills_json"] else {}
-            resume_context = skills_data.get("experience_summary", row["raw_text"][:1000])
-            if skills_data.get("skills"):
-                resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
-            if skills_data.get("suggested_questions"):
-                resume_context += f"\nSuggested questions: {'; '.join(skills_data['suggested_questions'][:5])}"
-            if skills_data.get("experience_years") is not None:
+            resume_json = json.loads(row["skills_json"]) if row["skills_json"] else {}
+            resume_context = resume_json.get("experience_summary", row["raw_text"][:1000])
+            if resume_json.get("skills"):
+                resume_context += f"\nSkills: {', '.join(resume_json['skills'])}"
+            if resume_json.get("suggested_questions"):
+                resume_context += f"\nSuggested questions: {'; '.join(resume_json['suggested_questions'][:5])}"
+            if resume_json.get("experience_years") is not None:
                 try:
-                    candidate_experience_years = float(skills_data["experience_years"])
+                    candidate_experience_years = float(resume_json["experience_years"])
                 except (TypeError, ValueError):
                     pass
 
@@ -193,6 +322,7 @@ def create_session(req: SessionCreate):
         ).fetchone()
         db.close()
         if row:
+            job_row_for_brief = dict(row)
             job_title = row["title"]
             job_description = row["description"] or ""
             job_skills = [s.strip() for s in (row["required_skills"] or "").split(",") if s.strip()]
@@ -205,6 +335,7 @@ def create_session(req: SessionCreate):
         app_row = db.execute(
             "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, "
             "j.role_family, j.seniority, j.min_experience_years, j.max_experience_years, "
+            "j.company_id, "
             "r.raw_text, r.skills_json "
             "FROM applications a "
             "JOIN candidates c ON a.candidate_id=c.id "
@@ -215,6 +346,19 @@ def create_session(req: SessionCreate):
         ).fetchone()
         db.close()
         if app_row:
+            if app_row["invite_revoked_at"]:
+                raise HTTPException(410, "This interview link has been revoked")
+            if app_row["invite_expires_at"]:
+                try:
+                    exp = datetime.fromisoformat(app_row["invite_expires_at"])
+                    if exp < datetime.utcnow():
+                        raise HTTPException(410, "This interview link has expired")
+                except HTTPException:
+                    raise
+                except (ValueError, TypeError):
+                    pass
+            session_company_id = app_row["company_id"]
+            session_application_id = app_row["id"]
             candidate_name = app_row["cname"]
             if app_row["title"]:
                 job_title = app_row["title"]
@@ -222,23 +366,43 @@ def create_session(req: SessionCreate):
                 job_skills = [s.strip() for s in (app_row["required_skills"] or "").split(",") if s.strip()]
                 role_family = app_row["role_family"] or role_family
                 seniority = app_row["seniority"] or seniority
+                job_row_for_brief = {
+                    "title": job_title,
+                    "description": job_description,
+                    "required_skills": app_row["required_skills"],
+                    "role_family": role_family,
+                    "seniority": seniority,
+                    "min_experience_years": app_row["min_experience_years"],
+                    "max_experience_years": app_row["max_experience_years"],
+                }
             if app_row["raw_text"]:
-                skills_data = json.loads(app_row["skills_json"]) if app_row["skills_json"] else {}
-                resume_context = skills_data.get("experience_summary", app_row["raw_text"][:1000])
-                if skills_data.get("skills"):
-                    resume_context += f"\nSkills: {', '.join(skills_data['skills'])}"
-                if skills_data.get("experience_years") is not None:
+                resume_json = json.loads(app_row["skills_json"]) if app_row["skills_json"] else {}
+                resume_context = resume_json.get("experience_summary", app_row["raw_text"][:1000])
+                if resume_json.get("skills"):
+                    resume_context += f"\nSkills: {', '.join(resume_json['skills'])}"
+                if resume_json.get("experience_years") is not None:
                     try:
-                        candidate_experience_years = float(skills_data["experience_years"])
+                        candidate_experience_years = float(resume_json["experience_years"])
                     except (TypeError, ValueError):
                         pass
 
     # If the candidate's experience is clearly outside the posted range, nudge
-    # seniority toward the candidate's actual level. Tough-but-fair: we don't
-    # want a 10-year staff engineer getting intern-depth questions just because
-    # they applied for a listing filed as "mid".
+    # seniority toward the candidate's actual level.
     if candidate_experience_years is not None:
         seniority = infer_seniority(candidate_experience_years)
+
+    target_minutes = float(req.target_duration_min) if req.target_duration_min else float(TOTAL_DURATION_MIN_DEFAULT)
+    # Sane bounds — 5 minutes is a smoke test, 60 is the hard upper.
+    target_minutes = max(5.0, min(60.0, target_minutes))
+
+    # Run preflight: read resume against JD and produce the interview brief
+    # the engine will surface to the LLM. Best-effort — empty dict on failure.
+    brief: dict = {}
+    if resume_json or job_row_for_brief:
+        try:
+            brief = build_interview_brief(resume_json or {}, job_row_for_brief, seniority)
+        except Exception:
+            brief = {}
 
     session = InterviewSession(
         session_id=sid,
@@ -251,17 +415,48 @@ def create_session(req: SessionCreate):
         role_family=role_family,
         seniority=seniority,
         candidate_experience_years=candidate_experience_years,
+        target_duration_min=target_minutes,
+        interview_brief=brief,
     )
     sessions[sid] = session
 
-    # Persist to DB
+    # If we resolved company_id from the invite token, prefer that. Otherwise
+    # try to derive it from the job_id (direct session creation by recruiters).
+    if not session_company_id and req.job_id:
+        db = get_db()
+        jrow = db.execute(
+            "SELECT company_id FROM jobs WHERE id=?", (req.job_id,)
+        ).fetchone()
+        db.close()
+        if jrow:
+            session_company_id = jrow["company_id"]
+
+    # Persist to DB (with the new columns)
     db = get_db()
     db.execute(
-        "INSERT INTO interview_sessions (id, candidate_id, resume_id, job_id) VALUES (?,?,?,?)",
-        (sid, None, req.resume_id, req.job_id),
+        "INSERT INTO interview_sessions "
+        "(id, candidate_id, resume_id, job_id, role_family, seniority, "
+        " target_duration_min, interview_brief_json, company_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (sid, None, req.resume_id, req.job_id, role_family, seniority,
+         target_minutes, json.dumps(brief) if brief else None,
+         session_company_id),
     )
+    if session_application_id:
+        db.execute(
+            "UPDATE applications SET session_id=?, invite_used_at=CURRENT_TIMESTAMP, "
+            "status='in_progress' WHERE id=?",
+            (sid, session_application_id),
+        )
     db.commit()
     db.close()
+    log_event(
+        "interview_started",
+        company_id=session_company_id,
+        job_id=req.job_id,
+        application_id=session_application_id,
+        session_id=sid,
+    )
 
     status = session.get_status()
     return SessionResponse(
@@ -273,6 +468,13 @@ def create_session(req: SessionCreate):
         avg_score=status["avg_score"],
         avg_ai_likelihood=status["avg_ai_likelihood"],
         cheating_flags_count=status["cheating_flags_count"],
+        target_duration_min=status["target_duration_min"],
+        elapsed_min=status["elapsed_min"],
+        remaining_min=status["remaining_min"],
+        stage_remaining_min=status["stage_remaining_min"],
+        interviewer_name=status["interviewer_name"],
+        role_family=status["role_family"],
+        seniority=status["seniority"],
     )
 
 
@@ -291,7 +493,68 @@ def get_session(session_id: str):
         avg_score=status["avg_score"],
         avg_ai_likelihood=status["avg_ai_likelihood"],
         cheating_flags_count=status["cheating_flags_count"],
+        target_duration_min=status["target_duration_min"],
+        elapsed_min=status["elapsed_min"],
+        remaining_min=status["remaining_min"],
+        stage_remaining_min=status["stage_remaining_min"],
+        interviewer_name=status["interviewer_name"],
+        role_family=status["role_family"],
+        seniority=status["seniority"],
     )
+
+
+@app.get("/api/session/{session_id}/report")
+async def get_report(session_id: str):
+    """Synthesized end-of-interview report. Cached on the session after the
+    first call so repeated views are instant. The candidate-side report page
+    polls this endpoint after the interview ends."""
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session.cached_report:
+        return _report_envelope(session, session.cached_report)
+
+    # Run synthesis off the event loop — it's an LLM call.
+    report = await asyncio.to_thread(synthesize_report, session)
+    session.cached_report = report
+
+    # Persist for analytics + so a recruiter view can read it later.
+    try:
+        db = get_db()
+        db.execute(
+            "UPDATE interview_sessions SET report_json=? WHERE id=?",
+            (json.dumps(report), session_id),
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+    return _report_envelope(session, report)
+
+
+def _report_envelope(session: InterviewSession, report: dict) -> dict:
+    status = session.get_status()
+    return {
+        "session_id": session.session_id,
+        "interviewer_name": status["interviewer_name"],
+        "role_family": status["role_family"],
+        "seniority": status["seniority"],
+        "candidate_name": session.candidate_name,
+        "job_title": session.job_title,
+        "target_duration_min": status["target_duration_min"],
+        "elapsed_min": status["elapsed_min"],
+        "total_turns": status["total_turns"],
+        "evaluations_count": status["evaluations_count"],
+        "avg_score": status["avg_score"],
+        "avg_ai_likelihood": status["avg_ai_likelihood"],
+        "cheating_flags_count": status["cheating_flags_count"],
+        "cheating_flags": session.cheating_flags,
+        "topics_covered": status["topics_covered"],
+        "interview_brief": session.interview_brief,
+        "evaluations": session.evaluations,
+        "report": report,
+    }
 
 
 @app.post("/api/session/{session_id}/turn", response_model=TurnResponse)
@@ -306,23 +569,58 @@ async def text_turn(session_id: str, req: TextTurnRequest):
     )
     status = session.get_status()
 
-    audio_url = None
-    if USE_SERVER_TTS:
-        try:
-            audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
-            audio_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(synthesize, reply, audio_path)
-            audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
-        except Exception:
-            pass
+    audio_url = await _try_synthesize(session_id, reply, status["total_turns"])
 
+    last_score = session.evaluations[-1].get("score") if session.evaluations else None
     return TurnResponse(
         reply=reply,
         stage=status["stage"],
         total_turns=status["total_turns"],
         is_finished=status["is_finished"],
         audio_url=audio_url,
+        last_turn_score=last_score,
+        elapsed_min=status["elapsed_min"],
+        remaining_min=status["remaining_min"],
+        stage_remaining_min=status["stage_remaining_min"],
     )
+
+
+async def _try_synthesize(session_id: str, text: str, turn_n: int) -> str | None:
+    """Attempt server-side TTS. Tries the configured provider first (Edge by
+    default), then falls through to the alternate. On total failure, logs a
+    one-line reason and returns None so the frontend can fall back to the
+    browser Web Speech API."""
+    if not USE_SERVER_TTS:
+        return None
+
+    audio_path = AUDIO_DIR / session_id / f"turn_{turn_n}.mp3"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    rel_url = f"/api/audio/{session_id}/turn_{turn_n}.mp3"
+
+    providers: list[tuple[str, callable]] = []
+    if TTS_PROVIDER == "elevenlabs":
+        providers.append(("elevenlabs", elevenlabs_synthesize))
+        providers.append(("edge", edge_synthesize))
+    else:
+        providers.append(("edge", edge_synthesize))
+        if os.getenv("ELEVENLABS_API_KEY"):
+            providers.append(("elevenlabs", elevenlabs_synthesize))
+
+    last_error = None
+    for name, fn in providers:
+        try:
+            await asyncio.to_thread(fn, text, audio_path)
+            return rel_url
+        except Exception as e:
+            last_error = (name, str(e)[:200].replace("\n", " "))
+            continue
+
+    if last_error:
+        print(
+            f"[TTS] all providers failed (session={session_id} turn={turn_n}): "
+            f"last={last_error[0]}: {last_error[1]}"
+        )
+    return None
 
 
 @app.post("/api/session/{session_id}/audio-turn", response_model=TurnResponse)
@@ -370,16 +668,9 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
     reply = await asyncio.to_thread(session.turn, transcript.strip(), 0, True)
     status = session.get_status()
 
-    audio_url = None
-    if USE_SERVER_TTS:
-        try:
-            audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
-            audio_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(synthesize, reply, audio_path)
-            audio_url = f"/api/audio/{session_id}/turn_{status['total_turns']}.mp3"
-        except Exception:
-            pass
+    audio_url = await _try_synthesize(session_id, reply, status["total_turns"])
 
+    last_score = session.evaluations[-1].get("score") if session.evaluations else None
     return TurnResponse(
         reply=reply,
         stage=status["stage"],
@@ -387,6 +678,10 @@ async def audio_turn(session_id: str, audio: UploadFile = File(...)):
         is_finished=status["is_finished"],
         audio_url=audio_url,
         transcript=transcript.strip(),
+        last_turn_score=last_score,
+        elapsed_min=status["elapsed_min"],
+        remaining_min=status["remaining_min"],
+        stage_remaining_min=status["stage_remaining_min"],
     )
 
 
@@ -474,7 +769,7 @@ async def upload_resume(
     }
 
 
-# --- Auth helper ---
+# --- Auth helpers ---
 
 def verify_company_auth(company_id: str, request: Request):
     """Check that the request carries a valid Bearer token for the given company."""
@@ -489,6 +784,130 @@ def verify_company_auth(company_id: str, request: Request):
     db.close()
     if not row:
         raise HTTPException(403, "Invalid or expired auth token")
+
+
+def get_candidate_from_token(request: Request) -> Optional[dict]:
+    """Resolve the Bearer token to a candidate row, or return None if no
+    token / unknown token. Used by /api/jobs/{id}/apply to attach an
+    application to the signed-in candidate without breaking anonymous apply."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[len("Bearer "):]
+    if not token:
+        return None
+    db = get_db()
+    row = db.execute(
+        "SELECT id, name, email FROM candidates WHERE auth_token=?",
+        (token,),
+    ).fetchone()
+    db.close()
+    return dict(row) if row else None
+
+
+def require_candidate(request: Request) -> dict:
+    cand = get_candidate_from_token(request)
+    if not cand:
+        raise HTTPException(401, "Candidate sign-in required")
+    return cand
+
+
+# --- Candidate auth endpoints ---
+
+class CandidateSignup(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class CandidateLogin(BaseModel):
+    email: str
+    password: str
+
+
+def _norm_email(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+@app.post("/api/candidate/signup")
+def candidate_signup(req: CandidateSignup):
+    email = _norm_email(req.email)
+    if not email or "@" not in email:
+        raise HTTPException(400, "Valid email required")
+    if not req.password or len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if not req.name.strip():
+        raise HTTPException(400, "Name required")
+
+    db = get_db()
+    existing = db.execute(
+        "SELECT id FROM candidates WHERE LOWER(email)=? AND password_hash IS NOT NULL",
+        (email,),
+    ).fetchone()
+    if existing:
+        db.close()
+        raise HTTPException(409, "An account with this email already exists. Try signing in.")
+
+    cid = uuid.uuid4().hex[:12]
+    pw_hash = hash_password(req.password)
+    auth_token = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO candidates (id, name, email, password_hash, auth_token) VALUES (?,?,?,?,?)",
+        (cid, req.name.strip(), email, pw_hash, auth_token),
+    )
+    db.commit()
+    db.close()
+    return {"candidate_id": cid, "name": req.name.strip(), "email": email, "auth_token": auth_token}
+
+
+@app.post("/api/candidate/login")
+def candidate_login(req: CandidateLogin):
+    email = _norm_email(req.email)
+    if not email or not req.password:
+        raise HTTPException(400, "Email and password required")
+    db = get_db()
+    row = db.execute(
+        "SELECT id, name, email, password_hash FROM candidates "
+        "WHERE LOWER(email)=? AND password_hash IS NOT NULL",
+        (email,),
+    ).fetchone()
+    if not row or not verify_password(req.password, row["password_hash"]):
+        db.close()
+        raise HTTPException(401, "Invalid email or password")
+    new_token = uuid.uuid4().hex
+    db.execute("UPDATE candidates SET auth_token=? WHERE id=?", (new_token, row["id"]))
+    db.commit()
+    db.close()
+    return {
+        "candidate_id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "auth_token": new_token,
+    }
+
+
+@app.get("/api/candidate/me")
+def candidate_me(request: Request):
+    cand = require_candidate(request)
+    return cand
+
+
+@app.get("/api/candidate/me/applications")
+def candidate_my_applications(request: Request):
+    cand = require_candidate(request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT a.id as application_id, a.status, a.invite_token, a.created_at, "
+        "  j.id as job_id, j.title as job_title, j.role_family, j.seniority, "
+        "  c.name as company_name "
+        "FROM applications a "
+        "LEFT JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN companies c ON j.company_id=c.id "
+        "WHERE a.candidate_id=? ORDER BY a.created_at DESC",
+        (cand["id"],),
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
 
 
 # --- Company & Job endpoints ---
@@ -639,34 +1058,67 @@ def get_job(job_id: str):
 @app.post("/api/jobs/{job_id}/apply")
 async def apply_to_job(
     job_id: str,
-    candidate_name: str = Form(...),
-    candidate_email: str = Form(...),
+    request: Request,
+    candidate_name: str = Form(""),
+    candidate_email: str = Form(""),
     resume: UploadFile = File(...),
 ):
+    """Apply to a job. Two modes:
+    - **Authenticated** (preferred): pass `Authorization: Bearer <candidate_token>`.
+      Reuses the signed-in candidate row; the form name/email are ignored.
+    - **Anonymous** (legacy): pass candidate_name + candidate_email in the form.
+      Creates a fresh candidates row without a password — used by the vanilla
+      SPA. The new Next.js apply flow always sends a token instead."""
     db = get_db()
     job = db.execute("SELECT * FROM jobs WHERE id=? AND status='active'", (job_id,)).fetchone()
     if not job:
         db.close()
         raise HTTPException(404, "Job not found or inactive")
 
+    # Resolve the candidate: prefer the Bearer token if present.
+    cand = get_candidate_from_token(request)
+    if cand:
+        candidate_id = cand["id"]
+        # Refuse a duplicate application from the same candidate to the same job.
+        dup = db.execute(
+            "SELECT id, invite_token FROM applications WHERE candidate_id=? AND job_id=?",
+            (candidate_id, job_id),
+        ).fetchone()
+        if dup:
+            db.close()
+            return {
+                "application_id": dup["id"],
+                "invite_token": dup["invite_token"],
+                "candidate_id": candidate_id,
+                "duplicate": True,
+            }
+    else:
+        if not candidate_name.strip() or not candidate_email.strip():
+            db.close()
+            raise HTTPException(401, "Sign in or provide candidate_name + candidate_email")
+        candidate_id = uuid.uuid4().hex[:12]
+        db.execute(
+            "INSERT INTO candidates (id, name, email) VALUES (?,?,?)",
+            (candidate_id, candidate_name.strip(), _norm_email(candidate_email)),
+        )
+
     # Parse resume
     content = await resume.read()
     raw_text = extract_text_from_pdf(content)
     skills_data = analyze_resume(raw_text) if raw_text.strip() else {}
 
-    candidate_id = uuid.uuid4().hex[:12]
     resume_id = uuid.uuid4().hex[:12]
     app_id = uuid.uuid4().hex[:12]
     invite_token = uuid.uuid4().hex[:16]
 
-    db.execute("INSERT INTO candidates (id, name, email) VALUES (?,?,?)", (candidate_id, candidate_name, candidate_email))
     db.execute(
         "INSERT INTO resumes (id, candidate_id, filename, raw_text, skills_json) VALUES (?,?,?,?,?)",
         (resume_id, candidate_id, resume.filename, raw_text[:5000], json.dumps(skills_data)),
     )
     db.execute(
-        "INSERT INTO applications (id, job_id, candidate_id, resume_id, status, invite_token) VALUES (?,?,?,?,?,?)",
-        (app_id, job_id, candidate_id, resume_id, "applied", invite_token),
+        "INSERT INTO applications (id, job_id, candidate_id, resume_id, status, invite_token) "
+        "VALUES (?,?,?,?,?,?)",
+        (app_id, job_id, candidate_id, resume_id, "invited", invite_token),
     )
     db.commit()
     db.close()
@@ -678,6 +1130,24 @@ async def apply_to_job(
         "resume_id": resume_id,
         "skills": skills_data.get("skills", []),
     }
+
+
+@app.get("/api/company/{company_id}/jobs")
+def company_jobs(company_id: str, request: Request):
+    """List a company's job postings (recruiter-only). Counts of active and
+    total applications per job are joined in for the dashboard."""
+    verify_company_auth(company_id, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT j.*, "
+        "  (SELECT COUNT(*) FROM applications a WHERE a.job_id=j.id) AS application_count "
+        "FROM jobs j "
+        "WHERE j.company_id=? "
+        "ORDER BY j.created_at DESC",
+        (company_id,),
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
 
 
 @app.post("/api/invite/send")
@@ -706,14 +1176,19 @@ def send_invite(req: InviteSend, request: Request):
 
 
 @app.get("/api/invite/{token}")
-def validate_invite(token: str):
+def validate_invite(token: str, request: Request):
+    # 60 token-resolutions per IP per minute. Generous for a candidate refresh
+    # cycle but caps brute-force enumeration at ~3600/hr.
+    rate_limit(request, bucket="invite", max_calls=60, window_s=60)
     db = get_db()
     row = db.execute(
         "SELECT a.*, c.name, c.email, j.title, j.id as jid, j.description, j.required_skills, "
+        "j.company_id, co.name as company_name, co.slug as company_slug, "
         "r.id as rid, r.skills_json "
         "FROM applications a "
         "JOIN candidates c ON a.candidate_id=c.id "
         "LEFT JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN companies co ON j.company_id=co.id "
         "LEFT JOIN resumes r ON a.resume_id=r.id "
         "WHERE a.invite_token=?",
         (token,)
@@ -722,6 +1197,18 @@ def validate_invite(token: str):
     if not row:
         raise HTTPException(404, "Invalid invite token")
 
+    if row["invite_revoked_at"]:
+        raise HTTPException(410, "This interview link has been revoked")
+    if row["invite_expires_at"]:
+        try:
+            exp = datetime.fromisoformat(row["invite_expires_at"])
+            if exp < datetime.utcnow():
+                raise HTTPException(410, "This interview link has expired")
+        except HTTPException:
+            raise
+        except (ValueError, TypeError):
+            pass
+
     skills = []
     if row["skills_json"]:
         try:
@@ -729,15 +1216,25 @@ def validate_invite(token: str):
         except Exception:
             pass
 
+    log_event(
+        "link_opened",
+        company_id=row["company_id"], job_id=row["jid"],
+        application_id=row["id"],
+    )
+
     return {
         "valid": True,
         "candidate_name": row["name"],
         "candidate_email": row["email"],
         "job_title": row["title"],
         "job_id": row["jid"],
+        "company_name": row["company_name"],
+        "company_slug": row["company_slug"],
         "resume_id": row["rid"],
         "skills": skills,
         "status": row["status"],
+        "expires_at": row["invite_expires_at"],
+        "already_used": bool(row["invite_used_at"]),
     }
 
 
@@ -756,6 +1253,553 @@ def company_applications(company_id: str, request: Request):
     ).fetchall()
     db.close()
     return [dict(r) for r in rows]
+
+
+# =====================================================================
+# Multi-tenant routes — /api/c/{slug}/*
+#
+# Every endpoint under this section runs through `get_company_by_slug()`
+# which verifies the Bearer token against the company's auth_token. No
+# query in this section should look up rows by id alone — always scope
+# by `company_id = company["id"]` so a leaked token can't read across
+# tenants.
+# =====================================================================
+
+
+def get_company_by_slug(slug: str, request: Request) -> dict:
+    """Resolve `slug` → company row, validating the caller's Bearer token.
+
+    Raises 404 if the slug doesn't exist (don't leak which slugs are taken
+    via 401 vs 404), 401 if the token is missing/invalid for that slug.
+    """
+    db = get_db()
+    company = db.execute(
+        "SELECT id, name, slug, email, auth_token, status, plan, "
+        "interview_quota_monthly, logo_url, brand_color "
+        "FROM companies WHERE slug=?",
+        (slug,),
+    ).fetchone()
+    db.close()
+    if not company:
+        raise HTTPException(404, "Workspace not found")
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Sign-in required")
+    token = auth_header[len("Bearer "):]
+    if not token or token != company["auth_token"]:
+        raise HTTPException(401, "Invalid or expired auth token")
+    if company["status"] != "active":
+        raise HTTPException(403, f"Workspace {company['status']}")
+    return dict(company)
+
+
+class CompanySlugLogin(BaseModel):
+    slug: str | None = None
+    name: str | None = None
+    password: str
+
+
+@app.post("/api/auth/company/login")
+def company_slug_login(req: CompanySlugLogin):
+    """Login by slug (preferred) or by name (legacy). Returns slug + token."""
+    if not req.password:
+        raise HTTPException(400, "Password required")
+    if not (req.slug or req.name):
+        raise HTTPException(400, "Slug or name required")
+
+    db = get_db()
+    if req.slug:
+        row = db.execute(
+            "SELECT id, name, slug, password_hash, status FROM companies WHERE slug=?",
+            (req.slug.strip().lower(),),
+        ).fetchone()
+    else:
+        row = db.execute(
+            "SELECT id, name, slug, password_hash, status FROM companies WHERE name=?",
+            (req.name,),
+        ).fetchone()
+    if not row or not verify_password(req.password, row["password_hash"] or ""):
+        if row:
+            db.close()
+        raise HTTPException(401, "Invalid credentials")
+    if row["status"] != "active":
+        db.close()
+        raise HTTPException(403, f"Workspace {row['status']}")
+
+    new_token = uuid.uuid4().hex
+    db.execute("UPDATE companies SET auth_token=? WHERE id=?", (new_token, row["id"]))
+    db.commit()
+    db.close()
+    return {
+        "company_id": row["id"],
+        "name": row["name"],
+        "slug": row["slug"],
+        "auth_token": new_token,
+    }
+
+
+@app.get("/api/c/{slug}/me")
+def tenant_me(slug: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    return {
+        "company_id": co["id"],
+        "name": co["name"],
+        "slug": co["slug"],
+        "email": co["email"],
+        "status": co["status"],
+        "plan": co["plan"],
+        "logo_url": co["logo_url"],
+        "brand_color": co["brand_color"],
+    }
+
+
+@app.get("/api/c/{slug}/dashboard")
+def tenant_dashboard(slug: str, request: Request):
+    """Dashboard summary: job count, application count, interview count, quota."""
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    job_count = db.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status='active'",
+        (co["id"],),
+    ).fetchone()["n"]
+    app_count = db.execute(
+        "SELECT COUNT(*) AS n FROM applications a JOIN jobs j ON a.job_id=j.id "
+        "WHERE j.company_id=?",
+        (co["id"],),
+    ).fetchone()["n"]
+    sess_count = db.execute(
+        "SELECT COUNT(*) AS n FROM interview_sessions WHERE company_id=?",
+        (co["id"],),
+    ).fetchone()["n"]
+    finished = db.execute(
+        "SELECT COUNT(*) AS n FROM interview_sessions "
+        "WHERE company_id=? AND status='finished'",
+        (co["id"],),
+    ).fetchone()["n"]
+    db.close()
+    return {
+        "company": {"id": co["id"], "name": co["name"], "slug": co["slug"]},
+        "active_jobs": job_count,
+        "applications": app_count,
+        "interviews_started": sess_count,
+        "interviews_finished": finished,
+        "quota_monthly": co["interview_quota_monthly"],
+    }
+
+
+@app.get("/api/c/{slug}/jobs")
+def tenant_list_jobs(slug: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT j.*, "
+        " (SELECT COUNT(*) FROM applications a WHERE a.job_id=j.id) AS application_count "
+        "FROM jobs j WHERE j.company_id=? ORDER BY j.created_at DESC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/c/{slug}/jobs")
+def tenant_create_job(slug: str, req: JobCreate, request: Request):
+    co = get_company_by_slug(slug, request)
+    if req.role_family not in ALL_PROFILES:
+        raise HTTPException(400, f"Unknown role_family: {req.role_family}")
+    if req.seniority not in SENIORITY_TIERS:
+        raise HTTPException(400, f"Unknown seniority: {req.seniority}")
+    jid = uuid.uuid4().hex[:12]
+    db = get_db()
+    db.execute(
+        "INSERT INTO jobs "
+        "(id, company_id, title, description, required_skills, "
+        " role_family, seniority, min_experience_years, max_experience_years, "
+        " department, employment_type) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            jid, co["id"], req.title, req.description, req.required_skills,
+            req.role_family, req.seniority,
+            req.min_experience_years, req.max_experience_years,
+            req.department, req.employment_type,
+        ),
+    )
+    db.commit()
+    db.close()
+    log_event("job_created", company_id=co["id"], job_id=jid)
+    return {"job_id": jid, "title": req.title}
+
+
+@app.get("/api/c/{slug}/jobs/{job_id}")
+def tenant_get_job(slug: str, job_id: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM jobs WHERE id=? AND company_id=?", (job_id, co["id"])
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Job not found")
+    return dict(row)
+
+
+@app.get("/api/c/{slug}/applications")
+def tenant_applications(slug: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT a.*, c.name as candidate_name, c.email as candidate_email, "
+        " j.title as job_title, j.role_family, j.seniority, "
+        " s.total_score as session_score, s.status as session_status, "
+        " s.stage as session_stage "
+        "FROM applications a "
+        "JOIN candidates c ON a.candidate_id=c.id "
+        "JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN interview_sessions s ON a.session_id=s.id "
+        "WHERE j.company_id=? "
+        "ORDER BY a.created_at DESC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/c/{slug}/candidates/{application_id}")
+def tenant_candidate_detail(slug: str, application_id: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT a.*, c.name as candidate_name, c.email as candidate_email, "
+        " j.title as job_title, j.company_id, "
+        " s.report_json, s.total_score, s.stage as session_stage, "
+        " s.cheating_flags, s.finished_at, "
+        " r.skills_json "
+        "FROM applications a "
+        "JOIN candidates c ON a.candidate_id=c.id "
+        "JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN interview_sessions s ON a.session_id=s.id "
+        "LEFT JOIN resumes r ON a.resume_id=r.id "
+        "WHERE a.id=? AND j.company_id=?",
+        (application_id, co["id"]),
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Application not found")
+    out = dict(row)
+    if out.get("report_json"):
+        try:
+            out["report"] = json.loads(out["report_json"])
+        except Exception:
+            out["report"] = None
+    if out.get("skills_json"):
+        try:
+            out["resume_skills"] = json.loads(out["skills_json"])
+        except Exception:
+            out["resume_skills"] = None
+    return out
+
+
+# ── Bulk candidate-link generation ─────────────────────────────────────
+
+class LinkCandidate(BaseModel):
+    name: str | None = None
+    email: str
+
+
+class LinksGenerateRequest(BaseModel):
+    candidates: list[LinkCandidate] = []
+    count: int | None = None
+    expires_in_days: int = 14
+    send_email: bool = False
+
+
+def _make_invite_token() -> str:
+    """URL-safe base32, 12 chars."""
+    return secrets.token_urlsafe(12)[:16]
+
+
+@app.post("/api/c/{slug}/jobs/{job_id}/links")
+def tenant_generate_links(
+    slug: str, job_id: str, req: LinksGenerateRequest, request: Request
+):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    job = db.execute(
+        "SELECT id, title, company_id FROM jobs WHERE id=? AND company_id=?",
+        (job_id, co["id"]),
+    ).fetchone()
+    if not job:
+        db.close()
+        raise HTTPException(404, "Job not found")
+
+    base_url = os.getenv("BASE_URL", "http://localhost:8000")
+    expires_at = datetime.utcnow() + timedelta(days=max(1, min(60, req.expires_in_days)))
+    expires_iso = expires_at.isoformat(timespec="seconds")
+
+    targets: list[dict] = []
+    if req.candidates:
+        targets = [
+            {"name": (c.name or c.email.split("@")[0]).strip(), "email": c.email.strip().lower()}
+            for c in req.candidates if c.email and c.email.strip()
+        ]
+    elif req.count:
+        n = max(1, min(200, int(req.count)))
+        targets = [{"name": None, "email": None} for _ in range(n)]
+    else:
+        db.close()
+        raise HTTPException(400, "Provide candidates[] or count")
+
+    created: list[dict] = []
+    for t in targets:
+        cand_id = uuid.uuid4().hex[:12]
+        db.execute(
+            "INSERT INTO candidates (id, name, email) VALUES (?,?,?)",
+            (cand_id, t["name"] or "", t["email"] or ""),
+        )
+        token = _make_invite_token()
+        app_id = uuid.uuid4().hex[:12]
+        db.execute(
+            "INSERT INTO applications "
+            "(id, job_id, candidate_id, resume_id, status, invite_token, "
+            " invite_expires_at, created_by_company) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                app_id, job_id, cand_id, None, "invited", token,
+                expires_iso, co["id"],
+            ),
+        )
+        url = f"{base_url}/i/?token={token}"
+        if req.send_email and t["email"]:
+            try:
+                send_interview_invite(
+                    t["email"], t["name"] or "Candidate", job["title"], token
+                )
+            except Exception:
+                pass
+        log_event(
+            "link_created",
+            company_id=co["id"], job_id=job_id, application_id=app_id,
+        )
+        created.append({
+            "application_id": app_id,
+            "candidate_id": cand_id,
+            "candidate_name": t["name"],
+            "candidate_email": t["email"],
+            "invite_token": token,
+            "invite_url": url,
+            "expires_at": expires_iso,
+        })
+
+    db.commit()
+    db.close()
+    return {"created": created, "count": len(created)}
+
+
+@app.get("/api/c/{slug}/jobs/{job_id}/links")
+def tenant_list_links(slug: str, job_id: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    base_url = os.getenv("BASE_URL", "http://localhost:8000")
+    db = get_db()
+    rows = db.execute(
+        "SELECT a.id as application_id, a.invite_token, a.status, a.created_at, "
+        " a.invite_expires_at, a.invite_used_at, a.invite_revoked_at, "
+        " c.name as candidate_name, c.email as candidate_email, "
+        " s.id as session_id, s.status as session_status, s.total_score "
+        "FROM applications a "
+        "JOIN candidates c ON a.candidate_id=c.id "
+        "JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN interview_sessions s ON a.session_id=s.id "
+        "WHERE a.job_id=? AND j.company_id=? "
+        "ORDER BY a.created_at DESC",
+        (job_id, co["id"]),
+    ).fetchall()
+    db.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["invite_url"] = f"{base_url}/i/?token={d['invite_token']}"
+        out.append(d)
+    return out
+
+
+@app.delete("/api/c/{slug}/links/{token}")
+def tenant_revoke_link(slug: str, token: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT a.id, a.job_id, j.company_id FROM applications a "
+        "JOIN jobs j ON a.job_id=j.id "
+        "WHERE a.invite_token=? AND j.company_id=?",
+        (token, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Link not found")
+    db.execute(
+        "UPDATE applications SET invite_revoked_at=CURRENT_TIMESTAMP WHERE id=?",
+        (row["id"],),
+    )
+    db.commit()
+    db.close()
+    log_event(
+        "link_revoked", company_id=co["id"], job_id=row["job_id"],
+        application_id=row["id"],
+    )
+    audit(
+        "link_revoked", actor=co["slug"], target=token,
+        ip=_client_ip(request),
+    )
+    return {"revoked": True, "token": token}
+
+
+@app.get("/api/c/{slug}/usage")
+def tenant_usage(slug: str, request: Request):
+    co = get_company_by_slug(slug, request)
+    db = get_db()
+    # Current calendar month
+    started = db.execute(
+        "SELECT COUNT(*) AS n FROM interview_sessions "
+        "WHERE company_id=? AND created_at >= date('now', 'start of month')",
+        (co["id"],),
+    ).fetchone()["n"]
+    finished = db.execute(
+        "SELECT COUNT(*) AS n FROM interview_sessions "
+        "WHERE company_id=? AND status='finished' "
+        "AND created_at >= date('now', 'start of month')",
+        (co["id"],),
+    ).fetchone()["n"]
+    db.close()
+    return {
+        "month_started": started,
+        "month_finished": finished,
+        "quota": co["interview_quota_monthly"],
+    }
+
+
+# =====================================================================
+# Lead intake (public, no auth)
+# =====================================================================
+
+class LeadCreate(BaseModel):
+    kind: str = "company"
+    company_name: str | None = None
+    contact_name: str
+    email: str
+    phone: str | None = None
+    role_count: int | None = None
+    use_case: str | None = None
+    source: str = "contact_form"
+
+
+@app.post("/api/leads")
+def create_lead(req: LeadCreate, request: Request):
+    # 5 lead submissions per IP per 10 minutes — cheap public endpoint, easy
+    # to spam, but legitimate users only need 1.
+    rate_limit(request, bucket="leads", max_calls=5, window_s=600)
+    if not req.contact_name.strip() or "@" not in (req.email or ""):
+        raise HTTPException(400, "Contact name and a valid email are required")
+    lead_id = uuid.uuid4().hex[:12]
+    db = get_db()
+    db.execute(
+        "INSERT INTO leads "
+        "(id, kind, company_name, contact_name, email, phone, role_count, "
+        " use_case, source, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?, 'new')",
+        (
+            lead_id, req.kind, req.company_name, req.contact_name.strip(),
+            req.email.strip().lower(), req.phone, req.role_count,
+            req.use_case, req.source,
+        ),
+    )
+    db.commit()
+    db.close()
+    try:
+        send_lead_notification({
+            "id": lead_id, "kind": req.kind,
+            "company_name": req.company_name,
+            "contact_name": req.contact_name, "email": req.email,
+            "phone": req.phone, "role_count": req.role_count,
+            "use_case": req.use_case, "source": req.source,
+        })
+    except Exception:
+        pass
+    return {"lead_id": lead_id, "status": "new"}
+
+
+# =====================================================================
+# Onboarding: owner sets password via setup_token
+# =====================================================================
+
+class OnboardSetPassword(BaseModel):
+    setup_token: str
+    password: str
+
+
+@app.post("/api/c/{slug}/onboard")
+def tenant_onboard(slug: str, req: OnboardSetPassword):
+    """Owner clicks email link → POSTs setup_token + new password.
+
+    Token must match and not be expired. On success: hash password,
+    rotate auth_token, clear setup_token, return auth_token + slug.
+    """
+    if not req.password or len(req.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    db = get_db()
+    co = db.execute(
+        "SELECT id, name, slug, setup_token, setup_token_expires_at "
+        "FROM companies WHERE slug=?",
+        (slug,),
+    ).fetchone()
+    if not co:
+        db.close()
+        raise HTTPException(404, "Workspace not found")
+    if not co["setup_token"] or co["setup_token"] != req.setup_token:
+        db.close()
+        raise HTTPException(403, "Invalid or used setup link")
+    if co["setup_token_expires_at"]:
+        try:
+            exp = datetime.fromisoformat(co["setup_token_expires_at"])
+            if exp < datetime.utcnow():
+                db.close()
+                raise HTTPException(410, "Setup link expired")
+        except (ValueError, TypeError):
+            pass
+    new_token = uuid.uuid4().hex
+    db.execute(
+        "UPDATE companies SET password_hash=?, auth_token=?, "
+        "setup_token=NULL, setup_token_expires_at=NULL WHERE id=?",
+        (hash_password(req.password), new_token, co["id"]),
+    )
+    db.commit()
+    db.close()
+    return {
+        "company_id": co["id"],
+        "name": co["name"],
+        "slug": co["slug"],
+        "auth_token": new_token,
+    }
+
+
+@app.get("/api/c/{slug}/onboard/{token}")
+def tenant_onboard_check(slug: str, token: str):
+    """Lightweight pre-flight so the onboard page can show name + status."""
+    db = get_db()
+    co = db.execute(
+        "SELECT name, slug, setup_token, setup_token_expires_at, password_hash "
+        "FROM companies WHERE slug=?",
+        (slug,),
+    ).fetchone()
+    db.close()
+    if not co:
+        raise HTTPException(404, "Workspace not found")
+    if not co["setup_token"] or co["setup_token"] != token:
+        raise HTTPException(403, "Invalid setup link")
+    return {
+        "name": co["name"],
+        "slug": co["slug"],
+        "expires_at": co["setup_token_expires_at"],
+        "already_set": bool(co["password_hash"]),
+    }
 
 
 # --- WebSocket endpoint for real-time audio ---
@@ -817,10 +1861,18 @@ async def ws_interview(ws: WebSocket, session_id: str):
             try:
                 audio_path = AUDIO_DIR / session_id / f"turn_{status['total_turns']}.mp3"
                 audio_path.parent.mkdir(parents=True, exist_ok=True)
-                synthesize(reply, audio_path)
+                # Use the same provider chain as the REST path so the WS flow
+                # automatically benefits from Edge TTS without code drift.
+                if TTS_PROVIDER == "elevenlabs":
+                    try:
+                        elevenlabs_synthesize(reply, audio_path)
+                    except Exception:
+                        edge_synthesize(reply, audio_path)
+                else:
+                    edge_synthesize(reply, audio_path)
                 audio_b64 = base64.b64encode(audio_path.read_bytes()).decode()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[TTS:ws] failed for session={session_id}: {e}")
 
             await ws.send_json({
                 "type": "reply",
@@ -846,20 +1898,42 @@ async def ws_interview(ws: WebSocket, session_id: str):
 
 
 # --- Serve frontend ---
+#
+# Two front-ends co-exist in this repo:
+#
+#   web/out/    — the Next.js 15 static export (recruiter dashboard, candidate
+#                 detail, live-interview surface, analytics, etc.). When this
+#                 directory is present we mount it as the primary site at "/".
+#   frontend/   — the original vanilla-JS prototype. Still served under
+#                 /static/* so legacy assets (e.g. avatar.glb) keep loading
+#                 even after the Next.js cutover.
+#
+# All API routes (/api/*) and the WebSocket (/ws/*) are registered above the
+# StaticFiles mount, so they always take precedence.
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+WEB_OUT_DIR = Path(__file__).parent.parent / "web" / "out"
 
 
-@app.get("/")
-def serve_index():
+# Candidate portal (the original vanilla SPA: 3D avatar, anti-cheat, voice
+# interview). Served under /candidate/* so the recruiter UI (Next.js) can own
+# the rest of the site at /. The vanilla SPA uses absolute /static/* and /api/*
+# paths, both of which still resolve correctly because they're registered as
+# explicit routes above this mount.
+@app.get("/candidate")
+@app.get("/candidate/")
+@app.get("/candidate/{rest:path}")
+def serve_candidate_portal(rest: str = ""):
     index = FRONTEND_DIR / "index.html"
-    if index.exists():
-        return FileResponse(index, media_type="text/html")
-    return {"message": "Frontend not built yet"}
+    if not index.exists():
+        raise HTTPException(404, "Candidate portal assets missing")
+    return FileResponse(index, media_type="text/html")
 
 
 @app.get("/static/{file_path:path}")
-def serve_static(file_path: str):
+def serve_legacy_static(file_path: str):
+    """Legacy passthrough — serves files from the old vanilla frontend dir
+    so the avatar.glb, anti-cheat assets, etc. remain reachable."""
     if ".." in file_path:
         raise HTTPException(400, "Invalid path")
     full_path = FRONTEND_DIR / file_path
@@ -872,6 +1946,27 @@ def serve_static(file_path: str):
         ".png": "image/png",
         ".svg": "image/svg+xml",
         ".ico": "image/x-icon",
+        ".glb": "model/gltf-binary",
+        ".woff2": "font/woff2",
     }
     mime = mime_map.get(full_path.suffix, "application/octet-stream")
     return FileResponse(full_path, media_type=mime)
+
+
+# Mount the Next.js static export at "/" if it has been built. StaticFiles
+# with html=True auto-serves index.html for directory paths and falls back
+# to index.html for unknown subpaths within the route prefix.
+if WEB_OUT_DIR.exists() and (WEB_OUT_DIR / "index.html").exists():
+    app.mount("/", StaticFiles(directory=str(WEB_OUT_DIR), html=True), name="web")
+else:
+    @app.get("/")
+    def serve_index_fallback():
+        index = FRONTEND_DIR / "index.html"
+        if index.exists():
+            return FileResponse(index, media_type="text/html")
+        return {
+            "message": (
+                "Frontend not built. Run `cd web && npm run build` to "
+                "generate web/out/, or restart with the legacy frontend/."
+            )
+        }

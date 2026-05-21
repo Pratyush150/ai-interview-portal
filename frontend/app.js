@@ -423,26 +423,37 @@ let speechSafetyTimer = null;
 // in Chromium — speak() completes, onend fires, but no audio reaches the
 // output. This is an observed, reproducible bug, which is why we keep them
 // OUT of the preference list entirely.
+// Female-first preference. The interviewer is "Sara" — voiced as a warm
+// female. Male voices intentionally omitted from the top tier; they remain
+// at the very end as a last-resort fallback only if no female voice exists.
 const VOICE_PREFERENCE = [
-    // Chrome's built-in voices — always reliable, available cross-platform
-    /^Google US English/i,
-    /^Google UK English Female/i,
-    /^Google UK English Male/i,
-    /^Google/i,
-    // macOS premium / enhanced (need to be downloaded in System Settings)
+    // macOS named female voices (warmest, highest quality when downloaded)
+    /^Samantha/i, /^Ava/i, /^Allison/i, /^Serena/i, /^Karen/i,
+    /^Tessa/i, /^Moira/i, /^Fiona/i, /^Susan/i, /^Victoria/i,
+    // macOS premium / enhanced — usually female by default
     /\(Premium\)/i,
     /\(Enhanced\)/i,
-    // Warm named macOS voices
-    /^Samantha/i, /^Ava/i, /^Allison/i, /^Serena/i, /^Karen/i,
-    /^Tessa/i, /^Moira/i, /^Fiona/i, /^Daniel/i,
-    // Local Windows SAPI voices — install via Settings → Time & Language
-    // → Speech. Robotic but 100% reliable because they run on-device.
+    // Chrome's built-in voices — Female variants first
+    /^Google UK English Female/i,
+    /^Google US English Female/i,
+    /^Google US English/i,        // historically female
+    /^Google हिन्दी/i,               // Hindi female fallback
+    // Local Windows SAPI female voices — robust because they run on-device
     /^Microsoft Zira Desktop/i,
-    /^Microsoft David Desktop/i,
     /^Microsoft Hazel Desktop/i,
-    /^Microsoft Mark/i,
     /^Microsoft Zira/i,
-    /^Microsoft David/i,
+    /^Microsoft Hazel/i,
+    /^Microsoft Aria/i,
+    /^Microsoft Jenny/i,
+    /^Microsoft Sonia/i,
+    /^Microsoft Libby/i,
+    /^Microsoft Heera/i,           // Indian English female
+    // Generic Google fallback if none of the above resolve
+    /^Google/i,
+    // ─── Last-resort male fallbacks (only if no female voice exists) ───
+    /^Microsoft David Desktop/i,
+    /^Microsoft Mark/i,
+    /^Daniel/i,
 ];
 
 // Voices we've observed to silently fail. We add to this set at runtime
@@ -511,7 +522,7 @@ function speakText(text, contentEl, _attempt = 0) {
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1.0;
-    utterance.pitch = 0.96;
+    utterance.pitch = 1.04;
     utterance.volume = 1.0;
     utterance.lang = 'en-US';
 

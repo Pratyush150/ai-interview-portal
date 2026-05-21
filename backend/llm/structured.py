@@ -1,4 +1,15 @@
-"""Phase 7+ — Structured JSON output from LLM with rubric-based scoring and AI detection."""
+"""Structured JSON output from the LLM with rubric-based scoring + AI detection.
+
+Beyond strict JSON, the system prompt now carries:
+  - the interviewer's name (passed in by the engine — currently 'Sara'),
+  - drill targets accumulated from past turns' weaknesses,
+  - per-turn time budget so the LLM can pace itself,
+  - the pre-interview brief (gaps to probe, unverified claims, depth-test topics).
+
+History window has been lifted to 24 messages (~12 turns) so that
+follow-up / cross-question prompts at turn 15+ can still see what the
+candidate said in background.
+"""
 from __future__ import annotations
 
 import json
@@ -17,15 +28,15 @@ No markdown, no explanation outside the JSON.
 
 Response schema:
 {{
-  "spoken_text": "What you say to the candidate (1-3 sentences, natural conversational tone)",
+  "spoken_text": "What you say to the candidate (1-3 sentences, natural conversational tone). Acknowledge their last point in one short clause, then ask the next question.",
   "evaluation": {{
     "correctness": 0-10 or null if not evaluating,
     "depth": 0-10 or null,
     "communication": 0-10 or null,
     "relevance": 0-10 or null,
     "score": null or the average of the 4 dimensions above (auto-calculate),
-    "strengths": ["list of specific strengths observed"] or [],
-    "weaknesses": ["list of specific weaknesses observed"] or [],
+    "strengths": ["specific strengths observed in this answer"] or [],
+    "weaknesses": ["specific weaknesses to drill into LATER"] or [],
     "notes": "brief internal evaluation note"
   }},
   "meta": {{
@@ -45,8 +56,11 @@ Response schema:
 {AI_DETECTION_PROMPT}
 
 Rules:
-- "spoken_text" is what the candidate hears (natural, conversational, 1-3 sentences).
+- "spoken_text" is what the candidate hears. Conversational, 1-3 sentences. Always acknowledge
+  their previous point in a short clause before asking the next question.
 - For intro/wrap-up stages, set all evaluation scores to null.
+- For 'weaknesses', prefer specific, probe-able items ("could not explain why they chose Postgres
+  over Cassandra", "vague on retry semantics") so a future turn can return to them.
 - "suggest_advance" is true when the current stage should move forward.
 - IMPORTANT: Be a FAIR evaluator. Do not inflate scores. Most answers score 5-7.
 - Always return valid JSON. No trailing commas. No comments."""
@@ -77,7 +91,6 @@ class InterviewResponse:
         meta = data.get("meta", {})
         ai_det = data.get("ai_detection", {})
 
-        # Calculate score from dimensions if not provided
         dims = [evaluation.get(d) for d in ("correctness", "depth", "communication", "relevance")]
         valid_dims = [d for d in dims if d is not None]
         calculated_score = round(sum(valid_dims) / len(valid_dims), 1) if valid_dims else evaluation.get("score")
@@ -102,6 +115,12 @@ class InterviewResponse:
         )
 
 
+# History window — number of (user, assistant) message slots to keep in
+# context. 24 ≈ 12 turns of back-and-forth, enough that a follow-up at turn
+# 15 still sees what the candidate claimed during background.
+HISTORY_WINDOW = 24
+
+
 def ask_llm_structured(
     user_text: str,
     stage: str = "technical",
@@ -111,6 +130,11 @@ def ask_llm_structured(
     asked_topics: list[str] | None = None,
     role_profile=None,
     seniority: str | None = None,
+    interviewer_name: str = "Sara",
+    drill_targets: list[str] | None = None,
+    time_remaining_min: float | None = None,
+    stage_remaining_min: float | None = None,
+    interview_brief: dict | None = None,
 ) -> InterviewResponse:
     """Send a prompt and parse the structured JSON response."""
     api_key = os.getenv("GROQ_API_KEY")
@@ -118,21 +142,44 @@ def ask_llm_structured(
     if not api_key or api_key.startswith("PASTE"):
         raise RuntimeError("GROQ_API_KEY missing in .env")
 
-    system_content = f"{STRUCTURED_SYSTEM_PROMPT}\n\nCurrent interview stage: {stage}."
+    system_content = (
+        f"{STRUCTURED_SYSTEM_PROMPT}\n\n"
+        f"Current interview stage: {stage}.\n"
+        f"You are '{interviewer_name}', a senior interviewer. In the FIRST intro turn only, "
+        f"introduce yourself by this name. Do not re-introduce yourself afterwards."
+    )
+
     if role_profile is not None:
         system_content += (
             f"\n\nROLE FAMILY: {role_profile.display_name} ({seniority or 'mid'}).\n"
             f"{role_profile.interviewer_persona}\n"
             f"Topic rotation set for this role: {', '.join(role_profile.topic_categories)}."
         )
+
+    if interview_brief:
+        brief_lines = []
+        for k in ("gaps_to_probe", "claimed_unverified_skills", "depth_test_topics", "jd_requirements_unmet"):
+            items = (interview_brief.get(k) or [])[:5]
+            if items:
+                brief_lines.append(f"- {k.replace('_', ' ')}: {'; '.join(items)}")
+        if brief_lines:
+            system_content += "\n\nPRE-INTERVIEW BRIEF (drives what to probe):\n" + "\n".join(brief_lines)
+
+    if drill_targets:
+        recent = drill_targets[-8:]
+        system_content += (
+            "\n\nOUTSTANDING DRILL TARGETS (return to these when natural — they are claims "
+            f"that haven't been verified or weaknesses found earlier):\n- {chr(10).join('- ' + t for t in recent).lstrip('- ')}"
+        )
+
     if resume_context:
         system_content += f"\n\nCandidate resume context:\n{resume_context}"
         system_content += "\nTailor questions to the candidate's specific experience and skills, but VARY the topics."
+
     if job_context:
         system_content += f"\n\nJob context:\n{job_context}"
         system_content += "\nFocus core-stage questions on the required skills and role competencies above."
 
-    # Topic diversity enforcement — prefer the role-specific rotation when we have one.
     if asked_topics:
         rotation = (
             ", ".join(role_profile.topic_categories)
@@ -142,25 +189,31 @@ def ask_llm_structured(
         system_content += (
             f"\n\nCRITICAL — TOPIC DIVERSITY: These topics have already been covered: "
             f"{', '.join(asked_topics)}. "
-            f"You MUST ask about a DIFFERENT topic now. Rotate through: {rotation}."
+            f"You MUST ask about a DIFFERENT topic now (unless drilling into a target above). Rotate through: {rotation}."
         )
 
-    # Trim history to last 8 messages — shorter context means fewer input
-    # tokens and noticeably lower LLM latency per turn. The system prompt
-    # still carries stage, resume, and job context so continuity is kept.
-    trimmed_history = history[-8:] if history and len(history) > 8 else history
+    if time_remaining_min is not None and stage_remaining_min is not None:
+        system_content += (
+            f"\n\nPACING: ~{time_remaining_min:.1f} min remaining overall, "
+            f"~{stage_remaining_min:.1f} min remaining in the '{stage}' stage. "
+            "If under 0.5 min remains in stage, set meta.suggest_advance=true."
+        )
+
+    trimmed_history = history[-HISTORY_WINDOW:] if history and len(history) > HISTORY_WINDOW else history
 
     messages = [{"role": "system", "content": system_content}]
     if trimmed_history:
         messages.extend(trimmed_history)
     messages.append({"role": "user", "content": user_text})
 
-    # Use the faster, smaller model for non-evaluative stages (intro,
-    # background, wrap-up). The 70b model is only needed where we rely
-    # on nuanced scoring (technical + follow-up).
+    # Use the faster model only for very lightweight stages. We DELIBERATELY
+    # keep `background` on the 70b model because that's where projects are
+    # established and follow-up cross-questions later depend on having
+    # parsed those project descriptions properly. Intro and wrap-up are
+    # truly conversational and OK on the small model.
     use_model = model
     temperature = 0.5
-    if stage in ("intro", "background", "wrap_up"):
+    if stage in ("intro", "wrap_up"):
         use_model = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
         temperature = 0.7
 
@@ -169,7 +222,7 @@ def ask_llm_structured(
         model=use_model,
         messages=messages,
         temperature=temperature,
-        max_tokens=500,
+        max_tokens=600,
         response_format={"type": "json_object"},
     )
 

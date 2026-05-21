@@ -43,17 +43,22 @@ tab.
 5. [End-to-end data flows](#end-to-end-data-flows)
 6. [Role profiles & seniority](#role-profiles--seniority)
 7. [Interview stage machine](#interview-stage-machine)
-8. [LLM pipeline](#llm-pipeline)
-9. [Speech pipeline — STT & TTS](#speech-pipeline)
-10. [3D avatar interviewer](#3d-avatar-interviewer)
-11. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
-12. [Anti-cheat subsystem](#anti-cheat-subsystem)
-13. [AI-generated-answer detection](#ai-generated-answer-detection)
-14. [Scoring rubric](#scoring-rubric)
-15. [Resume parser](#resume-parser)
-16. [Database schema](#database-schema)
-17. [HTTP / WebSocket API](#http--websocket-api)
-18. [Performance notes](#performance-notes)
+8. [Pre-interview brief (preflight)](#pre-interview-brief-preflight)
+9. [LLM pipeline](#llm-pipeline)
+10. [Speech pipeline — STT & TTS](#speech-pipeline)
+11. [3D avatar interviewer](#3d-avatar-interviewer)
+12. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
+13. [Anti-cheat subsystem](#anti-cheat-subsystem)
+14. [AI-generated-answer detection](#ai-generated-answer-detection)
+15. [Scoring rubric](#scoring-rubric)
+16. [Resume parser](#resume-parser)
+17. [End-of-interview report](#end-of-interview-report)
+18. [Multi-tenant company workspaces](#multi-tenant-company-workspaces)
+19. [Next.js web frontend](#nextjs-web-frontend)
+20. [Rate limiting](#rate-limiting)
+21. [Database schema](#database-schema)
+22. [HTTP / WebSocket API](#http--websocket-api)
+23. [Performance notes](#performance-notes)
 
 ---
 
@@ -64,9 +69,11 @@ tab.
 | STT         | Deepgram `nova-2` (file + streaming)          | sub-second latency, word-level timestamps, good with accents  |
 | LLM         | Groq cloud, `llama-3.3-70b-versatile`         | Groq gives ~5–10× tokens/sec over other hosts; 70b for quality|
 | LLM (fast)  | `llama-3.1-8b-instant`                        | used for intro / background / wrap-up where scoring isn't critical |
-| TTS         | ElevenLabs `eleven_turbo_v2_5` (optional)     | highest quality; optional because browser Web Speech is instant and free |
+| TTS (default) | Microsoft **Edge TTS** (neural, `en-US-AriaNeural`) | free, no API key, natural female voice — set as primary path |
+| TTS (alt)   | ElevenLabs `eleven_turbo_v2_5`                | higher quality; opt-in via `TTS_PROVIDER=elevenlabs`          |
 | Backend     | Python 3.10+, FastAPI, SQLite, uvicorn        | zero-ops, one-file DB, async-friendly                         |
-| Frontend    | Vanilla HTML / CSS / JS, Web Audio API        | no build step, smaller attack surface                         |
+| Frontend (legacy) | Vanilla HTML / CSS / JS, Web Audio API  | mounted at `/candidate` for the interview-room flow           |
+| Frontend (new) | Next.js 15 + Tailwind + shadcn/ui (static export, `web/`) | marketing site, company dashboard, candidate signup |
 | 3D avatar   | three.js 0.160 + GLTFLoader, local GLB        | morph-target lip sync driven by audio amplitude, idle blinks/gaze |
 | PDF parse   | PyMuPDF (`fitz`)                              | fastest and most reliable text extractor for resumes          |
 | Auth        | Salt + SHA-256 + bearer token                 | company dashboard only; candidates use signed invite tokens   |
@@ -84,8 +91,10 @@ backend/
   ai_detection.py             heuristic AI-answer detector
   scoring_rubric.py           LLM prompt text: rubric + AI-detection guidance
   interview/
-    engine.py                 InterviewSession class + stage machine
-    role_profiles.py          22 role families × 6 seniority tiers, mock JDs
+    engine.py                 InterviewSession class + time-paced stage machine
+    role_profiles.py          22 role families × 6 seniority tiers, time allocations, mock JDs
+    preflight.py              pre-interview brief: LLM reads resume vs JD before turn 1
+    report.py                 end-of-interview synthesized report (hire reco, strengths, etc.)
   llm/
     groq_client.py            raw chat call
     structured.py             structured-JSON call + role-aware topic rotation
@@ -93,14 +102,22 @@ backend/
     deepgram_stt.py           file-upload transcription with retry + STTTimeout
     deepgram_streaming.py     WebSocket streaming transcriber
   tts/
-    elevenlabs_tts.py         synthesize(text, path) → MP3
-frontend/
+    edge_tts_provider.py      Microsoft Edge TTS (default, free, no key)
+    elevenlabs_tts.py         ElevenLabs synthesize(text, path) → MP3 (opt-in)
+  scripts/
+    provision_company.py      manual lead → company conversion CLI (setup_token email)
+frontend/                     legacy candidate UI (served at /candidate)
   index.html                  all screens in one SPA-ish page
   app.js                      session + VAD + resume render + screens
   avatar.js                   three.js 3D avatar: lip-sync, blinks, gaze
   avatar.glb                  4.7 MB Ready-Player-Me-style mesh, served locally
   anticheat.js                tab, copy, motion, phone, camera-off watchers
   style.css                   dark theme
+web/                          Next.js 15 marketing + company dashboard (TS, Tailwind, shadcn)
+  src/app/                    routes (landing, /c/[slug] dashboard, onboarding, contact)
+  src/components/             reusable UI primitives
+  src/lib/                    API client, auth, helpers
+  package.json                next, react, @tanstack/react-query, monaco-editor, radix
 data/
   portal.db                   auto-created SQLite file (seeds demo company on first run)
 tests/
@@ -116,6 +133,17 @@ python3 -m pip install -r requirements.txt
 cp .env.example .env           # fill in keys
 uvicorn backend.api:app --reload --port 8000
 # open http://localhost:8000/
+```
+
+For the Next.js web app (optional, for the new marketing site + company
+dashboard):
+
+```bash
+cd web
+npm install
+npm run dev        # http://localhost:3000  (dev)
+# or, for production parity with FastAPI's static-export serving:
+npm run build      # writes web/out/, picked up by /static and the SPA routes
 ```
 
 On first launch the database is created and seeded with a `DemoCorp` company
@@ -145,10 +173,12 @@ python tests/smoke_streaming.py    # Deepgram streaming
 | `GROQ_MODEL`        | no        | `llama-3.3-70b-versatile`      | primary LLM                             |
 | `GROQ_FAST_MODEL`   | no        | `llama-3.1-8b-instant`         | used on light stages (intro, background, wrap-up) |
 | `DEEPGRAM_API_KEY`  | only for voice | —                         | STT                                     |
-| `ELEVENLABS_API_KEY`| only if `USE_SERVER_TTS=1` | —                 | high-quality TTS                        |
-| `ELEVENLABS_VOICE_ID`| no       | `21m00Tcm4TlvDq8ikWAM` (Rachel)| voice choice                            |
-| `USE_SERVER_TTS`    | no        | `0`                            | `1` = ElevenLabs; `0` = browser Web Speech (fast, free) |
-| `SMTP_*`            | no        | —                              | outbound invite emails                  |
+| `USE_SERVER_TTS`    | no        | `1`                            | `1` = server TTS (Edge default, ElevenLabs opt-in); `0` = browser Web Speech |
+| `TTS_PROVIDER`      | no        | `edge`                         | `edge` (free, no key) or `elevenlabs`   |
+| `EDGE_TTS_VOICE`    | no        | `en-US-AriaNeural`             | any Edge neural voice (e.g. `en-IN-NeerjaNeural`) |
+| `ELEVENLABS_API_KEY`| only if `TTS_PROVIDER=elevenlabs` | —              | ElevenLabs key                          |
+| `ELEVENLABS_VOICE_ID`| no       | `21m00Tcm4TlvDq8ikWAM` (Rachel)| ElevenLabs voice                        |
+| `SMTP_*`            | no        | —                              | outbound invite + onboarding + lead-notification emails |
 
 ---
 
@@ -176,7 +206,12 @@ candidate clicks invite link ?token=... ─▶ GET /api/invite/:token
 
 candidate hits "Start Interview"
             ─▶ POST /api/session  { invite_token | resume_id + job_id }
-            returns session_id, stage='intro'
+                │
+                ├──▶ preflight.build_interview_brief(resume, jd, role, seniority)
+                │      one Groq call: returns claim_verifications, jd_gaps,
+                │      strong_topics, suggested_opening — injected into the
+                │      interviewer's system prompt before turn 1
+                └──▶ returns session_id, stage='intro'
 ```
 
 ### B. Interview turn (voice)
@@ -276,19 +311,36 @@ init so the dashboard and apply flow have content out of the box.
 The "core" stage is exposed on the wire as the legacy `technical` enum value
 for backward compatibility, but the engine treats it role-agnostically — it
 can be a system design block, a finance valuation drill, or a consulting
-case. Per-stage turn counts come from the seniority's turn budget:
+case.
+
+### Time-based pacing (replaces turn budgets)
+
+Sessions are paced by a **clock**, not a turn count.
+`TOTAL_DURATION_MIN_DEFAULT = 22` minutes (overridable per session). Each
+seniority tier carries a percentage split across stages
+(`STAGE_TIME_ALLOCATION` in `role_profiles.py`); senior+ interviews shift
+more time into follow-up for deeper drills, intern/entry shift slightly
+more into background.
 
 | Stage      | intern | entry | mid | senior | lead | principal |
 |------------|--------|-------|-----|--------|------|-----------|
-| intro      |   1    |   1   |  2  |   2    |   2  |    2      |
-| background |   2    |   3   |  3  |   4    |   4  |    5      |
-| core       |   3    |   5   |  8  |  11    |  13  |   15      |
-| follow_up  |   1    |   2   |  3  |   5    |   7  |    8      |
-| wrap_up    |   1    |   1   |  2  |   2    |   2  |    2      |
-| **total**  | **8**  | **12**| **18** | **24** | **28** | **32** |
+| intro      |  10%   |  9%   | 8%  |  7%    |  7%  |   6%      |
+| background |  22%   | 20%   | 18% | 16%    | 15%  |  13%      |
+| core       |  48%   | 50%   | 50% | 50%    | 48%  |  48%      |
+| follow_up  |  12%   | 14%   | 18% | 22%    | 25%  |  28%      |
+| wrap_up    |   8%   |  7%   |  6% |  5%    |  5%  |   5%      |
+
+At 22 minutes default that's ~10–11 minutes of core for everyone, scaling
+from 2.6 min of follow-up (intern) up to 6.2 min (principal). The LLM is
+told how many seconds remain in the stage and overall, so it can pace
+itself; the engine also forces a stage advance when the slice is
+exhausted (with a soft floor of 1 turn so we never skip a stage).
+
+The legacy `get_turn_budget()` helper is still derived from the time
+allocation — useful for pre-flight UI hints, but no longer authoritative.
 
 Each stage has:
-- a **turn limit** from the seniority budget; exceeding it auto-advances.
+- a **time budget** (in seconds) computed from the seniority allocation.
 - a **role-specific stage prompt** pulled from the `RoleProfile`. The core
   prompt has a `{{depth}}` token that's filled with the seniority depth
   instruction at request time.
@@ -296,9 +348,44 @@ Each stage has:
   the LLM tags each question, and the system prompt carries the
   already-covered list plus the role profile's `topic_categories` so the
   LLM rotates through fresh areas.
+- **drill-target tracking**: weaknesses surfaced in prior turns are
+  collected in `InterviewSession.drill_targets` and re-injected into the
+  next system prompt as "outstanding probes". The LLM can then actually
+  cross-question those points instead of forgetting them.
 
 The LLM itself can also vote to advance the stage early via the
 `meta.suggest_advance` field in its structured JSON response.
+
+---
+
+## Pre-interview brief (preflight)
+
+File: `backend/interview/preflight.py`. Entry: `build_interview_brief(...)`.
+
+Runs **once when a session is created**, after the resume has been parsed
+and the JD has been loaded but before the first turn. One Groq call to a
+senior-hiring-manager prompt reads the resume *against* the JD and
+returns a structured brief:
+
+```json
+{
+  "claim_verifications": ["candidate claims '3 years of Kubernetes at scale' — verify with a real incident story"],
+  "jd_gaps":            ["JD requires gRPC; resume mentions only REST"],
+  "strong_topics":      ["distributed transactions", "Postgres tuning"],
+  "weak_topics":        ["mobile, frontend"],
+  "suggested_opening":  "I see you led the payments migration at X — walk me through the trickiest call you had to make there."
+}
+```
+
+The brief is injected into the interviewer's system prompt as the first
+thing she sees. This is what turns the LLM from "an interviewer with the
+candidate's skills as a string" into "an interviewer who has already
+read the resume against the JD before walking into the room" — she
+knows what to probe, what claims to verify, what JD requirements aren't
+backed by the resume, and a good opening question.
+
+The brief is cached on the session in memory; it does not re-run on
+every turn.
 
 ---
 
@@ -391,19 +478,31 @@ The `/audio-turn` response now also carries the candidate's transcribed
 `transcript` field, so the UI renders their actual words instead of a
 "[voice input]" placeholder.
 
-### TTS — browser-first, ElevenLabs-optional
+### TTS — Edge by default, ElevenLabs opt-in, browser fallback
 
-Browser path (default, `USE_SERVER_TTS=0`):
+The server-side TTS path is now **on by default** (`USE_SERVER_TTS=1`)
+because the default provider — Microsoft Edge TTS — is free, key-less,
+and produces a natural neural voice.
+
+**Edge TTS (default, `TTS_PROVIDER=edge`):**
+- `backend/tts/edge_tts_provider.py` calls the public Edge Online TTS
+  service via the `edge-tts` Python package. No API key.
+- Default voice: `en-US-AriaNeural`. Override with `EDGE_TTS_VOICE`
+  (e.g. `en-IN-NeerjaNeural`, `en-GB-SoniaNeural`,
+  `en-US-JennyNeural`).
+- Writes MP3 to `tests/audio/sessions/<sid>/turn_<n>.mp3`, returns
+  `audio_url: "/api/audio/<sid>/turn_<n>.mp3"`.
+
+**ElevenLabs (opt-in, `TTS_PROVIDER=elevenlabs`):**
+- Requires `ELEVENLABS_API_KEY`. Calls `elevenlabs.convert(...)`,
+  streams chunks to the same path/format as Edge.
+- Use this if you need the highest-quality voice and are willing to pay.
+
+**Browser-only (`USE_SERVER_TTS=0`):**
 - Backend returns `{ audio_url: null }`.
 - Frontend uses `window.speechSynthesis.speak(...)` with a synced typing
-  animation. Zero added latency, zero API cost.
-
-Server path (`USE_SERVER_TTS=1`):
-- Backend runs `elevenlabs.convert(...)`, streams chunks to
-  `tests/audio/sessions/<sid>/turn_<n>.mp3`.
-- Backend returns `audio_url: "/api/audio/<sid>/turn_<n>.mp3"`.
-- Frontend plays the file via a hidden `<audio>` element while the typing
-  animation runs.
+  animation. Zero added latency, zero API cost — but voice quality
+  depends entirely on the user's OS/browser.
 
 ---
 
@@ -622,35 +721,161 @@ dimensions — we don't score small-talk.
 
 ---
 
+## End-of-interview report
+
+File: `backend/interview/report.py`. Entry: `synthesize_report(session)`.
+
+When the candidate or the recruiter hits `GET /api/session/:id/report`,
+one Groq pass synthesizes a recruiter-ready report from everything the
+session collected:
+
+- **Hire recommendation** — `strong_hire | hire | lean_hire | lean_no | no_hire`
+- **Top strengths and weaknesses** across the whole interview, each with
+  a direct quote from a real turn
+- **Per-dimension averages** (correctness, depth, communication,
+  relevance) and a comparison to the seniority bar
+- **Topic coverage map** — which `topic_categories` were actually touched
+- **AI-detection summary** with the worst-offending turns
+- **One-paragraph human-readable summary**
+
+The synthesized report is cached on the `InterviewSession` and persisted
+to `interview_sessions.report_json` so subsequent loads are instant. A
+session can only produce a report once it's finished or has at least one
+scored turn.
+
+---
+
+## Multi-tenant company workspaces
+
+The legacy company auth (`POST /api/company`, `POST /api/company/login`)
+still works. On top of it, every company now has a URL-safe **slug**
+(unique, indexed) and a parallel set of `/api/c/:slug/...` routes — so
+the Next.js dashboard uses stable, shareable paths like
+`/c/acme/jobs/123` instead of opaque UUIDs.
+
+### Onboarding flow
+
+```
+prospect submits contact form ─▶ POST /api/leads
+        │     leads(kind, company_name, contact_name, email, role_count, use_case, source)
+        │     status='new'; SMTP notifies sales (send_lead_notification)
+        ▼
+operator runs CLI: python -m backend.scripts.provision_company --lead-id <id>
+        │     ├─ create companies row + unique slug
+        │     ├─ generate setup_token (random 32 hex, 7-day expiry)
+        │     ├─ email owner the setup link (send_owner_setup_email)
+        │     └─ leads.status='onboarded', leads.converted_company_id=<id>
+        ▼
+owner clicks link ─▶ GET  /api/c/:slug/onboard/:token   (validate)
+                  ─▶ POST /api/c/:slug/onboard          (set password)
+        │     consumes the setup_token, returns a bearer auth_token
+        ▼
+owner lands on /c/:slug dashboard in the Next.js app
+```
+
+The CLI is in `backend/scripts/provision_company.py` and supports both
+modes:
+
+```bash
+# Convert an inbound lead:
+python -m backend.scripts.provision_company --lead-id <lead_id>
+
+# Or create a workspace from scratch:
+python -m backend.scripts.provision_company \
+    --name "Acme Tech" --email owner@acme.com [--contact-name "Priya"]
+```
+
+### Auditing
+
+Significant tenant actions (lead in, company provisioned, invite sent,
+session started/finished) are logged via `audit()` /
+`log_event()` into the `interview_events` table for later analytics.
+
+---
+
+## Next.js web frontend
+
+The `web/` directory is a standalone Next.js 15 app (TypeScript, App
+Router, Tailwind, shadcn/ui, React Query, Monaco editor) that ships:
+
+- **Marketing landing page** — what the product does, demo CTA
+- **Contact form** — wired to `POST /api/leads`
+- **Owner onboarding page** — consumes a setup_token via
+  `/api/c/:slug/onboard`
+- **Company dashboard** at `/c/:slug` — jobs, applications, candidate
+  files, shareable application links, usage panel
+- **Candidate signup/login** for the multi-application flow
+
+It is **statically exported** (`next build` → `web/out/`) and served by
+FastAPI in production, which is why two small middlewares live in
+`backend/api.py`:
+
+- `static_cache_headers` — `_next/static/*` is `immutable`,
+  `Cache-Control: max-age=31536000`; HTML pages are `no-cache` so the
+  shell never gets stuck pointing at a stale chunk hash after a
+  rebuild.
+- `rsc_payload_redirect` — Next's static export emits `index.txt` RSC
+  payloads next to every `index.html`. If a *browser* (vs. the Next
+  router's `fetch`) lands on one directly, redirect to the parent
+  directory so the user doesn't see raw JSON.
+
+For local dev, run `npm run dev` in `web/` for HMR; for production
+parity run `npm run build` and let FastAPI serve `web/out/`.
+
+---
+
+## Rate limiting
+
+`backend/api.py` ships a small in-process sliding-window limiter
+(`rate_limit(request, bucket, max_calls, window_s)`) keyed by
+`(bucket, client_ip)`. It honors `X-Forwarded-For` so it works behind
+nginx. It's good enough for a single-worker uvicorn deployment and is
+applied on public-facing endpoints (resume upload, apply, contact form)
+to prevent abuse.
+
+For a multi-worker or multi-host deploy, swap the per-process dict for
+a Redis-backed counter — the function signature stays the same. We
+deliberately keep the in-process version to avoid adding Redis as a
+dependency at this stage.
+
+---
+
 ## Database schema
 
 All tables live in `data/portal.db` (WAL journal, foreign keys ON).
 
 ```
-candidates(id, name, email, created_at)
+candidates(id, name, email, password_hash, auth_token, created_at)
 resumes(id, candidate_id, filename, raw_text, skills_json, uploaded_at)
-companies(id, name, email, password_hash, auth_token, created_at)
+companies(id, name, email, password_hash, auth_token, created_at,
+          slug UNIQUE, status, plan,
+          setup_token, setup_token_expires_at)
 jobs(id, company_id, title, description, required_skills,
      role_family, seniority, min_experience_years, max_experience_years,
      department, employment_type, status, created_at)
 applications(id, job_id, candidate_id, resume_id, session_id, status,
              invite_token UNIQUE, created_at)
 interview_sessions(id, candidate_id, resume_id, job_id, stage, status,
-                    cheating_flags, total_score, created_at, finished_at)
+                    cheating_flags, total_score, created_at, finished_at,
+                    report_json)
 eval_records(id PK autoinc, session_id, turn_number, stage, score,
               correctness, depth, communication, relevance, topic,
               strengths, weaknesses, notes, ai_likelihood, created_at)
 email_log(id, to_addr, subject, body, status, sent_at)
+leads(id, kind, company_name, contact_name, email, phone, role_count,
+      use_case, source, status, notes, created_at, converted_company_id)
+interview_events(id PK autoinc, company_id, job_id, application_id,
+                  session_id, event, metadata, created_at)
 ```
 
 Password hashing uses a random 16-byte salt with SHA-256 → stored as
 `salt$hash`. Auth tokens rotate on every login.
 
-`init_db()` runs lightweight online migrations: any missing column on the
-`jobs` table (the role/seniority/experience fields) is added via
-`ALTER TABLE` on boot, so an old `portal.db` from a previous version
-upgrades transparently. Then it seeds `DemoCorp` plus one mock JD per
-role family from `MOCK_JDS`, skipping any title that already exists.
+`init_db()` runs lightweight online migrations: missing columns on
+`jobs`, `companies`, and `interview_sessions` are added via `ALTER TABLE`
+on boot, and any company without a `slug` gets one back-filled from its
+name. Then it seeds `DemoCorp` plus one mock JD per role family from
+`MOCK_JDS`, skipping any title that already exists.
 
 ---
 
@@ -660,32 +885,68 @@ role family from `MOCK_JDS`, skipping any title that already exists.
 
 | Method | Path                                   | Purpose                                      |
 |--------|----------------------------------------|----------------------------------------------|
-| GET    | `/`                                    | serve `frontend/index.html`                  |
+| GET    | `/`                                    | serve Next.js landing (or legacy frontend)   |
+| GET    | `/candidate`, `/candidate/*`           | serve legacy candidate interview UI          |
 | GET    | `/static/*`                            | serve frontend assets                        |
 | GET    | `/api/health`                          | liveness probe                               |
+| GET    | `/api/roles`                           | list role families + seniority tiers         |
 | POST   | `/api/resume/upload`                   | upload + parse resume, returns full breakdown|
 | GET    | `/api/jobs`                            | list active jobs                             |
 | GET    | `/api/jobs/:id`                        | job detail                                   |
 | POST   | `/api/jobs/:id/apply`                  | apply to job (multipart resume)              |
 | GET    | `/api/invite/:token`                   | validate invite token                        |
-| POST   | `/api/session`                         | create interview session                     |
+| POST   | `/api/session`                         | create interview session (runs preflight)    |
 | GET    | `/api/session/:id`                     | session status                               |
+| GET    | `/api/session/:id/report`              | synthesized end-of-interview report (cached) |
 | POST   | `/api/session/:id/turn`                | text turn                                    |
 | POST   | `/api/session/:id/audio-turn`          | voice turn (multipart WebM/Opus)             |
 | POST   | `/api/session/:id/cheating-report`     | append violations (list of arbitrary dicts)  |
 | GET    | `/api/session/:id/evaluations`         | per-turn scores + cheating flags             |
-| GET    | `/api/audio/:id/:file`                 | serve ElevenLabs MP3                         |
+| GET    | `/api/audio/:id/:file`                 | serve Edge / ElevenLabs MP3                  |
+| POST   | `/api/leads`                           | submit contact-form lead                     |
 | WS     | `/ws/interview/:id`                    | streaming STT + structured reply             |
 
-### Company (Bearer auth)
+### Candidate (Bearer auth)
+
+| Method | Path                                   | Purpose                                      |
+|--------|----------------------------------------|----------------------------------------------|
+| POST   | `/api/candidate/signup`                | email + password signup                      |
+| POST   | `/api/candidate/login`                 | login → bearer token                         |
+| GET    | `/api/candidate/me`                    | profile                                      |
+| GET    | `/api/candidate/me/applications`       | this candidate's applications + statuses     |
+
+### Company — legacy id-keyed routes (Bearer auth)
 
 | Method | Path                                         |
 |--------|----------------------------------------------|
 | POST   | `/api/company`  (register, returns token)    |
 | POST   | `/api/company/login`                         |
 | POST   | `/api/company/:id/jobs`                      |
+| GET    | `/api/company/:id/jobs`                      |
 | GET    | `/api/company/:id/applications`              |
 | POST   | `/api/invite/send`                           |
+
+### Company — tenant-aware `/c/:slug` routes (Bearer auth)
+
+These mirror the legacy id-keyed routes but key off the URL-safe company
+slug, so the Next.js dashboard can use stable paths like `/c/acme/jobs`.
+
+| Method | Path                                            | Purpose                                  |
+|--------|-------------------------------------------------|------------------------------------------|
+| POST   | `/api/auth/company/login`                       | login by email → returns slug + token    |
+| GET    | `/api/c/:slug/me`                               | company profile                          |
+| GET    | `/api/c/:slug/dashboard`                        | counters: jobs, applicants, recent activity |
+| GET    | `/api/c/:slug/jobs`                             | list jobs                                |
+| POST   | `/api/c/:slug/jobs`                             | create job                               |
+| GET    | `/api/c/:slug/jobs/:job_id`                     | job detail + applications                |
+| GET    | `/api/c/:slug/applications`                     | tenant-wide applications view            |
+| GET    | `/api/c/:slug/candidates/:application_id`       | candidate file (resume, sessions, scores)|
+| POST   | `/api/c/:slug/jobs/:job_id/links`               | create shareable application link        |
+| GET    | `/api/c/:slug/jobs/:job_id/links`               | list shareable links                     |
+| DELETE | `/api/c/:slug/links/:token`                     | revoke shareable link                    |
+| GET    | `/api/c/:slug/usage`                            | usage / plan limits                      |
+| GET    | `/api/c/:slug/onboard/:token`                   | validate setup_token (public)            |
+| POST   | `/api/c/:slug/onboard`                          | complete owner onboarding (set password) |
 
 `POST /api/company/:id/jobs` body:
 

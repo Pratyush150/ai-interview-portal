@@ -53,8 +53,8 @@
                  0 16px 32px rgba(0, 0, 0, 0.06);
     --shadow-xl: 0 2px 4px rgba(0, 0, 0, 0.04), 0 12px 24px rgba(0, 0, 0, 0.06),
                  0 28px 56px rgba(0, 0, 0, 0.08);
-    --ring-accent: 0 0 0 4px rgba(0, 113, 227, 0.15);
-    --ring-danger: 0 0 0 4px rgba(215, 0, 21, 0.15);
+    --ring-accent: 0 0 0 4px rgba(79, 70, 229, 0.18);
+    --ring-danger: 0 0 0 4px rgba(244, 63, 94, 0.18);
 
     /* Motion — Apple's signature easing */
     --ease-apple: cubic-bezier(0.32, 0.72, 0, 1);
@@ -64,30 +64,34 @@
     --dur-base: 240ms;
     --dur-slow: 420ms;
 
-    /* --- Light theme (default) --- */
-    --bg: #fafaf8;
+    /* --- Light theme (default) --- Synced with the Next.js recruiter
+       dashboard tokens (web/src/app/globals.css). The candidate portal and
+       the dashboard now share one visual language: warm off-white bg, slate
+       text, indigo accent, slate borders. Existing class rules below are
+       unchanged — they just resolve to the new colors. */
+    --bg: #fafaf9;
     --bg-elev: #ffffff;
     --surface: #ffffff;
-    --surface-subtle: #f4f4f2;
-    --surface-hover: #eeeeeb;
-    --text: #1d1d1f;
-    --text-secondary: #424245;
-    --text-tertiary: #86868b;
-    --border: rgba(0, 0, 0, 0.09);
-    --border-strong: rgba(0, 0, 0, 0.14);
-    --accent: #0071e3;
-    --accent-hover: #0077ed;
-    --accent-pressed: #006edb;
-    --accent-soft: rgba(0, 113, 227, 0.10);
+    --surface-subtle: #f8fafc;
+    --surface-hover: #f1f5f9;
+    --text: #0f172a;
+    --text-secondary: #475569;
+    --text-tertiary: #64748b;
+    --border: #e2e8f0;
+    --border-strong: #cbd5e1;
+    --accent: #4f46e5;
+    --accent-hover: #4338ca;
+    --accent-pressed: #3730a3;
+    --accent-soft: rgba(79, 70, 229, 0.10);
     --accent-text: #ffffff;
-    --success: #1d8c44;
-    --success-soft: rgba(29, 140, 68, 0.10);
-    --warning: #b26a00;
-    --warning-soft: rgba(178, 106, 0, 0.10);
-    --danger: #d70015;
-    --danger-soft: rgba(215, 0, 21, 0.09);
-    --translucent-bar: rgba(250, 250, 248, 0.72);
-    --camera-chrome: #0a0a0b;
+    --success: #10b981;
+    --success-soft: rgba(16, 185, 129, 0.12);
+    --warning: #f59e0b;
+    --warning-soft: rgba(245, 158, 11, 0.14);
+    --danger: #f43f5e;
+    --danger-soft: rgba(244, 63, 94, 0.12);
+    --translucent-bar: rgba(250, 250, 249, 0.78);
+    --camera-chrome: #0a0a0a;
 }
 
 /* Dark theme — activated explicitly via <html data-theme="dark"> on the
@@ -98,29 +102,31 @@
    auto-flipped with the OS. We moved to an explicit opt-in so the portal
    has a predictable light default and an explicit dark toggle. */
 [data-theme="dark"] {
-        --bg: #0a0a0b;
-        --bg-elev: #151517;
-        --surface: #1c1c1e;
-        --surface-subtle: #222225;
-        --surface-hover: #2a2a2d;
-        --text: #f5f5f7;
-        --text-secondary: #d1d1d6;
-        --text-tertiary: #8e8e93;
-        --border: rgba(255, 255, 255, 0.10);
-        --border-strong: rgba(255, 255, 255, 0.16);
-        --accent: #0a84ff;
-        --accent-hover: #409cff;
-        --accent-pressed: #0071e3;
-        --accent-soft: rgba(10, 132, 255, 0.15);
+        /* Dark theme — synced with web/src/app/globals.css `.dark` block:
+           near-black bg, slate-100 text, indigo-500 accent, slate-800 borders. */
+        --bg: #0a0a0a;
+        --bg-elev: #0f172a;
+        --surface: #0f172a;
+        --surface-subtle: #111827;
+        --surface-hover: #1e293b;
+        --text: #f8fafc;
+        --text-secondary: #cbd5e1;
+        --text-tertiary: #94a3b8;
+        --border: #1e293b;
+        --border-strong: #334155;
+        --accent: #6366f1;
+        --accent-hover: #818cf8;
+        --accent-pressed: #4f46e5;
+        --accent-soft: rgba(99, 102, 241, 0.18);
         --accent-text: #ffffff;
-        --success: #30d158;
-        --success-soft: rgba(48, 209, 88, 0.14);
-        --warning: #ff9f0a;
-        --warning-soft: rgba(255, 159, 10, 0.14);
-        --danger: #ff453a;
-        --danger-soft: rgba(255, 69, 58, 0.14);
-        --translucent-bar: rgba(20, 20, 22, 0.72);
-        --camera-chrome: #0a0a0b;
+        --success: #10b981;
+        --success-soft: rgba(16, 185, 129, 0.16);
+        --warning: #f59e0b;
+        --warning-soft: rgba(245, 158, 11, 0.16);
+        --danger: #f43f5e;
+        --danger-soft: rgba(244, 63, 94, 0.16);
+        --translucent-bar: rgba(10, 10, 10, 0.78);
+        --camera-chrome: #0a0a0a;
         --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.25);
         --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25), 0 2px 6px rgba(0, 0, 0, 0.2);
         --shadow-md: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 12px rgba(0, 0, 0, 0.25);
@@ -652,7 +658,7 @@ svg { display: block; }
     z-index: 3;
 }
 
-/* Serif monogram — Morgan's initial in Georgia / iowan for editorial feel.
+/* Serif monogram — Sara's initial in Georgia / iowan for editorial feel.
    Tracks large in the upper third of the tile. */
 .presence-mark {
     position: absolute;
@@ -1680,7 +1686,7 @@ svg { display: block; }
 }
 .interviewer-chip[data-state="speaking"] .chip-dot {
     background: var(--accent);
-    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.22);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.22);
     animation: chip-pulse 1.2s ease-in-out infinite;
 }
 .interviewer-chip[data-state="listening"] .chip-dot {

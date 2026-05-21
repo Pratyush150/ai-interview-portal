@@ -108,22 +108,31 @@ class AntiCheatMonitor {
         }
     }
 
-    // Phone / tablet / second-screen heuristic. A phone screen pointed at
-    // the webcam typically produces a concentrated rectangular bright region
-    // with many near-white pixels. We look for:
-    //   - high brightFraction (pixels with luminance > 220)
-    //   - that bright region clusters into a tight bounding box (< 55% of frame)
-    //   - sustained across multiple consecutive samples
+    // Phone / tablet / second-screen heuristic.
+    //
+    // The original thresholds (brightFraction > 0.10, fillRatio > 0.35,
+    // streak ≥ 3) were too aggressive — they fired on white shirts, lit
+    // windows, desk lamps, and even bright wall paint. Tightened so only
+    // a sustained, dense, screen-shaped bright region trips the flag:
+    //
+    //   - brightFraction > 0.22  (a real screen, not a glint)
+    //   - bounding box covers < 50% of frame  (not full-frame washout)
+    //   - bright pixels actually fill the box (> 0.55)  (rules out windows)
+    //   - sustained ≥ 6 frames (~3 seconds at 2 Hz sampling)
+    //
+    // We still RECORD the flag for the recruiter's cheat-analysis tab, but
+    // we no longer pop a real-time warning banner — the original behaviour
+    // alarmed clean candidates and dragged trust on the platform.
     _handlePhoneDetection(stats) {
         const looksLikeScreen = (
-            stats.brightFraction > 0.10 &&
+            stats.brightFraction > 0.22 &&
             stats.brightFraction < 0.55 &&
-            stats.brightBoxCoverage < 0.55 &&
-            stats.brightBoxFillRatio > 0.35
+            stats.brightBoxCoverage < 0.50 &&
+            stats.brightBoxFillRatio > 0.55
         );
         if (looksLikeScreen) {
             this._phoneStreak++;
-            if (this._phoneStreak >= 3) {
+            if (this._phoneStreak >= 6) {
                 this.phoneWarnCount++;
                 this._record('phone_suspected', {
                     bright_fraction: Number(stats.brightFraction.toFixed(3)),
@@ -132,11 +141,10 @@ class AntiCheatMonitor {
                     streak: this._phoneStreak,
                     count: this.phoneWarnCount,
                 });
-                const now = Date.now();
-                if (now - this._lastPhoneWarnAt > 6000) {
-                    this._lastPhoneWarnAt = now;
-                    this._showWarning('A phone or second screen appears to be visible. Please remove any other devices from the frame.');
-                }
+                // Real-time banner intentionally suppressed. Reviewers see
+                // the flag in the candidate's cheat-analysis tab with full
+                // evidence; no need to alarm someone who simply has a
+                // bright lamp behind them.
                 this._phoneStreak = 0;
             }
         } else {

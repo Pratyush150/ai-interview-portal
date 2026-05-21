@@ -13,3 +13,11 @@ tests/audio/output_*.mp3
 tests/audio/reply*.mp3
 tests/audio/sessions/
 data/
+
+# Next.js frontend (web/) — keep source, ignore build artifacts
+web/node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo
+web/.env.local
+web/.env.*.local
