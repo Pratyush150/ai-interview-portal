@@ -105,9 +105,7 @@ function Nav() {
             </Button>
           ) : (
             <Button variant="primary" size="sm" asChild>
-              <a href={`/candidate/?name=${encodeURIComponent(user!.name)}`}>
-                Continue as candidate
-              </a>
+              <Link href="/jobs">Browse jobs</Link>
             </Button>
           )}
         </div>

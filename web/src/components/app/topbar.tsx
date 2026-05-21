@@ -9,8 +9,6 @@ import {
   Bell,
   LogOut,
   User as UserIcon,
-  ExternalLink,
-  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -42,27 +40,11 @@ export function Topbar({ breadcrumbs }: { breadcrumbs?: React.ReactNode }) {
   const setShortcutHelp = useUIStore((s) => s.setShortcutHelp);
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
-  const loginAs = useAuth((s) => s.loginAs);
 
   function handleLogout() {
     logout();
     toast.success("Signed out");
     router.push("/");
-  }
-
-  function switchRole(role: Role) {
-    loginAs(role);
-    toast.success(`Now signed in as ${ROLE_LABEL[role]}`);
-    if (role === "candidate") {
-      // Pass identity so the vanilla portal pre-fills the setup screen.
-      const next = useAuth.getState().user;
-      const qs = new URLSearchParams();
-      if (next?.name) qs.set("name", next.name);
-      if (next?.email) qs.set("email", next.email);
-      window.location.href = `/candidate/?${qs.toString()}`;
-    } else {
-      router.push("/dashboard");
-    }
   }
 
   return (
@@ -143,35 +125,6 @@ export function Topbar({ breadcrumbs }: { breadcrumbs?: React.ReactNode }) {
               Account & settings
             </Link>
           </DropdownMenuItem>
-          <DropdownMenuItem asChild>
-            <a href="/candidate/" target="_blank" rel="noreferrer">
-              <ExternalLink className="size-4" />
-              Open candidate portal
-            </a>
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuLabel>
-            <span className="text-[10px] uppercase tracking-wider">
-              Switch role (demo)
-            </span>
-          </DropdownMenuLabel>
-          {(["recruiter", "hiring_manager", "admin", "candidate"] as Role[]).map(
-            (r) => (
-              <DropdownMenuItem
-                key={r}
-                onSelect={() => switchRole(r)}
-                disabled={user?.role === r}
-              >
-                <RefreshCw className="size-4" />
-                {ROLE_LABEL[r]}
-                {user?.role === r && (
-                  <span className="ml-auto text-[10px] text-muted-foreground">
-                    current
-                  </span>
-                )}
-              </DropdownMenuItem>
-            ),
-          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={handleLogout}>
             <LogOut className="size-4" />

@@ -132,6 +132,8 @@ function LiveInterviewPage() {
   const analyserRef = React.useRef<AnalyserNode | null>(null);
   const ampRafRef = React.useRef<number | null>(null);
   const ttsAudioRef = React.useRef<HTMLAudioElement | null>(null);
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const [cameraOn, setCameraOn] = React.useState(false);
 
   // ─── Elapsed timer ───
   React.useEffect(() => {
@@ -195,19 +197,44 @@ function LiveInterviewPage() {
     }
   }
 
-  // ─── Open microphone ───
+  // ─── Open microphone (and camera) ───
+  //
+  // We ask for audio+video in a single prompt — that's also what the
+  // pre-interview check told the candidate would happen. If the camera
+  // permission is denied or the device has no camera, we gracefully fall
+  // back to audio-only so the interview can still proceed.
   async function openMic() {
     if (streamRef.current) return;
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+      });
+      setCameraOn(true);
+    } catch (err) {
+      console.warn("Camera unavailable, falling back to audio-only", err);
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: audioConstraints,
+        video: false,
+      });
+      setCameraOn(false);
+      toast.warning(
+        "Couldn't access your camera. The interview will continue with audio only.",
+      );
+    }
     streamRef.current = stream;
-    // Set up amplitude analyser for the waveform
+    // Attach the video track to the picture-in-picture tile.
+    if (videoRef.current && stream.getVideoTracks().length > 0) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(() => undefined);
+    }
+    // Set up amplitude analyser for the waveform.
     const ctx = new (window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext })
         .webkitAudioContext)();
@@ -250,6 +277,10 @@ function LiveInterviewPage() {
       }
     }
     recorderRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraOn(false);
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -665,6 +696,29 @@ function LiveInterviewPage() {
         )}
       >
         <div className="relative flex flex-col items-center justify-center gap-6 border-b border-border p-6 md:border-b-0 md:border-r">
+          {/* Camera tile — picture-in-picture style, top-right of this panel.
+              Hidden when the candidate denies camera permission so we don't
+              show a black box. */}
+          <div
+            className={cn(
+              "absolute right-4 top-4 z-10 overflow-hidden rounded-lg border border-border bg-black shadow-lg",
+              "h-[120px] w-[160px] md:h-[150px] md:w-[200px]",
+              !cameraOn && "hidden",
+            )}
+          >
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="h-full w-full object-cover [transform:scaleX(-1)]"
+            />
+            <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
+              <span className="size-1.5 rounded-full bg-[var(--danger)] animate-pulse" />
+              You
+            </div>
+          </div>
+
           <div className="text-center">
             <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
               {labelFor(aiState, recording, paused)}
