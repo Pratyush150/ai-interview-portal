@@ -62,7 +62,7 @@ export default function SettingsPage() {
               </div>
               <div>
                 <Label>Subdomain</Label>
-                <Input className="mt-1" defaultValue="democorp.vaani.in" />
+                <Input className="mt-1" defaultValue="democorp.apertureai.com" />
               </div>
               <div>
                 <Label>Default timezone</Label>

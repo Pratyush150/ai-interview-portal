@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/stores/auth-store";
+import { BRAND_NAME } from "@/lib/brand";
 import {
   candidateLogin,
   candidateSignup,
@@ -115,12 +116,12 @@ function CandidateLogin() {
     <div className="flex min-h-screen">
       <div className="flex flex-1 items-center justify-center px-6 py-12">
         <div className="w-full max-w-sm space-y-6">
-          <div className="flex items-center gap-2">
+          <Link href="/" className="flex items-center gap-2">
             <div className="flex size-7 items-center justify-center rounded-md bg-[var(--primary)] text-white">
               <Sparkles className="size-3.5" />
             </div>
-            <span className="font-semibold">Vaani</span>
-          </div>
+            <span className="font-semibold">{BRAND_NAME}</span>
+          </Link>
 
           <div>
             <h1 className="text-xl font-semibold tracking-tight">

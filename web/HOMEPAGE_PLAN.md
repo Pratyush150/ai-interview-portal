@@ -15,7 +15,7 @@ Layout — single page, left-aligned, no carousel, no purple, no glass.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Vaani  ·  Product  Pricing  Customers  Docs           [Sign in] [Get started] │   ← 60px nav
+│  ApertureAI  ·  Product  Pricing  Customers  Docs      [Sign in] [Get started] │   ← 60px nav
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  AI-led interviews built for                                         │

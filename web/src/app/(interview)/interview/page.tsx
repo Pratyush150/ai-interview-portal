@@ -34,6 +34,7 @@ import {
 import { PreInterviewCheck } from "@/components/app/pre-interview-check";
 import { formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { BRAND_NAME } from "@/lib/brand";
 import { toast } from "sonner";
 import {
   audioUrl as resolveAudio,
@@ -735,7 +736,7 @@ function LiveInterviewPage() {
         </div>
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold leading-tight">
-            {interviewerName} · Vaani Interview
+            {interviewerName} · {BRAND_NAME} Interview
           </div>
           <div className="text-[11px] text-muted-foreground tabular">
             {sessionId ? `Session ${sessionId.slice(0, 8)}` : "Connecting…"} ·{" "}

@@ -97,7 +97,7 @@ export const useAuth = create<AuthState>()(
       setHydrated: () => set({ hydrated: true }),
     }),
     {
-      name: "vaani-auth",
+      name: "apertureai-auth",
       onRehydrateStorage: () => (state) => {
         state?.setHydrated();
       },

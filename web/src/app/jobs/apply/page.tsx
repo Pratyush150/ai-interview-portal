@@ -15,6 +15,7 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { BRAND_NAME } from "@/lib/brand";
 import {
   applyToJob,
   candidateLogin,
@@ -104,7 +105,7 @@ function JobApplyInner() {
             <div className="flex size-7 items-center justify-center rounded-md bg-[var(--primary)] text-white">
               <Sparkles className="size-3.5" strokeWidth={2.5} />
             </div>
-            Vaani
+            {BRAND_NAME}
           </Link>
         </div>
       </header>

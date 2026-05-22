@@ -1,4 +1,4 @@
-# Vaani — AI Interview Portal (Web)
+# ApertureAI — AI Interview Portal (Web)
 
 Next.js 15 + TypeScript + Tailwind v4 + shadcn/ui frontend for the AI
 Interview Portal. Sits parallel to the original `frontend/` (vanilla JS,

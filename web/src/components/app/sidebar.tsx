@@ -18,6 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { useRoles } from "@/lib/mock-api";
 import type { Role } from "@/types";
 import { useAuth } from "@/stores/auth-store";
+import { BRAND_NAME } from "@/lib/brand";
 
 interface NavItem {
   href: string;
@@ -69,10 +70,12 @@ export function Sidebar() {
   return (
     <aside className="hidden md:flex w-[240px] shrink-0 flex-col border-r border-border bg-sidebar">
       <div className="flex h-[60px] items-center gap-2 px-4 border-b border-border">
-        <div className="flex h-7 w-7 items-center justify-center rounded-md bg-[var(--primary)] text-[var(--primary-foreground)]">
-          <Sparkles className="size-3.5" strokeWidth={2.5} />
-        </div>
-        <span className="font-semibold tracking-tight">Vaani</span>
+        <Link href="/" className="flex items-center gap-2">
+          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-[var(--primary)] text-[var(--primary-foreground)]">
+            <Sparkles className="size-3.5" strokeWidth={2.5} />
+          </div>
+          <span className="font-semibold tracking-tight">{BRAND_NAME}</span>
+        </Link>
         <Badge variant="outline" className="ml-auto text-[10px] px-1.5 py-0">
           beta
         </Badge>

@@ -123,12 +123,12 @@ function OnboardPage() {
   return (
     <div className="flex min-h-screen items-center justify-center px-4 py-12">
       <div className="w-full max-w-md space-y-6">
-        <div className="flex items-center gap-2">
+        <Link href="/" className="flex items-center gap-2">
           <div className="flex size-7 items-center justify-center rounded-md bg-[var(--primary)] text-white">
             <Sparkles className="size-3.5" strokeWidth={2.5} />
           </div>
           <span className="font-semibold tracking-tight">{BRAND_NAME}</span>
-        </div>
+        </Link>
 
         <Card>
           <CardContent className="p-6">

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { BRAND_NAME } from "@/lib/brand";
 import { Badge } from "@/components/ui/badge";
 import { fetchJobs, fetchRoleCatalog, type JobRow } from "@/lib/auth-api";
 import { useAuth } from "@/stores/auth-store";
@@ -69,7 +70,7 @@ export default function JobsPage() {
             <div className="flex size-7 items-center justify-center rounded-md bg-[var(--primary)] text-white">
               <Sparkles className="size-3.5" strokeWidth={2.5} />
             </div>
-            <span className="font-semibold tracking-tight">Vaani</span>
+            <span className="font-semibold tracking-tight">{BRAND_NAME}</span>
             <Badge variant="outline" className="ml-1 text-[10px]">
               Jobs
             </Badge>
@@ -89,7 +90,7 @@ export default function JobsPage() {
                 </Link>
                 <span className="opacity-50">·</span>
                 <Link href="/" className="hover:text-foreground">
-                  Hire on Vaani
+                  Hire on {BRAND_NAME}
                 </Link>
               </>
             )}
