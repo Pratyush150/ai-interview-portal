@@ -4,17 +4,18 @@ Uses the public Edge Online TTS service (the same one that powers Microsoft
 Translator and Edge Read-Aloud). The `edge-tts` Python package speaks to it
 directly.
 
-**Voice selection (default: en-US-AvaMultilingualNeural).** Microsoft's
-"Multilingual" neural voices (Ava, Emma) are the newest generation and
-sound noticeably more human and conversational than the older voices
-(Aria, Jenny). They also handle non-English names and code-y tokens
-("Kubernetes", "PostgreSQL") with much less robotic prosody.
+**Voice selection (default: en-IN-NeerjaExpressiveNeural).** Indian
+English female voice with the "Expressive" model — meaningfully warmer
+and more natural prosody than the standard Neerja voice, and the accent
+aligns with how most candidates and recruiters in the target market
+actually speak. Microsoft labels it "Friendly, Positive" and it sounds
+the part: conversational, not news-reader.
 
 Override at runtime with `EDGE_TTS_VOICE=...`. Good alternatives:
-  - en-US-AvaMultilingualNeural   (default — warmest, most natural)
-  - en-US-EmmaMultilingualNeural  (slightly brighter / younger sound)
-  - en-US-JennyMultilingualNeural (older but still good)
-  - en-IN-NeerjaNeural            (Indian English female)
+  - en-IN-NeerjaExpressiveNeural  (default — Indian English, expressive)
+  - en-IN-NeerjaNeural            (Indian English, standard)
+  - en-US-AvaMultilingualNeural   (American English, very natural)
+  - en-US-EmmaMultilingualNeural  (American English, brighter)
   - en-GB-SoniaNeural             (British English female)
 
 **Pacing.** We synthesize at -5% rate (a hair slower than default) so the
@@ -31,32 +32,30 @@ from pathlib import Path
 
 import edge_tts
 
-DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
+DEFAULT_VOICE = "en-IN-NeerjaExpressiveNeural"
 DEFAULT_RATE = "-5%"
 
 # Tech terms that Edge's neural voices habitually mispronounce. We expand
-# acronyms into spaced-out letters or phonetic forms so the synthesizer
-# spells them rather than guessing a syllable structure. Keep the keys
-# uppercase and use word boundaries in the regex so we don't touch
-# substrings inside ordinary words.
+# acronyms into spaced-out letters so the synthesizer spells them rather
+# than guessing a syllable structure. List is intentionally conservative —
+# only acronyms a competent reader actually says letter-by-letter in
+# Indian-English tech conversation. SQL stays "S Q L" (not "sequel" —
+# that's an American convention), JSON stays as a word.
 _PRONUNCIATION_FIXES: dict[str, str] = {
     "API":     "A P I",
     "APIs":    "A P Is",
     "AWS":     "A W S",
     "GCP":     "G C P",
     "SDK":     "S D K",
-    "SQL":     "sequel",
-    "MySQL":   "my sequel",
+    "SQL":     "S Q L",
+    "MySQL":   "my S Q L",
     "PostgreSQL": "Postgres",
-    "NoSQL":   "no sequel",
-    "JSON":    "Jason",
-    "YAML":    "yamel",
+    "NoSQL":   "no S Q L",
     "JWT":     "J W T",
-    "OAuth":   "oh-auth",
+    "OAuth":   "oh auth",
     "URL":     "U R L",
     "URI":     "U R I",
     "URLs":    "U R Ls",
-    "REST":    "REST",  # already fine — keep for documentation
     "gRPC":    "gee R P C",
     "HTTP":    "H T T P",
     "HTTPS":   "H T T P S",
