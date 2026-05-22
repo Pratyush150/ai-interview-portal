@@ -136,6 +136,23 @@ function LiveInterviewPage() {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const [cameraOn, setCameraOn] = React.useState(false);
 
+  // Callback ref: any time a <video> element mounts (the big right-side
+  // panel OR the corner tile when the code editor is showing), attach
+  // the captured stream immediately. Survives layout switches because
+  // both <video> elements use this same ref callback.
+  const setVideoEl = React.useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (!el) return;
+    const s = streamRef.current;
+    if (s && s.getVideoTracks().length > 0 && el.srcObject !== s) {
+      el.srcObject = s;
+      const tryPlay = () =>
+        el.play().catch((err) => console.warn("video play rejected:", err));
+      if (el.readyState >= 1) tryPlay();
+      else el.onloadedmetadata = tryPlay;
+    }
+  }, []);
+
   // ─── Elapsed timer ───
   React.useEffect(() => {
     if (phase !== "live") return;
@@ -159,10 +176,10 @@ function LiveInterviewPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ─── Bind the camera stream to the <video> tile AFTER React has
-  // committed the visible state. Doing it inline inside openMic() races
-  // with React's render — at that moment the tile is still display:none
-  // and Chrome silently rejects play() on hidden video elements.
+  // ─── Bind the camera stream to whatever <video> element is currently
+  // mounted (the big right panel OR the corner tile in code-editor mode).
+  // The callback ref handles initial mount; this effect catches the case
+  // where the stream arrives AFTER the element is already mounted.
   React.useEffect(() => {
     const video = videoRef.current;
     const stream = streamRef.current;
@@ -171,16 +188,13 @@ function LiveInterviewPage() {
       video.srcObject = stream;
     }
     const tryPlay = () => {
-      video.play().catch((err) => {
-        console.warn("Camera <video>.play() rejected:", err);
-      });
+      video.play().catch((err) =>
+        console.warn("camera play() rejected:", err),
+      );
     };
-    if (video.readyState >= 1) {
-      tryPlay();
-    } else {
-      video.onloadedmetadata = tryPlay;
-    }
-  }, [cameraOn, phase]);
+    if (video.readyState >= 1) tryPlay();
+    else video.onloadedmetadata = tryPlay;
+  }, [cameraOn, phase, showCodePanel]);
 
   // ─── Begin: pre-flight checks done → create session if needed → ask first Q ───
   async function beginInterview() {
@@ -725,55 +739,51 @@ function LiveInterviewPage() {
       <div
         className={cn(
           "grid flex-1 grid-cols-1 overflow-hidden",
-          showCodePanel && "md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]",
+          // No code editor: 50/50 — audio on the left, BIG camera on the right.
+          // Code editor showing: shrink audio col, give code 1.4fr; camera
+          // demotes to a corner tile inside the audio column.
+          showCodePanel
+            ? "md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]"
+            : "md:grid-cols-2",
         )}
       >
         <div className="relative flex flex-col items-center justify-center gap-6 border-b border-border p-6 md:border-b-0 md:border-r">
-          {/* Camera tile — picture-in-picture style, top-right of this
-              panel. ALWAYS rendered during the live phase so the <video>
-              element is in the DOM before the stream is ready (the effect
-              above does the actual attachment after React commits). When
-              the candidate has no camera/permission we show a clear
-              placeholder instead of a black box. */}
-          <div
-            className={cn(
-              "absolute right-4 top-4 z-10 overflow-hidden rounded-lg border-2 border-border bg-black shadow-lg",
-              "h-[140px] w-[200px] md:h-[180px] md:w-[260px]",
-            )}
-          >
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className={cn(
-                "h-full w-full object-cover [transform:scaleX(-1)]",
-                !cameraOn && "invisible",
-              )}
-            />
-            {!cameraOn && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center">
-                <VideoOff className="size-5 text-muted-foreground" />
-                <div className="text-[11px] font-medium text-muted-foreground">
-                  Camera off
-                </div>
-                <div className="text-[10px] text-muted-foreground/70">
-                  Audio-only mode
-                </div>
-              </div>
-            )}
-            <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
-              <span
+          {/* Corner camera tile — ONLY when code editor is showing. Uses
+              the same setVideoEl callback ref as the big panel below, so
+              the stream attaches whichever element is currently mounted. */}
+          {showCodePanel && (
+            <div className="absolute right-4 top-4 z-10 h-[140px] w-[200px] overflow-hidden rounded-lg border-2 border-border bg-black shadow-lg md:h-[180px] md:w-[260px]">
+              <video
+                ref={setVideoEl}
+                autoPlay
+                playsInline
+                muted
                 className={cn(
-                  "size-1.5 rounded-full",
-                  cameraOn
-                    ? "bg-[var(--danger)] animate-pulse"
-                    : "bg-muted-foreground",
+                  "h-full w-full object-cover [transform:scaleX(-1)]",
+                  !cameraOn && "invisible",
                 )}
               />
-              You
+              {!cameraOn && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center">
+                  <VideoOff className="size-5 text-muted-foreground" />
+                  <div className="text-[11px] font-medium text-muted-foreground">
+                    Camera off
+                  </div>
+                </div>
+              )}
+              <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    cameraOn
+                      ? "bg-[var(--danger)] animate-pulse"
+                      : "bg-muted-foreground",
+                  )}
+                />
+                You
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="text-center">
             <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -829,7 +839,7 @@ function LiveInterviewPage() {
           )}
         </div>
 
-        {showCodePanel && (
+        {showCodePanel ? (
           <div className="flex flex-col overflow-hidden">
             <div className="border-b border-border px-5 py-4">
               <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -850,6 +860,48 @@ function LiveInterviewPage() {
                   setCode(STARTER_CODE[l]);
                 }}
               />
+            </div>
+          </div>
+        ) : (
+          /* BIG camera panel — the full right half of the screen when no
+             code editor is active. The <video> ref uses the same callback
+             as the corner tile, so the stream attaches to whichever element
+             is currently mounted. */
+          <div className="relative hidden overflow-hidden bg-black md:block">
+            <video
+              ref={setVideoEl}
+              autoPlay
+              playsInline
+              muted
+              className={cn(
+                "absolute inset-0 h-full w-full object-cover [transform:scaleX(-1)]",
+                !cameraOn && "invisible",
+              )}
+            />
+            {!cameraOn && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+                <div className="rounded-full bg-card/40 p-5">
+                  <VideoOff className="size-10 text-muted-foreground" />
+                </div>
+                <div className="text-sm font-medium text-muted-foreground">
+                  Camera unavailable
+                </div>
+                <div className="max-w-xs text-xs text-muted-foreground/70 leading-relaxed">
+                  Allow camera access in the browser permission prompt, or
+                  continue in audio-only mode. (Requires HTTPS or localhost.)
+                </div>
+              </div>
+            )}
+            <div className="pointer-events-none absolute bottom-3 left-3 flex items-center gap-1.5 rounded-md bg-black/70 px-2 py-1 text-xs font-medium text-white">
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  cameraOn
+                    ? "bg-[var(--danger)] animate-pulse"
+                    : "bg-muted-foreground",
+                )}
+              />
+              {candidateName || "You"}
             </div>
           </div>
         )}
