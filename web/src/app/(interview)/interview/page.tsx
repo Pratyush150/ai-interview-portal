@@ -339,18 +339,48 @@ function LiveInterviewPage() {
   }
 
   // ─── Begin recording the candidate's answer ───
+  //
+  // Now that the captured stream contains BOTH audio and video tracks
+  // (since we added the camera feed), we must hand MediaRecorder an
+  // audio-only view. Passing the mixed stream while requesting an
+  // audio/webm mimeType makes some Chromium builds throw
+  // NotSupportedError, which previously fell straight into text-mode
+  // fallback — the bug the user reported.
   function startRecording() {
     if (!streamRef.current || muted) return;
+    const audioTracks = streamRef.current.getAudioTracks();
+    if (audioTracks.length === 0) {
+      console.error("No audio tracks on stream");
+      toast.error("Microphone isn't available. Falling back to text.");
+      setTextMode(true);
+      return;
+    }
+    const audioOnly = new MediaStream(audioTracks);
+    // Pick the first supported mimeType. Chrome/Edge/Firefox all support
+    // webm/opus; Safari prefers mp4. We pass the chosen type to the Blob
+    // too so the backend receives the right Content-Type.
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/mp4",
+    ];
+    const mimeType =
+      typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported
+        ? candidates.find((m) => MediaRecorder.isTypeSupported(m))
+        : undefined;
     try {
-      const rec = new MediaRecorder(streamRef.current, {
-        mimeType: "audio/webm;codecs=opus",
-      });
+      const rec = mimeType
+        ? new MediaRecorder(audioOnly, { mimeType })
+        : new MediaRecorder(audioOnly);
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
         if (e.data.size > 0) chunksRef.current.push(e.data);
       };
       rec.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const blob = new Blob(chunksRef.current, {
+          type: rec.mimeType || mimeType || "audio/webm",
+        });
         if (blob.size < 3000) {
           toast.warning("That was very short — try again.");
           setRecording(false);
@@ -365,7 +395,7 @@ function LiveInterviewPage() {
       setRecording(true);
       setAiState("listening");
     } catch (e) {
-      console.error(e);
+      console.error("MediaRecorder failed", e);
       toast.error("Recording failed. Falling back to text.");
       setTextMode(true);
     }
