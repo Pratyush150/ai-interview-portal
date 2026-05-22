@@ -15,6 +15,7 @@ import {
   Clock,
   AlertTriangle,
   Send,
+  VideoOff,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
@@ -158,6 +159,29 @@ function LiveInterviewPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ─── Bind the camera stream to the <video> tile AFTER React has
+  // committed the visible state. Doing it inline inside openMic() races
+  // with React's render — at that moment the tile is still display:none
+  // and Chrome silently rejects play() on hidden video elements.
+  React.useEffect(() => {
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (!cameraOn || !video || !stream) return;
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+    }
+    const tryPlay = () => {
+      video.play().catch((err) => {
+        console.warn("Camera <video>.play() rejected:", err);
+      });
+    };
+    if (video.readyState >= 1) {
+      tryPlay();
+    } else {
+      video.onloadedmetadata = tryPlay;
+    }
+  }, [cameraOn, phase]);
+
   // ─── Begin: pre-flight checks done → create session if needed → ask first Q ───
   async function beginInterview() {
     setPhase("live");
@@ -203,8 +227,19 @@ function LiveInterviewPage() {
   // pre-interview check told the candidate would happen. If the camera
   // permission is denied or the device has no camera, we gracefully fall
   // back to audio-only so the interview can still proceed.
+  //
+  // Important: getUserMedia requires a secure context (HTTPS or
+  // http://localhost). On a plain-HTTP deploy (e.g. an Oracle VM IP
+  // without TLS), the call rejects with NotAllowedError before the
+  // permission prompt ever appears. Surface that clearly.
   async function openMic() {
     if (streamRef.current) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast.error(
+        "Your browser blocks mic/camera on insecure pages. Open the site over HTTPS (or via localhost).",
+      );
+      throw new Error("getUserMedia unavailable (insecure context)");
+    }
     const audioConstraints: MediaTrackConstraints = {
       echoCancellation: true,
       noiseSuppression: true,
@@ -216,24 +251,22 @@ function LiveInterviewPage() {
         audio: audioConstraints,
         video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
       });
-      setCameraOn(true);
     } catch (err) {
       console.warn("Camera unavailable, falling back to audio-only", err);
       stream = await navigator.mediaDevices.getUserMedia({
         audio: audioConstraints,
         video: false,
       });
-      setCameraOn(false);
       toast.warning(
         "Couldn't access your camera. The interview will continue with audio only.",
       );
     }
     streamRef.current = stream;
-    // Attach the video track to the picture-in-picture tile.
-    if (videoRef.current && stream.getVideoTracks().length > 0) {
-      videoRef.current.srcObject = stream;
-      videoRef.current.play().catch(() => undefined);
-    }
+    // Flip cameraOn based on whether we actually got a video track.
+    // The actual srcObject → <video> binding happens in a useEffect below
+    // so that React has committed the visible state before play() runs
+    // (Chrome silently rejects play() on a display:none video element).
+    setCameraOn(stream.getVideoTracks().length > 0);
     // Set up amplitude analyser for the waveform.
     const ctx = new (window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -696,14 +729,16 @@ function LiveInterviewPage() {
         )}
       >
         <div className="relative flex flex-col items-center justify-center gap-6 border-b border-border p-6 md:border-b-0 md:border-r">
-          {/* Camera tile — picture-in-picture style, top-right of this panel.
-              Hidden when the candidate denies camera permission so we don't
-              show a black box. */}
+          {/* Camera tile — picture-in-picture style, top-right of this
+              panel. ALWAYS rendered during the live phase so the <video>
+              element is in the DOM before the stream is ready (the effect
+              above does the actual attachment after React commits). When
+              the candidate has no camera/permission we show a clear
+              placeholder instead of a black box. */}
           <div
             className={cn(
-              "absolute right-4 top-4 z-10 overflow-hidden rounded-lg border border-border bg-black shadow-lg",
-              "h-[120px] w-[160px] md:h-[150px] md:w-[200px]",
-              !cameraOn && "hidden",
+              "absolute right-4 top-4 z-10 overflow-hidden rounded-lg border-2 border-border bg-black shadow-lg",
+              "h-[140px] w-[200px] md:h-[180px] md:w-[260px]",
             )}
           >
             <video
@@ -711,10 +746,31 @@ function LiveInterviewPage() {
               autoPlay
               playsInline
               muted
-              className="h-full w-full object-cover [transform:scaleX(-1)]"
+              className={cn(
+                "h-full w-full object-cover [transform:scaleX(-1)]",
+                !cameraOn && "invisible",
+              )}
             />
-            <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
-              <span className="size-1.5 rounded-full bg-[var(--danger)] animate-pulse" />
+            {!cameraOn && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center">
+                <VideoOff className="size-5 text-muted-foreground" />
+                <div className="text-[11px] font-medium text-muted-foreground">
+                  Camera off
+                </div>
+                <div className="text-[10px] text-muted-foreground/70">
+                  Audio-only mode
+                </div>
+              </div>
+            )}
+            <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  cameraOn
+                    ? "bg-[var(--danger)] animate-pulse"
+                    : "bg-muted-foreground",
+                )}
+              />
               You
             </div>
           </div>
