@@ -18,9 +18,10 @@ Override at runtime with `EDGE_TTS_VOICE=...`. Good alternatives:
   - en-US-EmmaMultilingualNeural  (American English, brighter)
   - en-GB-SoniaNeural             (British English female)
 
-**Pacing.** We synthesize at -5% rate (a hair slower than default) so the
-delivery feels conversational rather than newsreader-fast. Override with
-`EDGE_TTS_RATE=...` (e.g. `-10%`, `+0%`).
+**Pacing.** We synthesize at +5% rate — a hair quicker than baseline so
+the interviewer feels engaged and confident without crossing into
+news-reader fast. Override with `EDGE_TTS_RATE=...` (e.g. `+0%`, `+10%`,
+`-5%` for a slower delivery).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from pathlib import Path
 import edge_tts
 
 DEFAULT_VOICE = "en-IN-NeerjaExpressiveNeural"
-DEFAULT_RATE = "-5%"
+DEFAULT_RATE = "+5%"
 
 # Tech terms that Edge's neural voices habitually mispronounce. We expand
 # acronyms into spaced-out letters so the synthesizer spells them rather
