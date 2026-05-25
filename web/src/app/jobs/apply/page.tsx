@@ -166,7 +166,11 @@ function JobApplyInner() {
             <ResumeUploadPanel
               job={job}
               onApplied={(inviteToken) => {
-                router.push(`/interview/?invite=${encodeURIComponent(inviteToken)}`);
+                // Always route through the aptitude gate first. The
+                // /aptitude page checks server-side whether aptitude is
+                // required for this job and redirects to /interview if
+                // it isn't (or has already been cleared).
+                router.push(`/aptitude/?invite=${encodeURIComponent(inviteToken)}`);
               }}
             />
           ) : (

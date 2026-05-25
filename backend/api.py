@@ -335,13 +335,13 @@ def create_session(req: SessionCreate):
         app_row = db.execute(
             "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, "
             "j.role_family, j.seniority, j.min_experience_years, j.max_experience_years, "
-            "j.company_id, "
+            "j.company_id, j.aptitude_required, "
             "r.raw_text, r.skills_json "
             "FROM applications a "
             "JOIN candidates c ON a.candidate_id=c.id "
             "LEFT JOIN jobs j ON a.job_id=j.id "
             "LEFT JOIN resumes r ON a.resume_id=r.id "
-            "WHERE a.invite_token=? AND a.status='invited'",
+            "WHERE a.invite_token=? AND a.status IN ('invited','in_progress','aptitude_passed','rejected_aptitude')",
             (req.invite_token,)
         ).fetchone()
         db.close()
@@ -357,6 +357,32 @@ def create_session(req: SessionCreate):
                     raise
                 except (ValueError, TypeError):
                     pass
+
+            # ── Aptitude gate ─────────────────────────────────────────────
+            # If the job requires aptitude and this application hasn't
+            # passed it, refuse to create the interview session. The
+            # frontend reads the structured detail and redirects.
+            # 'skipped' = grandfathered legacy app; 'passed' = cleared.
+            apt_status = app_row["aptitude_status"] or "pending"
+            apt_required = bool(app_row["aptitude_required"])
+            if apt_required and apt_status not in ("passed", "skipped"):
+                if apt_status == "failed":
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "error": "aptitude_failed",
+                            "message": "You did not clear the aptitude round. This application is closed.",
+                        },
+                    )
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "aptitude_required",
+                        "aptitude_url": f"/aptitude/?invite={req.invite_token}",
+                        "message": "Please complete the aptitude round before starting the interview.",
+                    },
+                )
+
             session_company_id = app_row["company_id"]
             session_application_id = app_row["id"]
             candidate_name = app_row["cname"]
@@ -719,6 +745,458 @@ def get_evaluations(session_id: str):
         "avg_ai_likelihood": status["avg_ai_likelihood"],
         "cheating_flags_count": status["cheating_flags_count"],
         "cheating_flags": session.cheating_flags,
+    }
+
+
+# ─── Aptitude gate (candidate-facing) ──────────────────────────────────
+#
+# Flow:
+#   GET  /api/aptitude/{token}            → load questions + state
+#   POST /api/aptitude/{token}/start      → create attempt, set in_progress
+#   POST /api/aptitude/{token}/submit     → grade, finalize, set passed/failed
+#
+# Server enforces the timer (started_at + duration_min). A late submission
+# is silently graded on whatever answers came in (typically auto-fired by
+# the browser on timeout, but we don't trust the client).
+
+
+def _load_application_by_invite(invite_token: str) -> dict:
+    """Resolve an invite token to its application row + job aptitude config.
+
+    Raises 404 if the token is unknown, 410 if revoked/expired.
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT a.id AS application_id, a.candidate_id, a.job_id, "
+        "       a.aptitude_status, a.aptitude_score, a.aptitude_started_at, "
+        "       a.aptitude_completed_at, a.invite_expires_at, a.invite_revoked_at, "
+        "       j.company_id, j.title AS job_title, "
+        "       j.aptitude_required, j.aptitude_pass_score, j.aptitude_total, "
+        "       j.aptitude_duration_min, "
+        "       c.name AS candidate_name "
+        "FROM applications a "
+        "LEFT JOIN jobs j ON a.job_id=j.id "
+        "LEFT JOIN candidates c ON a.candidate_id=c.id "
+        "WHERE a.invite_token=?",
+        (invite_token,),
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Invite not found")
+    if row["invite_revoked_at"]:
+        raise HTTPException(410, "This link has been revoked")
+    if row["invite_expires_at"]:
+        try:
+            exp = datetime.fromisoformat(row["invite_expires_at"])
+            if exp < datetime.utcnow():
+                raise HTTPException(410, "This link has expired")
+        except (ValueError, TypeError):
+            pass
+    return dict(row)
+
+
+@app.get("/api/aptitude/{invite_token}")
+def aptitude_get(invite_token: str):
+    """Return the active question bank for the candidate's company + their
+    current attempt state. Questions are returned WITHOUT correct_index so a
+    snooping candidate can't read it out of the network panel."""
+    app_row = _load_application_by_invite(invite_token)
+    db = get_db()
+    qrows = db.execute(
+        "SELECT id, category, question_text, options_json, difficulty, position "
+        "FROM aptitude_questions WHERE company_id=? AND active=1 "
+        "ORDER BY position ASC, created_at ASC LIMIT ?",
+        (app_row["company_id"], int(app_row["aptitude_total"] or 10)),
+    ).fetchall()
+    questions = [
+        {
+            "id": r["id"],
+            "category": r["category"],
+            "question_text": r["question_text"],
+            "options": json.loads(r["options_json"]),
+            "difficulty": r["difficulty"],
+        }
+        for r in qrows
+    ]
+    # If an attempt is in progress, surface time remaining.
+    seconds_remaining: int | None = None
+    if app_row["aptitude_status"] == "in_progress" and app_row["aptitude_started_at"]:
+        try:
+            started = datetime.fromisoformat(app_row["aptitude_started_at"])
+            total_sec = int(app_row["aptitude_duration_min"] or 10) * 60
+            elapsed = int((datetime.utcnow() - started).total_seconds())
+            seconds_remaining = max(0, total_sec - elapsed)
+        except (ValueError, TypeError):
+            seconds_remaining = None
+    db.close()
+    return {
+        "candidate_name": app_row["candidate_name"],
+        "job_title": app_row["job_title"],
+        "status": app_row["aptitude_status"],
+        "score": app_row["aptitude_score"],
+        "pass_score": app_row["aptitude_pass_score"] or 6,
+        "total": app_row["aptitude_total"] or 10,
+        "duration_min": app_row["aptitude_duration_min"] or 10,
+        "seconds_remaining": seconds_remaining,
+        "questions": questions,
+        "aptitude_required": bool(app_row["aptitude_required"]),
+    }
+
+
+@app.post("/api/aptitude/{invite_token}/start")
+def aptitude_start(invite_token: str):
+    """Begin the timed aptitude round. Idempotent: if an attempt is already
+    in progress, returns it instead of overwriting."""
+    app_row = _load_application_by_invite(invite_token)
+    if not app_row["aptitude_required"]:
+        return {"status": "skipped", "message": "Aptitude not required for this job."}
+    if app_row["aptitude_status"] == "passed":
+        return {"status": "passed", "message": "Already cleared."}
+    if app_row["aptitude_status"] == "failed":
+        raise HTTPException(403, "You did not clear the aptitude round. Locked out.")
+
+    db = get_db()
+    if app_row["aptitude_status"] == "in_progress" and app_row["aptitude_started_at"]:
+        # Resume the existing attempt.
+        db.close()
+        return aptitude_get(invite_token)
+
+    # Fresh start.
+    attempt_id = uuid.uuid4().hex[:12]
+    now = datetime.utcnow().isoformat()
+    db.execute(
+        "INSERT INTO aptitude_attempts (id, application_id, started_at, status) "
+        "VALUES (?,?,?,?)",
+        (attempt_id, app_row["application_id"], now, "in_progress"),
+    )
+    db.execute(
+        "UPDATE applications SET aptitude_status='in_progress', aptitude_started_at=? "
+        "WHERE id=?",
+        (now, app_row["application_id"]),
+    )
+    db.commit()
+    db.close()
+    log_event(
+        "aptitude_started",
+        company_id=app_row["company_id"],
+        job_id=app_row["job_id"],
+        application_id=app_row["application_id"],
+    )
+    return aptitude_get(invite_token)
+
+
+class AptitudeSubmit(BaseModel):
+    # Map of question_id → selected option index (0-based). Missing answers
+    # are graded as wrong.
+    answers: dict[str, int]
+
+
+@app.post("/api/aptitude/{invite_token}/submit")
+def aptitude_submit(invite_token: str, payload: AptitudeSubmit):
+    """Grade the attempt and finalize pass/fail."""
+    app_row = _load_application_by_invite(invite_token)
+    if not app_row["aptitude_required"]:
+        raise HTTPException(400, "Aptitude not required for this job.")
+    if app_row["aptitude_status"] in ("passed", "failed"):
+        raise HTTPException(400, f"Aptitude already {app_row['aptitude_status']}.")
+    if app_row["aptitude_status"] != "in_progress":
+        raise HTTPException(400, "Aptitude not started yet — call /start first.")
+
+    pass_score = int(app_row["aptitude_pass_score"] or 6)
+    total = int(app_row["aptitude_total"] or 10)
+
+    db = get_db()
+    qrows = db.execute(
+        "SELECT id, correct_index FROM aptitude_questions "
+        "WHERE company_id=? AND active=1 "
+        "ORDER BY position ASC, created_at ASC LIMIT ?",
+        (app_row["company_id"], total),
+    ).fetchall()
+
+    score = 0
+    for r in qrows:
+        chosen = payload.answers.get(r["id"])
+        if chosen is not None and int(chosen) == int(r["correct_index"]):
+            score += 1
+
+    passed = score >= pass_score
+    new_status = "passed" if passed else "failed"
+    now = datetime.utcnow().isoformat()
+
+    db.execute(
+        "UPDATE aptitude_attempts SET completed_at=?, status=?, score=?, total=?, answers_json=? "
+        "WHERE application_id=? AND status='in_progress'",
+        (now, new_status, score, total, json.dumps(payload.answers),
+         app_row["application_id"]),
+    )
+    # Also update applications.status so the recruiter view reflects progress.
+    new_app_status = "aptitude_passed" if passed else "rejected_aptitude"
+    db.execute(
+        "UPDATE applications SET aptitude_status=?, aptitude_score=?, "
+        "aptitude_completed_at=?, status=? WHERE id=?",
+        (new_status, score, now, new_app_status, app_row["application_id"]),
+    )
+    db.commit()
+    db.close()
+    log_event(
+        "aptitude_completed",
+        company_id=app_row["company_id"],
+        job_id=app_row["job_id"],
+        application_id=app_row["application_id"],
+        metadata={"score": score, "total": total, "passed": passed},
+    )
+    return {
+        "status": new_status,
+        "score": score,
+        "total": total,
+        "pass_score": pass_score,
+        "passed": passed,
+    }
+
+
+# ─── Aptitude question bank (recruiter-facing CRUD) ───────────────────
+
+
+def _verify_slug_auth(slug: str, request: Request) -> dict:
+    """Resolve `/c/<slug>` to a company row and verify the bearer token.
+    Returns the company row. Raises 401/404 as appropriate."""
+    db = get_db()
+    co = db.execute("SELECT * FROM companies WHERE slug=?", (slug,)).fetchone()
+    db.close()
+    if not co:
+        raise HTTPException(404, "Workspace not found")
+    token = (request.headers.get("authorization", "") or "").removeprefix("Bearer ").strip()
+    if not token or token != co["auth_token"]:
+        raise HTTPException(401, "Unauthorized")
+    return dict(co)
+
+
+class AptitudeQuestionIn(BaseModel):
+    category: str = "general"
+    question_text: str
+    options: list[str]
+    correct_index: int
+    difficulty: str = "easy"
+    active: bool = True
+    position: int | None = None
+
+
+@app.get("/api/c/{slug}/aptitude/questions")
+def aptitude_q_list(slug: str, request: Request):
+    """List the company's aptitude bank (recruiter only). Includes
+    correct_index — this endpoint is auth-gated."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, category, question_text, options_json, correct_index, "
+        "       difficulty, active, position, created_at "
+        "FROM aptitude_questions WHERE company_id=? "
+        "ORDER BY position ASC, created_at ASC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [
+        {
+            "id": r["id"],
+            "category": r["category"],
+            "question_text": r["question_text"],
+            "options": json.loads(r["options_json"]),
+            "correct_index": r["correct_index"],
+            "difficulty": r["difficulty"],
+            "active": bool(r["active"]),
+            "position": r["position"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/c/{slug}/aptitude/questions")
+def aptitude_q_create(slug: str, q: AptitudeQuestionIn, request: Request):
+    co = _verify_slug_auth(slug, request)
+    if len(q.options) < 2 or len(q.options) > 6:
+        raise HTTPException(400, "Provide 2 to 6 options.")
+    if q.correct_index < 0 or q.correct_index >= len(q.options):
+        raise HTTPException(400, "correct_index out of range.")
+    qid = uuid.uuid4().hex[:12]
+    db = get_db()
+    # Auto-position: append to end if not provided.
+    pos = q.position
+    if pos is None:
+        max_pos = db.execute(
+            "SELECT COALESCE(MAX(position), -1) AS p FROM aptitude_questions WHERE company_id=?",
+            (co["id"],),
+        ).fetchone()["p"]
+        pos = (max_pos or -1) + 1
+    db.execute(
+        "INSERT INTO aptitude_questions "
+        "(id, company_id, category, question_text, options_json, correct_index, difficulty, active, position) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (qid, co["id"], q.category, q.question_text.strip(),
+         json.dumps(q.options), q.correct_index, q.difficulty,
+         1 if q.active else 0, pos),
+    )
+    db.commit()
+    db.close()
+    return {"id": qid, "ok": True}
+
+
+@app.patch("/api/c/{slug}/aptitude/questions/{qid}")
+def aptitude_q_update(slug: str, qid: str, q: AptitudeQuestionIn, request: Request):
+    co = _verify_slug_auth(slug, request)
+    if len(q.options) < 2 or len(q.options) > 6:
+        raise HTTPException(400, "Provide 2 to 6 options.")
+    if q.correct_index < 0 or q.correct_index >= len(q.options):
+        raise HTTPException(400, "correct_index out of range.")
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM aptitude_questions WHERE id=? AND company_id=?",
+        (qid, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Question not found")
+    db.execute(
+        "UPDATE aptitude_questions SET category=?, question_text=?, options_json=?, "
+        "correct_index=?, difficulty=?, active=?, position=COALESCE(?, position) WHERE id=?",
+        (q.category, q.question_text.strip(), json.dumps(q.options),
+         q.correct_index, q.difficulty, 1 if q.active else 0, q.position, qid),
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/c/{slug}/aptitude/questions/{qid}")
+def aptitude_q_delete(slug: str, qid: str, request: Request):
+    """Soft delete: sets active=0 so historical attempts still resolve."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM aptitude_questions WHERE id=? AND company_id=?",
+        (qid, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Question not found")
+    db.execute("UPDATE aptitude_questions SET active=0 WHERE id=?", (qid,))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+# ─── Recruiter view: all interview sessions + their reports ────────────
+
+
+@app.get("/api/c/{slug}/sessions")
+def list_sessions_for_company(slug: str, request: Request):
+    """Every interview session under this company. Powers the dashboard's
+    "Reports" view — works across server restarts because data is read
+    from the DB, not the in-memory session cache."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT s.id, s.stage, s.status, s.total_score, s.created_at, "
+        "       s.finished_at, s.target_duration_min, s.role_family, s.seniority, "
+        "       (s.report_json IS NOT NULL) AS has_report, "
+        "       c.name AS candidate_name, c.email AS candidate_email, "
+        "       j.title AS job_title, j.id AS job_id, "
+        "       a.aptitude_score AS aptitude_score, "
+        "       a.aptitude_status AS aptitude_status "
+        "FROM interview_sessions s "
+        "LEFT JOIN applications a ON a.session_id=s.id "
+        "LEFT JOIN candidates c ON COALESCE(a.candidate_id, s.candidate_id)=c.id "
+        "LEFT JOIN jobs j ON s.job_id=j.id "
+        "WHERE s.company_id=? "
+        "ORDER BY s.created_at DESC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [
+        {
+            "session_id": r["id"],
+            "stage": r["stage"],
+            "status": r["status"],
+            "total_score": r["total_score"],
+            "created_at": r["created_at"],
+            "finished_at": r["finished_at"],
+            "target_duration_min": r["target_duration_min"],
+            "role_family": r["role_family"],
+            "seniority": r["seniority"],
+            "has_report": bool(r["has_report"]),
+            "candidate_name": r["candidate_name"],
+            "candidate_email": r["candidate_email"],
+            "job_title": r["job_title"],
+            "job_id": r["job_id"],
+            "aptitude_score": r["aptitude_score"],
+            "aptitude_status": r["aptitude_status"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/c/{slug}/sessions/{session_id}/report")
+async def get_session_report_for_recruiter(slug: str, session_id: str, request: Request):
+    """Cached report_json for one session. Falls back to synthesizing from
+    eval_records if needed and the live session is still in memory."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT s.*, c.name AS cname, c.email AS cemail, j.title AS jtitle "
+        "FROM interview_sessions s "
+        "LEFT JOIN applications a ON a.session_id=s.id "
+        "LEFT JOIN candidates c ON COALESCE(a.candidate_id, s.candidate_id)=c.id "
+        "LEFT JOIN jobs j ON s.job_id=j.id "
+        "WHERE s.id=? AND s.company_id=?",
+        (session_id, co["id"]),
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Session not found in this workspace")
+
+    report: dict | None = None
+    if row["report_json"]:
+        report = json.loads(row["report_json"])
+    elif session_id in sessions:
+        # Live session, not yet flushed — synthesize on demand.
+        sess = sessions[session_id]
+        report = sess.cached_report or await asyncio.to_thread(synthesize_report, sess)
+        sess.cached_report = report
+        try:
+            d2 = get_db()
+            d2.execute(
+                "UPDATE interview_sessions SET report_json=? WHERE id=?",
+                (json.dumps(report), session_id),
+            )
+            d2.commit()
+            d2.close()
+        except Exception:
+            pass
+
+    # Per-turn evaluations from DB so the recruiter view shows the timeline.
+    db = get_db()
+    evals = db.execute(
+        "SELECT turn_number, stage, score, correctness, depth, communication, "
+        "       relevance, topic, strengths, weaknesses, notes, ai_likelihood, "
+        "       candidate_excerpt "
+        "FROM eval_records WHERE session_id=? ORDER BY turn_number ASC",
+        (session_id,),
+    ).fetchall()
+    db.close()
+
+    return {
+        "session_id": session_id,
+        "candidate_name": row["cname"],
+        "candidate_email": row["cemail"],
+        "job_title": row["jtitle"],
+        "stage": row["stage"],
+        "status": row["status"],
+        "total_score": row["total_score"],
+        "created_at": row["created_at"],
+        "finished_at": row["finished_at"],
+        "report": report,
+        "evaluations": [dict(e) for e in evals],
+        "cheating_flags": json.loads(row["cheating_flags"] or "[]"),
     }
 
 

@@ -229,6 +229,20 @@ function LiveInterviewPage() {
       await ask(id, "Hello, I'm ready to begin.");
     } catch (e) {
       console.error(e);
+      // Aptitude gate: backend returns 403 with detail.error='aptitude_required'
+      // or 'aptitude_failed' when the candidate hasn't cleared the pre-screen.
+      const err = e as { status?: number; detail?: { error?: string; aptitude_url?: string; message?: string } };
+      const detail = err?.detail;
+      if (err?.status === 403 && detail?.error === "aptitude_required" && inviteToken) {
+        toast.message("Please clear the aptitude round first.");
+        router.replace(`/aptitude/?invite=${encodeURIComponent(inviteToken)}`);
+        return;
+      }
+      if (err?.status === 403 && detail?.error === "aptitude_failed") {
+        toast.error(detail.message || "You did not clear the aptitude round. This application is closed.");
+        router.replace("/jobs");
+        return;
+      }
       toast.error(
         "Couldn't start the interview. Check that the backend is running.",
       );

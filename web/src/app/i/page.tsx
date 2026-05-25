@@ -79,9 +79,10 @@ function InvitePage() {
 
   function startInterview() {
     if (!state || !token) return;
-    // Hand off to the existing interview surface; it knows how to bootstrap
-    // the session from the invite token via /api/session.
-    window.location.href = `/interview/?invite=${encodeURIComponent(token)}`;
+    // Route through /aptitude first — that page will redirect straight to
+    // /interview if the job doesn't require an aptitude round (or if it's
+    // already been cleared).
+    window.location.href = `/aptitude/?invite=${encodeURIComponent(token)}`;
   }
 
   if (error) {

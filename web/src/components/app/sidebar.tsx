@@ -12,6 +12,8 @@ import {
   Plus,
   ChevronDown,
   Sparkles,
+  ClipboardList,
+  FileText,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -36,6 +38,8 @@ interface NavItem {
 const NAV: NavItem[] = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/candidates", label: "Candidates", icon: Users },
+  { href: "/reports", label: "Reports", icon: FileText },
+  { href: "/aptitude-bank", label: "Aptitude bank", icon: ClipboardList },
   {
     href: "/analytics",
     label: "Analytics",

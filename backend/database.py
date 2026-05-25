@@ -176,6 +176,28 @@ def init_db():
             ip TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS aptitude_questions (
+            id TEXT PRIMARY KEY,
+            company_id TEXT REFERENCES companies(id),
+            category TEXT DEFAULT 'general',
+            question_text TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            correct_index INTEGER NOT NULL,
+            difficulty TEXT DEFAULT 'easy',
+            active INTEGER DEFAULT 1,
+            position INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS aptitude_attempts (
+            id TEXT PRIMARY KEY,
+            application_id TEXT REFERENCES applications(id),
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            status TEXT DEFAULT 'in_progress',
+            score INTEGER,
+            total INTEGER,
+            answers_json TEXT
+        );
     """)
 
     # ── Migrations on existing tables (additive only) ─────────────────────
@@ -187,6 +209,14 @@ def init_db():
         ("max_experience_years",  "REAL DEFAULT 40"),
         ("department",            "TEXT DEFAULT ''"),
         ("employment_type",       "TEXT DEFAULT 'full_time'"),
+        # New: aptitude gate. Default 0 for additive safety on EXISTING jobs
+        # (legacy seeded mock JDs). The seed step below explicitly turns it
+        # ON for DemoCorp's jobs, and create-job endpoints default new jobs
+        # to 1. Old flows therefore never see the gate unless we opt them in.
+        ("aptitude_required",     "INTEGER DEFAULT 0"),
+        ("aptitude_pass_score",   "INTEGER DEFAULT 6"),
+        ("aptitude_total",        "INTEGER DEFAULT 10"),
+        ("aptitude_duration_min", "INTEGER DEFAULT 10"),
     ]:
         _ensure_column(conn, "jobs", col, decl)
 
@@ -234,10 +264,42 @@ def init_db():
         ("invite_used_at",      "TIMESTAMP"),
         ("invite_revoked_at",   "TIMESTAMP"),
         ("created_by_company",  "TEXT"),  # the company that generated this link
+        # New: aptitude gate state. 'skipped' = job doesn't require aptitude;
+        # 'pending' = required but not started; 'in_progress' = active attempt;
+        # 'passed'/'failed' = terminal. Only 'passed' (or 'skipped') opens
+        # /api/session. 'failed' is final — locked out, no retry.
+        ("aptitude_status",        "TEXT DEFAULT 'pending'"),
+        ("aptitude_score",         "INTEGER"),
+        ("aptitude_started_at",    "TIMESTAMP"),
+        ("aptitude_completed_at",  "TIMESTAMP"),
     ]:
         _ensure_column(conn, "applications", col, decl)
 
+    # Aptitude question bank: enforce uniqueness of (company, position) so
+    # the dashboard ordering is stable.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_aptitude_q_company ON aptitude_questions(company_id, active)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_aptitude_a_application ON aptitude_attempts(application_id)"
+    )
+
     conn.commit()
+
+    # ── One-shot backfill: aptitude gate for pre-existing applications ─────
+    # The new `aptitude_status` column defaults to 'pending'. For applications
+    # created BEFORE the gate existed, that would mean every old invite link
+    # is now blocked from starting an interview. We use sqlite's
+    # `PRAGMA user_version` as a one-shot flag: if it's < 1, run the
+    # grandfather backfill exactly once and bump it.
+    schema_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if schema_version < 1:
+        conn.execute(
+            "UPDATE applications SET aptitude_status='skipped' "
+            "WHERE aptitude_status='pending'"
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
 
     # ── Backfills ─────────────────────────────────────────────────────────
 
@@ -263,6 +325,7 @@ def init_db():
 
     conn.commit()
     _seed_demo_company(conn)
+    _seed_aptitude_bank(conn)
     conn.close()
 
 
@@ -323,6 +386,132 @@ def _seed_demo_company(conn: sqlite3.Connection) -> None:
                 jd["role_family"], jd["seniority"],
                 jd["min_experience_years"], jd["max_experience_years"],
                 jd.get("department", ""), jd.get("employment_type", "full_time"),
+            ),
+        )
+    # Turn the aptitude gate ON for ALL DemoCorp jobs (existing + just-inserted).
+    # The global migration default is 0 for safety on other tenants, but for
+    # the demo we want the feature actually exercised.
+    conn.execute(
+        "UPDATE jobs SET aptitude_required=1 WHERE company_id=? AND aptitude_required=0",
+        (company_id,),
+    )
+    conn.commit()
+
+
+# Default mock aptitude bank. 10 MCQs — light logical / quant / verbal mix
+# typical of a pre-screen. Recruiters can edit, add, or delete from the
+# dashboard; only `active=1` rows are served to candidates. Indexes into
+# `options` are 0-based.
+_MOCK_APTITUDE_QUESTIONS: list[dict] = [
+    {
+        "category": "quantitative",
+        "question_text": "If a train covers 120 km in 2 hours, what is its average speed?",
+        "options": ["40 km/h", "50 km/h", "60 km/h", "80 km/h"],
+        "correct_index": 2,
+        "difficulty": "easy",
+    },
+    {
+        "category": "logical",
+        "question_text": "Which number completes the series: 2, 4, 8, 16, __ ?",
+        "options": ["20", "24", "30", "32"],
+        "correct_index": 3,
+        "difficulty": "easy",
+    },
+    {
+        "category": "verbal",
+        "question_text": "Choose the word most similar in meaning to 'meticulous'.",
+        "options": ["Careless", "Thorough", "Hasty", "Random"],
+        "correct_index": 1,
+        "difficulty": "easy",
+    },
+    {
+        "category": "quantitative",
+        "question_text": "20% of 250 is:",
+        "options": ["25", "40", "50", "60"],
+        "correct_index": 2,
+        "difficulty": "easy",
+    },
+    {
+        "category": "logical",
+        "question_text": "All roses are flowers. Some flowers fade quickly. Therefore:",
+        "options": [
+            "All roses fade quickly.",
+            "Some roses may fade quickly.",
+            "No roses fade quickly.",
+            "All flowers are roses.",
+        ],
+        "correct_index": 1,
+        "difficulty": "medium",
+    },
+    {
+        "category": "quantitative",
+        "question_text": "If 5 workers build a wall in 10 days, how many days will 10 workers take? (assume same rate)",
+        "options": ["2 days", "5 days", "10 days", "20 days"],
+        "correct_index": 1,
+        "difficulty": "easy",
+    },
+    {
+        "category": "verbal",
+        "question_text": "Pick the odd one out:",
+        "options": ["Apple", "Banana", "Carrot", "Mango"],
+        "correct_index": 2,
+        "difficulty": "easy",
+    },
+    {
+        "category": "logical",
+        "question_text": "If MONDAY is coded as NPOEBZ, how is FRIDAY coded?",
+        "options": ["GSJEBZ", "GSKEBZ", "GSJFBZ", "GSJEAZ"],
+        "correct_index": 0,
+        "difficulty": "medium",
+    },
+    {
+        "category": "quantitative",
+        "question_text": "A product costs ₹400 after a 20% discount. What was the original price?",
+        "options": ["₹450", "₹480", "₹500", "₹520"],
+        "correct_index": 2,
+        "difficulty": "medium",
+    },
+    {
+        "category": "verbal",
+        "question_text": "Choose the correctly spelt word.",
+        "options": ["Accomodation", "Acommodation", "Accommodation", "Acomodation"],
+        "correct_index": 2,
+        "difficulty": "easy",
+    },
+]
+
+
+def _seed_aptitude_bank(conn: sqlite3.Connection) -> None:
+    """Seed the default 10-question aptitude bank for DemoCorp.
+
+    Idempotent: only inserts if the company has zero active questions.
+    Other companies must populate via the dashboard CRUD endpoints — we do
+    NOT auto-seed for them so we don't surprise paying tenants with our
+    mock content.
+    """
+    row = conn.execute(
+        "SELECT id FROM companies WHERE name=?", (DEMO_COMPANY_NAME,)
+    ).fetchone()
+    if not row:
+        return
+    company_id = row["id"]
+    existing = conn.execute(
+        "SELECT COUNT(*) AS n FROM aptitude_questions WHERE company_id=? AND active=1",
+        (company_id,),
+    ).fetchone()
+    if existing and existing["n"]:
+        return
+    import json as _json
+    for i, q in enumerate(_MOCK_APTITUDE_QUESTIONS):
+        conn.execute(
+            "INSERT INTO aptitude_questions "
+            "(id, company_id, category, question_text, options_json, correct_index, difficulty, active, position) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                uuid.uuid4().hex[:12], company_id,
+                q["category"], q["question_text"],
+                _json.dumps(q["options"]), q["correct_index"],
+                q["difficulty"], 1, i,
             ),
         )
     conn.commit()

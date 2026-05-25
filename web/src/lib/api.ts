@@ -105,13 +105,28 @@ export interface ReportEnvelope {
   report: ReportSynthesis;
 }
 
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(status: number, detail: unknown, message?: string) {
+    super(message || `Request failed: ${status}`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 export async function createSession(body: SessionCreateBody): Promise<SessionResponse> {
   const r = await fetch(`${apiBase()}/api/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`createSession failed: ${r.status}`);
+  if (!r.ok) {
+    // Surface FastAPI's `detail` so the caller can branch on structured
+    // errors (e.g. {error: "aptitude_required", aptitude_url: ...}).
+    const body = await r.json().catch(() => ({}));
+    throw new ApiError(r.status, body?.detail ?? body, body?.detail?.message);
+  }
   return r.json();
 }
 
