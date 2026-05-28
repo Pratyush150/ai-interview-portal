@@ -31,12 +31,13 @@ export function RequireRole({ allow, redirectTo = "/login", children }: Props) {
       return;
     }
     if (!allow.includes(user.role)) {
-      // Wrong role → either send candidates to their portal, or back to login.
+      // Wrong role: send candidates to the public job board (their entry point
+      // for applications and interviews). Recruiters/HMs without access go to
+      // the login screen. We deliberately do NOT redirect to /candidate/ here
+      // — that path serves the legacy vanilla portal, which was leaking into
+      // the recruiter dashboard when a candidate session hit it.
       if (user.role === "candidate") {
-        const qs = new URLSearchParams();
-        qs.set("name", user.name);
-        if (user.email) qs.set("email", user.email);
-        window.location.href = `/candidate/?${qs.toString()}`;
+        router.replace("/jobs");
       } else {
         router.replace(redirectTo);
       }

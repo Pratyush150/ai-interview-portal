@@ -18,8 +18,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
       }),
   );
 
+  // forcedTheme="dark" locks the UI to dark regardless of OS or
+  // localStorage. We previously relied on defaultTheme="dark" + enableSystem
+  // but next-themes' hydration script would strip the `dark` class for
+  // users whose OS preferred light, producing the white-flash and
+  // white-dropdown bugs. Re-enable the toggle by replacing forcedTheme
+  // with defaultTheme.
   return (
-    <NextThemesProvider attribute="class" defaultTheme="system" enableSystem>
+    <NextThemesProvider attribute="class" forcedTheme="dark">
       <QueryClientProvider client={client}>
         <TooltipProvider delayDuration={120}>{children}</TooltipProvider>
       </QueryClientProvider>

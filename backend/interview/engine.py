@@ -68,8 +68,18 @@ BASE_INTERVIEWER_PREFIX = (
     "- Acknowledge the candidate's last answer briefly (one short clause) BEFORE asking the next "
     "  question. This makes the interview feel like a conversation, not an interrogation.\n"
     "- Do not accept hand-waving; always dig: why / how / tradeoffs / failure modes.\n"
+    "- DIFFICULTY CURVE: open each topic at BASIC level (definitions, idioms). Once the candidate "
+    "  shows competence on a topic, escalate within that SAME topic to intermediate, then advanced. "
+    "  Never start a topic at advanced. Never jump back to a basic question on a topic you've already "
+    "  cleared. Stay within ONE topic until you've reached the candidate's ceiling, then transition.\n"
+    "- NO TOPIC HOPPING: do not abandon a topic mid-thread. If the candidate gave a weak answer, "
+    "  drill deeper on the SAME concept rather than switching to an unrelated subject. Switching topics "
+    "  repeatedly makes the interview feel disjointed and prevents real signal.\n"
     "- If the candidate's last answer revealed a weakness or unverified claim listed in DRILL TARGETS "
     "  below, return to it now (in a natural way) instead of jumping to a new topic.\n"
+    "- Voice-first format. The candidate is SPEAKING answers — do NOT ask them to write code aloud. "
+    "  Coding is reserved for the dedicated coding round at the end (separate UI). If a problem needs "
+    "  code, ask the candidate to describe the APPROACH/PSEUDOCODE in words.\n"
     "- Stay in English unless the candidate switches first.\n"
     "- Be tough but fair. Assess true depth, not polished delivery.\n"
 )
@@ -257,16 +267,34 @@ class InterviewSession:
 
     # ---- Stage advancement -----------------------------------------------
 
+    # Per-stage turn ceiling — the engine advances past this regardless of
+    # the time budget. Without it, a fast / quiet candidate can spend an
+    # hour in the same stage and never reach wrap_up → coding never fires.
+    # Numbers picked so the FULL flow completes in ≤ 15 turns even when
+    # the candidate answers in 5 seconds.
+    _MAX_TURNS_PER_STAGE = {
+        Stage.INTRO:    2,
+        Stage.BACKGROUND: 3,
+        Stage.TECHNICAL: 5,   # "core"
+        Stage.FOLLOW_UP: 3,
+        Stage.WRAP_UP:  2,
+    }
+
     def _should_advance(self) -> bool:
-        # Time-based: stage exhausted its slice. Soft floor — at least 1 turn
-        # per stage so we don't skip a stage entirely if the candidate types
-        # one super-long answer and burns the budget on it.
+        # Soft floor — at least 1 turn per stage so we don't skip a stage
+        # entirely if the candidate types one super-long answer.
         if self.stage_turn_count < 1:
             return False
+        # Per-stage turn ceiling — guarantees the architecture's
+        # apti → interview → coding flow finishes even when the engine
+        # would otherwise sit in one stage for the full clock budget.
+        if self.stage_turn_count >= self._MAX_TURNS_PER_STAGE.get(self.stage, 5):
+            return True
+        # Time-based: stage exhausted its slice.
         if self.stage_remaining_min() <= 0.0:
             return True
-        # Hard ceiling on overall length: if we've blown 110% of total budget,
-        # collapse straight to wrap_up so the candidate isn't trapped.
+        # Hard ceiling on overall length: if we've blown 110% of total
+        # budget, collapse to wrap_up.
         if self.elapsed_min() > self.target_duration_min * 1.10:
             return True
         return False
@@ -426,6 +454,10 @@ class InterviewSession:
             "role_family": self.role_family,
             "seniority": self.seniority,
             "interviewer_name": self.interviewer_name,
+            # Whether this role family includes a post-interview coding round.
+            # Engineering roles → True; PM/Sales/HR/etc. → False. Surfaced so
+            # the frontend can route past the IDE phase straight to ended.
+            "has_coding_round": self._profile.has_coding_round,
             # Time-based pacing surface
             "target_duration_min": round(self.target_duration_min, 1),
             "elapsed_min": round(self.elapsed_min(), 2),

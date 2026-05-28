@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   Send,
   VideoOff,
+  ShieldAlert,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Badge } from "@/components/ui/badge";
@@ -39,18 +40,25 @@ import { toast } from "sonner";
 import {
   audioUrl as resolveAudio,
   createSession,
+  getApiBase,
   getSession,
   postAudioTurn,
   postTextTurn,
   type TurnResponse,
 } from "@/lib/api";
 import { InterviewReport } from "@/components/app/interview-report";
+import { useAnticheat, ANTICHEAT_MAX_WARNINGS } from "@/hooks/use-anticheat";
+import {
+  getCodingProblem,
+  type CodingProblem,
+} from "@/lib/coding-problems";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Live interview surface
-// Reads ?session=<id> from the URL to resume an existing session, or
-// auto-creates one via POST /api/session if absent. Wraps the page in Suspense
-// because useSearchParams() requires it for static export.
+// Flow: pre-flight check → voice Q&A (intro → background → core → follow_up
+// → wrap_up) → coding round (pseudocode, 1 problem) → report.
+// The IDE never appears during the voice rounds; we used to flip it on
+// mid-interview, which broke the flow and confused candidates.
 // ───────────────────────────────────────────────────────────────────────────
 
 export default function InterviewPageWrapper() {
@@ -69,7 +77,7 @@ function FullScreenLoading() {
   );
 }
 
-type Phase = "check" | "live" | "ended";
+type Phase = "check" | "live" | "coding" | "ended" | "flagged";
 type TalkRole = "interviewer" | "candidate";
 
 interface TurnLine {
@@ -77,15 +85,19 @@ interface TurnLine {
   text: string;
 }
 
+// Starter buffers per language. C/C++ get their own — the editor language
+// "c" is a separate Monaco mode from "cpp" so a candidate familiar with
+// pure C can pick it without mentally translating from a C++ template.
 const STARTER_CODE: Record<CodeLanguage, string> = {
-  python: "# Use this scratch buffer if the interviewer asks for code.\n",
-  javascript: "// Use this scratch buffer if the interviewer asks for code.\n",
-  typescript: "// Use this scratch buffer if the interviewer asks for code.\n",
-  go: "// Use this scratch buffer if the interviewer asks for code.\npackage main\n",
-  java: "// Use this scratch buffer if the interviewer asks for code.\n",
-  cpp: "// Use this scratch buffer if the interviewer asks for code.\n",
-  rust: "// Use this scratch buffer if the interviewer asks for code.\n",
-  sql: "-- Use this scratch buffer if the interviewer asks for code.\n",
+  python: "# Write PSEUDOCODE here — focus on the algorithm.\n",
+  javascript: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  typescript: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  go: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  java: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  c: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  cpp: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  rust: "// Write PSEUDOCODE here — focus on the algorithm.\n",
+  sql: "-- Write PSEUDOCODE here — focus on the algorithm.\n",
 };
 
 function LiveInterviewPage() {
@@ -119,10 +131,19 @@ function LiveInterviewPage() {
     "Loading interview…",
   );
   const [captionVisibleChars, setCaptionVisibleChars] = React.useState(0);
-  const [showCodePanel, setShowCodePanel] = React.useState(false);
   const [textFallback, setTextFallback] = React.useState("");
   const [textMode, setTextMode] = React.useState(false);
   const [interviewerName, setInterviewerName] = React.useState<string>("Sara");
+  const [roleFamily, setRoleFamily] = React.useState<string>("backend_engineering");
+  // True for engineering roles; false for PM/Sales/HR/etc. When false we
+  // skip the coding phase entirely and go straight to the report.
+  const [hasCodingRound, setHasCodingRound] = React.useState<boolean>(true);
+  // Coding problems for the IDE round. The backend returns a list (usually
+  // 2 per engineering role). We walk through them sequentially — submit
+  // problem 1, then problem 2, then finish the interview. The static TS
+  // bank is the fallback used while the API call is still in flight.
+  const [codingProblems, setCodingProblems] = React.useState<CodingProblem[] | null>(null);
+  const [codingIdx, setCodingIdx] = React.useState(0);
   const [targetMinutes, setTargetMinutes] = React.useState<number>(22);
   const [lastScore, setLastScore] = React.useState<number | null>(null);
 
@@ -137,12 +158,15 @@ function LiveInterviewPage() {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const [cameraOn, setCameraOn] = React.useState(false);
 
-  // Callback ref: any time a <video> element mounts (the big right-side
-  // panel OR the corner tile when the code editor is showing), attach
-  // the captured stream immediately. Survives layout switches because
-  // both <video> elements use this same ref callback.
+  // Anti-cheat: hook needs the live stream + the mounted <video> to read
+  // motion / dark-frame heuristics. We keep a state copy of the stream so
+  // the hook re-runs when it changes (the ref alone wouldn't trigger).
+  const [streamForAnticheat, setStreamForAnticheat] = React.useState<MediaStream | null>(null);
+  const [videoForAnticheat, setVideoForAnticheat] = React.useState<HTMLVideoElement | null>(null);
+
   const setVideoEl = React.useCallback((el: HTMLVideoElement | null) => {
     videoRef.current = el;
+    setVideoForAnticheat(el);
     if (!el) return;
     const s = streamRef.current;
     if (s && s.getVideoTracks().length > 0 && el.srcObject !== s) {
@@ -154,7 +178,51 @@ function LiveInterviewPage() {
     }
   }, []);
 
-  // ─── Elapsed timer ───
+  const anticheat = useAnticheat({
+    sessionId,
+    videoEl: videoForAnticheat,
+    stream: streamForAnticheat,
+    apiBase: getApiBase(),
+    active: phase === "live" || phase === "coding",
+    onFlagged: () => {
+      // Three strikes — end the interview and surface the terminal banner.
+      stopRecording();
+      stopMic();
+      silenceTTS();
+      // Fire-and-forget /report POST so the backend writes total_score,
+      // status='finished', cheating_flags, and finished_at even though
+      // the candidate is on the flagged screen (which does NOT mount
+      // <InterviewReport> and would otherwise never trigger the persist).
+      if (sessionId) {
+        fetch(`${getApiBase()}/api/session/${sessionId}/report`).catch(() => undefined);
+      }
+      setPhase("flagged");
+    },
+    onCameraLost: () => {
+      toast.error(
+        "Your camera was turned off. Re-enable it from your browser settings — the interview is being flagged.",
+      );
+    },
+  });
+
+  // Surface each new anti-cheat warning as a toast. Mirrors the legacy
+  // vanilla portal's behaviour so the candidate knows exactly which
+  // behaviour was flagged.
+  React.useEffect(() => {
+    if (anticheat.latestMessage) {
+      toast.warning(
+        `${anticheat.latestMessage} (${anticheat.warnings}/${ANTICHEAT_MAX_WARNINGS})`,
+      );
+    }
+  }, [anticheat.latestMessage, anticheat.warnings]);
+
+  // ─── Voice-interview timer (live phase only) ───
+  //
+  // The 22-minute budget covers ONLY the voice rounds. When the
+  // candidate transitions to the coding phase the ticker stops — the
+  // coding round gets its own separate 30-minute budget tracked by
+  // `codingElapsedSec` below. This keeps the time pressure of each
+  // round visible to the candidate without one bleeding into the other.
   React.useEffect(() => {
     if (phase !== "live") return;
     const t = setInterval(() => {
@@ -163,24 +231,114 @@ function LiveInterviewPage() {
     return () => clearInterval(t);
   }, [phase, paused]);
 
-  // ─── Cleanup on unmount ───
+  // ─── Coding-round timer (coding phase only, 30 min budget) ───
+  //
+  // Fresh counter, fresh budget. Auto-submits whatever's in the editor
+  // when the timer hits 0 so the candidate can't silently overrun.
+  const CODING_BUDGET_MIN = 30;
+  const [codingElapsedSec, setCodingElapsedSec] = React.useState(0);
+  const codingExpiredRef = React.useRef(false);
   React.useEffect(() => {
-    return () => {
-      stopMic();
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
+    if (phase !== "coding") {
+      // Reset whenever we leave (defensive — would only matter if the
+      // candidate somehow re-enters the coding phase from a flagged
+      // state, which currently isn't possible).
+      if (phase !== "ended" && phase !== "flagged") {
+        setCodingElapsedSec(0);
+        codingExpiredRef.current = false;
       }
-      if (ttsAudioRef.current) {
-        ttsAudioRef.current.pause();
-      }
-    };
+      return;
+    }
+    const t = setInterval(() => {
+      setCodingElapsedSec((s) => s + 1);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [phase]);
+
+  // Auto-submit when the coding budget is hit. We submit whatever the
+  // candidate has currently typed — even an empty buffer — so the
+  // session ends cleanly and the report can be generated. We do NOT
+  // require all problems to be solved; the engine evaluates each
+  // submission as it lands and the unsubmitted ones simply don't count.
+  React.useEffect(() => {
+    if (phase !== "coding") return;
+    if (codingExpiredRef.current) return;
+    if (codingElapsedSec < CODING_BUDGET_MIN * 60) return;
+    codingExpiredRef.current = true;
+    toast.warning("Coding round time's up — submitting and wrapping up.");
+    // Submit current code (if any) then end the interview. Wrapped in a
+    // microtask so React state settles first.
+    queueMicrotask(() => {
+      void submitCode().finally(() => {
+        stopMic();
+        silenceTTS();
+        if (sessionId) {
+          fetch(`${getApiBase()}/api/session/${sessionId}/report`).catch(() => undefined);
+        }
+        setPhase("ended");
+      });
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [codingElapsedSec, phase]);
+
+  // ─── Fully silence any TTS audio source ───
+  //
+  // `audio.pause()` alone is unreliable on Chrome — paused audio can
+  // resume on its own under certain autoplay-policy conditions, and on
+  // Safari a pending play() promise can override a pause. The robust
+  // shutdown is: pause + detach src + reload. Web Speech needs
+  // cancel() + pause() back-to-back because Chrome's speech queue
+  // survives a single cancel() call after a long-running utterance.
+  const destroyedRef = React.useRef(false);
+  const silenceTTS = React.useCallback(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.speechSynthesis?.cancel();
+      window.speechSynthesis?.pause();
+      // Then resume to flush; a paused queue can outlive a cancel call.
+      setTimeout(() => {
+        try { window.speechSynthesis?.cancel(); } catch {}
+      }, 50);
+    } catch {}
+    const a = ttsAudioRef.current;
+    if (a) {
+      try {
+        a.pause();
+        a.removeAttribute("src");
+        a.load();
+      } catch {}
+      ttsAudioRef.current = null;
+    }
   }, []);
 
+  // ─── Cleanup on unmount + tab hide + browser back/forward ───
+  React.useEffect(() => {
+    function onVisibility() {
+      if (document.hidden) silenceTTS();
+    }
+    function onPageHide() {
+      // Fires on real navigation (back/forward, tab close). Stops audio
+      // even if React doesn't unmount fast enough.
+      destroyedRef.current = true;
+      silenceTTS();
+      stopMic();
+    }
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onPageHide);
+    return () => {
+      destroyedRef.current = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onPageHide);
+      silenceTTS();
+      stopMic();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [silenceTTS]);
+
   // ─── Bind the camera stream to whatever <video> element is currently
-  // mounted (the big right panel OR the corner tile in code-editor mode).
-  // The callback ref handles initial mount; this effect catches the case
-  // where the stream arrives AFTER the element is already mounted.
+  // mounted (the big right panel OR the corner tile in coding mode).
   React.useEffect(() => {
     const video = videoRef.current;
     const stream = streamRef.current;
@@ -195,7 +353,7 @@ function LiveInterviewPage() {
     };
     if (video.readyState >= 1) tryPlay();
     else video.onloadedmetadata = tryPlay;
-  }, [cameraOn, phase, showCodePanel]);
+  }, [cameraOn, phase]);
 
   // ─── Begin: pre-flight checks done → create session if needed → ask first Q ───
   async function beginInterview() {
@@ -211,26 +369,25 @@ function LiveInterviewPage() {
         setSessionId(id);
         setStage(sess.stage);
         setInterviewerName(sess.interviewer_name || "Sara");
+        setRoleFamily(sess.role_family || "backend_engineering");
+        setHasCodingRound(sess.has_coding_round !== false);
         if (sess.target_duration_min) setTargetMinutes(sess.target_duration_min);
       } else {
-        // Resuming an existing session — pull its metadata.
         try {
           const sess = await getSession(id);
           setStage(sess.stage);
           setInterviewerName(sess.interviewer_name || "Sara");
+          setRoleFamily(sess.role_family || "backend_engineering");
+          setHasCodingRound(sess.has_coding_round !== false);
           if (sess.target_duration_min) setTargetMinutes(sess.target_duration_min);
         } catch {
           /* keep defaults */
         }
       }
-      // Open the mic stream early so subsequent record/stop is instant.
       await openMic();
-      // Kick off by sending an empty "hello" so the LLM produces the intro Q.
       await ask(id, "Hello, I'm ready to begin.");
     } catch (e) {
       console.error(e);
-      // Aptitude gate: backend returns 403 with detail.error='aptitude_required'
-      // or 'aptitude_failed' when the candidate hasn't cleared the pre-screen.
       const err = e as { status?: number; detail?: { error?: string; aptitude_url?: string; message?: string } };
       const detail = err?.detail;
       if (err?.status === 403 && detail?.error === "aptitude_required" && inviteToken) {
@@ -251,16 +408,10 @@ function LiveInterviewPage() {
   }
 
   // ─── Open microphone (and camera) ───
-  //
-  // We ask for audio+video in a single prompt — that's also what the
-  // pre-interview check told the candidate would happen. If the camera
-  // permission is denied or the device has no camera, we gracefully fall
-  // back to audio-only so the interview can still proceed.
-  //
-  // Important: getUserMedia requires a secure context (HTTPS or
-  // http://localhost). On a plain-HTTP deploy (e.g. an Oracle VM IP
-  // without TLS), the call rejects with NotAllowedError before the
-  // permission prompt ever appears. Surface that clearly.
+  // We require BOTH at this stage — the pre-flight gate already enforced
+  // camera presence, so a failure here is an unrecoverable state and we
+  // abort back to the check screen rather than silently dropping to
+  // audio-only (which previously let candidates proceed without a camera).
   async function openMic() {
     if (streamRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -281,22 +432,16 @@ function LiveInterviewPage() {
         video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
       });
     } catch (err) {
-      console.warn("Camera unavailable, falling back to audio-only", err);
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-        video: false,
-      });
-      toast.warning(
-        "Couldn't access your camera. The interview will continue with audio only.",
+      console.warn("Camera/mic unavailable", err);
+      toast.error(
+        "Camera or microphone access was denied. Both are required — please grant them and reload.",
       );
+      setPhase("check");
+      throw err;
     }
     streamRef.current = stream;
-    // Flip cameraOn based on whether we actually got a video track.
-    // The actual srcObject → <video> binding happens in a useEffect below
-    // so that React has committed the visible state before play() runs
-    // (Chrome silently rejects play() on a display:none video element).
+    setStreamForAnticheat(stream);
     setCameraOn(stream.getVideoTracks().length > 0);
-    // Set up amplitude analyser for the waveform.
     const ctx = new (window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext })
         .webkitAudioContext)();
@@ -321,7 +466,6 @@ function LiveInterviewPage() {
         sum += v * v;
       }
       const rms = Math.sqrt(sum / buf.length);
-      // Boost lows so the waveform feels reactive
       setAmplitude(Math.min(1, rms * 2.4));
       ampRafRef.current = requestAnimationFrame(tick);
     };
@@ -347,20 +491,14 @@ function LiveInterviewPage() {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    setStreamForAnticheat(null);
     if (audioCtxRef.current) {
       audioCtxRef.current.close().catch(() => undefined);
       audioCtxRef.current = null;
     }
   }
 
-  // ─── Begin recording the candidate's answer ───
-  //
-  // Now that the captured stream contains BOTH audio and video tracks
-  // (since we added the camera feed), we must hand MediaRecorder an
-  // audio-only view. Passing the mixed stream while requesting an
-  // audio/webm mimeType makes some Chromium builds throw
-  // NotSupportedError, which previously fell straight into text-mode
-  // fallback — the bug the user reported.
+  // ─── Recording ───
   function startRecording() {
     if (!streamRef.current || muted) return;
     const audioTracks = streamRef.current.getAudioTracks();
@@ -371,9 +509,6 @@ function LiveInterviewPage() {
       return;
     }
     const audioOnly = new MediaStream(audioTracks);
-    // Pick the first supported mimeType. Chrome/Edge/Firefox all support
-    // webm/opus; Safari prefers mp4. We pass the chosen type to the Blob
-    // too so the backend receives the right Content-Type.
     const candidates = [
       "audio/webm;codecs=opus",
       "audio/webm",
@@ -441,7 +576,6 @@ function LiveInterviewPage() {
         toast.error("Couldn't process that turn. Try again.");
       }
       setAiState("listening");
-      // Re-arm mic if the candidate wants to retry
       if (!muted) startRecording();
     } finally {
       setSubmitting(false);
@@ -466,6 +600,48 @@ function LiveInterviewPage() {
     }
   }
 
+  // ─── Coding-round submission ───
+  // The candidate's pseudocode is shipped to the engine as a text turn so the
+  // existing evaluator scores it like any other answer. The candidate
+  // walks through 2 problems (more if the recruiter added them). After
+  // the last one we end the interview and surface the report.
+  async function submitCode() {
+    if (!sessionId) return;
+    if (code.replace(/[\s\W]/g, "").length < 8) {
+      toast.warning("Add a bit more detail before submitting.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const problemList = codingProblems ?? [getCodingProblem(roleFamily)];
+      const currentIdx = Math.min(codingIdx, problemList.length - 1);
+      const currentProblem = problemList[currentIdx];
+      const payload =
+        `[Coding round — pseudocode submission ${currentIdx + 1}/${problemList.length}, ${language}]\n` +
+        `Problem: ${currentProblem.title}\n\n` +
+        code;
+      const turn = await postTextTurn(sessionId, payload);
+      setTranscript((t) => [...t, { role: "candidate", text: payload }]);
+      handleTurnResponse(turn);
+      // Advance to next problem OR end the interview.
+      if (currentIdx + 1 < problemList.length) {
+        setCodingIdx(currentIdx + 1);
+        // Reset the editor buffer to the language's starter so the
+        // candidate isn't tempted to copy-paste their previous solution.
+        setCode(STARTER_CODE[language]);
+        toast.success(
+          `Submitted ${currentIdx + 1}/${problemList.length}. On to the next.`,
+        );
+      } else {
+        setPhase("ended");
+      }
+    } catch {
+      toast.error("Couldn't submit your code.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   // ─── Render and speak the AI's reply ───
   async function handleTurnResponse(turn: TurnResponse) {
     if (turn.transcript) {
@@ -477,44 +653,74 @@ function LiveInterviewPage() {
     setStage(turn.stage);
     setTurnCount(turn.total_turns);
     if (turn.last_turn_score != null) setLastScore(turn.last_turn_score);
-    // Set the full text up front but reveal 0 chars — the speak() routine
-    // advances captionVisibleChars in lock-step with the actual TTS
-    // playback (Web Speech onboundary, or audio.currentTime for server TTS).
     setCurrentQuestion(turn.reply);
     setCaptionVisibleChars(0);
     setTranscript((t) => [...t, { role: "interviewer", text: turn.reply }]);
 
-    // Heuristic: surface the code panel for technical/follow-up stages.
-    setShowCodePanel(turn.stage === "core" || turn.stage === "follow_up" || turn.stage === "technical");
-
+    // The voice interview is OVER when the engine sets `is_finished` —
+    // that's the canonical "second round complete" signal. Only then do
+    // we hand off to the coding round (engineering roles) or jump to the
+    // report (non-engineering roles). This way the candidate experiences
+    // the full intro→background→core→follow_up→wrap_up arc with no IDE
+    // interruption mid-flight.
     if (turn.is_finished) {
+      setAiState("speaking");
       await speak(turn.reply, turn.audio_url);
-      // Reveal the rest of the caption as a safety net before transitioning.
       setCaptionVisibleChars(turn.reply.length);
-      setPhase("ended");
+      setAiState("idle");
+      stopRecording();
+      if (hasCodingRound) {
+        // Pre-fetch the role-curated coding problems before mounting the
+        // IDE. The CodingRound component falls back to the static TS
+        // bank if this is still in flight, so the panel never blanks.
+        if (sessionId) {
+          fetch(`${getApiBase()}/api/session/${sessionId}/coding-problem`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data: { problems?: CodingProblem[] } | null) => {
+              const list = (data?.problems ?? []).filter(
+                (p) => p && p.title && p.prompt,
+              );
+              if (list.length > 0) {
+                setCodingProblems(list);
+                setCodingIdx(0);
+              }
+            })
+            .catch(() => undefined);
+        }
+        // KEEP the camera + mic stream alive — anti-cheat (motion + dark
+        // frame + camera-kill detection) runs throughout the coding round
+        // too. We only silence the TTS playback and stop the recorder.
+        silenceTTS();
+        setPhase("coding");
+      } else {
+        // Non-engineering — no coding round. Persist the report and end.
+        stopMic();
+        silenceTTS();
+        if (sessionId) {
+          fetch(`${getApiBase()}/api/session/${sessionId}/report`).catch(() => undefined);
+        }
+        setPhase("ended");
+      }
       return;
     }
+
     setAiState("speaking");
     await speak(turn.reply, turn.audio_url);
     setCaptionVisibleChars(turn.reply.length);
     setAiState("idle");
-    // Auto-arm the mic 800ms after the interviewer stops speaking.
     setTimeout(() => {
-      if (!muted && !paused && !textMode) startRecording();
+      if (!muted && !paused && !textMode && phase === "live") startRecording();
     }, 800);
   }
 
-  /** Plays the reply and SCRUBS the visible caption to match TTS playback.
-   *
-   * Server-TTS path (<audio>): we estimate per-character timing from the
-   * audio's metadata duration once it's known, and tick captionVisibleChars
-   * up as audio.currentTime advances — closed loop.
-   *
-   * Browser-TTS path (Web Speech): SpeechSynthesisUtterance.onboundary fires
-   * a 'word' boundary event with charIndex — we feed that straight in. This
-   * is the cleanest sync we can get without inventing timestamps. */
   function speak(text: string, audio_url: string | null): Promise<void> {
     return new Promise((resolve) => {
+      // If the component already unmounted (back button, tab close)
+      // between handleTurnResponse and now, do not start any new audio.
+      if (destroyedRef.current) {
+        resolve();
+        return;
+      }
       const total = text.length;
       const url = resolveAudio(audio_url);
 
@@ -553,7 +759,6 @@ function LiveInterviewPage() {
           setCaptionVisibleChars(total);
           resolve();
         });
-        // Safety timeout: bound by audio's likely length plus a generous margin.
         setTimeout(() => {
           cleanup();
           resolve();
@@ -562,7 +767,6 @@ function LiveInterviewPage() {
       }
 
       if (typeof window === "undefined" || !window.speechSynthesis) {
-        // No TTS available — reveal the caption over an estimated read-time.
         const estMs = Math.min(15000, text.length * 60);
         const start = Date.now();
         const interval = setInterval(() => {
@@ -578,17 +782,11 @@ function LiveInterviewPage() {
         return;
       }
 
-      // Chrome can leave the speech synth in a paused state after a tab
-      // switch / autoplay-policy gate. Resuming + cancelling pending utterances
-      // is the documented workaround. Without this, speak() silently no-ops.
       try {
         window.speechSynthesis.resume();
         window.speechSynthesis.cancel();
       } catch {}
 
-      // Voices load asynchronously in Chrome. If getVoices() is still empty,
-      // wait one tick for `voiceschanged` before speaking — otherwise the
-      // utterance fires with no voice attached and produces no audio.
       const startSpeak = () => {
         const voices = window.speechSynthesis.getVoices();
         const enVoice =
@@ -604,7 +802,6 @@ function LiveInterviewPage() {
           startSpeak();
         };
         window.speechSynthesis.addEventListener("voiceschanged", onVoices);
-        // Hard fallback: speak after 600 ms even if voices never arrive.
         setTimeout(() => {
           window.speechSynthesis.removeEventListener("voiceschanged", onVoices);
           startSpeak();
@@ -615,62 +812,51 @@ function LiveInterviewPage() {
       return;
 
       function speakWith(voice: SpeechSynthesisVoice | undefined) {
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1;
-      utter.pitch = 1;
-      utter.lang = "en-US";
-      if (voice) utter.voice = voice;
-      // The browser fires onboundary per word with charIndex — scrub the
-      // caption to cover up-to-AND-including the current word. Some browsers
-      // (Safari) don't fire it; we fall back to a time-based ramp.
-      let gotBoundary = false;
-      utter.onboundary = (ev) => {
-        gotBoundary = true;
-        const idx = (ev.charIndex ?? 0) + (ev.charLength ?? 0);
-        setCaptionVisibleChars(Math.max(captionVisibleChars, Math.min(total, idx + 1)));
-      };
-      // Time-based fallback for browsers without onboundary support. We use
-      // 165 wpm ≈ 12 chars/sec — close to default Web Speech rate.
-      const rampStart = Date.now();
-      const fallbackMsTotal = Math.max(800, (total / 12) * 1000);
-      const fallback = setInterval(() => {
-        if (gotBoundary) return; // boundary takes over
-        const f = Math.min(1, (Date.now() - rampStart) / fallbackMsTotal);
-        setCaptionVisibleChars(Math.floor(f * total));
-      }, 60);
-      const finish = () => {
-        clearInterval(fallback);
-        setCaptionVisibleChars(total);
-        resolve();
-      };
-      utter.onend = finish;
-      utter.onerror = (ev) => {
-        // Common causes: voice not installed, autoplay policy, or the synth
-        // is in a stuck "paused" state. We surface the reason in the console
-        // so a recruiter / candidate can see why no audio played.
-        console.warn(
-          "[TTS] Web Speech utterance error:",
-          (ev as SpeechSynthesisErrorEvent).error || "unknown",
-          "— check that your browser has at least one English voice installed.",
-        );
-        finish();
-      };
-      try {
-        window.speechSynthesis.speak(utter);
-      } catch (err) {
-        console.warn("[TTS] speechSynthesis.speak threw:", err);
-        finish();
-      }
-      // Chrome silent-fail guard.
-      setTimeout(() => {
-        clearInterval(fallback);
-        resolve();
-      }, Math.max(10000, text.length * 90));
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.rate = 1;
+        utter.pitch = 1;
+        utter.lang = "en-US";
+        if (voice) utter.voice = voice;
+        let gotBoundary = false;
+        utter.onboundary = (ev) => {
+          gotBoundary = true;
+          const idx = (ev.charIndex ?? 0) + (ev.charLength ?? 0);
+          setCaptionVisibleChars(Math.max(captionVisibleChars, Math.min(total, idx + 1)));
+        };
+        const rampStart = Date.now();
+        const fallbackMsTotal = Math.max(800, (total / 12) * 1000);
+        const fallback = setInterval(() => {
+          if (gotBoundary) return;
+          const f = Math.min(1, (Date.now() - rampStart) / fallbackMsTotal);
+          setCaptionVisibleChars(Math.floor(f * total));
+        }, 60);
+        const finish = () => {
+          clearInterval(fallback);
+          setCaptionVisibleChars(total);
+          resolve();
+        };
+        utter.onend = finish;
+        utter.onerror = (ev) => {
+          console.warn(
+            "[TTS] Web Speech utterance error:",
+            (ev as SpeechSynthesisErrorEvent).error || "unknown",
+          );
+          finish();
+        };
+        try {
+          window.speechSynthesis.speak(utter);
+        } catch (err) {
+          console.warn("[TTS] speechSynthesis.speak threw:", err);
+          finish();
+        }
+        setTimeout(() => {
+          clearInterval(fallback);
+          resolve();
+        }, Math.max(10000, text.length * 90));
       }
     });
   }
 
-  // ─── Initial prompt: empty hello to elicit the first interviewer question ───
   async function ask(id: string, hello: string) {
     setAiState("thinking");
     try {
@@ -711,9 +897,42 @@ function LiveInterviewPage() {
   function endInterview() {
     stopRecording();
     stopMic();
-    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
+    silenceTTS();
     setPhase("ended");
     toast.success("Interview ended.");
+  }
+
+  // Manual "advance" — candidate-controlled escape hatch. Bypasses the
+  // strict "wait for is_finished" rule when the candidate is satisfied
+  // with the voice round or a tester wants to verify the IDE phase
+  // without waiting out the engine's full stage budget. Camera stays on
+  // for anti-cheat; only the mic recorder + TTS stop.
+  async function endVoiceRoundAndProceed() {
+    stopRecording();
+    silenceTTS();
+    if (hasCodingRound) {
+      if (sessionId) {
+        fetch(`${getApiBase()}/api/session/${sessionId}/coding-problem`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data: { problems?: CodingProblem[] } | null) => {
+            const list = (data?.problems ?? []).filter((p) => p && p.title && p.prompt);
+            if (list.length > 0) {
+              setCodingProblems(list);
+              setCodingIdx(0);
+            }
+          })
+          .catch(() => undefined);
+      }
+      setPhase("coding");
+      toast.message("Moving to the coding round.");
+    } else {
+      stopMic();
+      if (sessionId) {
+        fetch(`${getApiBase()}/api/session/${sessionId}/report`).catch(() => undefined);
+      }
+      setPhase("ended");
+      toast.message("Voice round complete.");
+    }
   }
 
   // ─── Phases ───
@@ -728,15 +947,68 @@ function LiveInterviewPage() {
     );
   }
 
+  if (phase === "flagged") {
+    return (
+      <div className="mx-auto flex min-h-screen max-w-md flex-col items-center justify-center gap-4 px-6 text-center">
+        <ShieldAlert className="size-12 text-[var(--danger)]" />
+        <h1 className="text-xl font-semibold">Interview flagged</h1>
+        <p className="text-sm text-muted-foreground">
+          We detected {ANTICHEAT_MAX_WARNINGS} or more potential integrity
+          violations during your session (tab switches, pasting, camera off,
+          or excessive movement). The interview has ended and the hiring
+          team will receive the recording for review.
+        </p>
+        <Button variant="outline" onClick={() => router.push("/jobs")}>
+          Back to jobs
+        </Button>
+      </div>
+    );
+  }
+
   if (phase === "ended") {
     return (
       <InterviewReport
         sessionId={sessionId}
-        elapsedSec={elapsed}
+        // Report card shows TOTAL time across both rounds so a recruiter
+        // can see end-to-end duration. Voice and coding budgets are
+        // tracked independently mid-session but combined for reporting.
+        elapsedSec={elapsed + codingElapsedSec}
         turnCount={turnCount}
         candidateAnswers={transcript.filter((t) => t.role === "candidate").length}
         interviewerName={interviewerName}
-        onBackToDashboard={() => router.push("/dashboard/")}
+        onBackToDashboard={() => router.push("/jobs")}
+      />
+    );
+  }
+
+  if (phase === "coding") {
+    return (
+      <CodingRound
+        problem={
+          (codingProblems ?? [getCodingProblem(roleFamily)])[
+            Math.min(codingIdx, (codingProblems ?? [1]).length - 1)
+          ] ?? getCodingProblem(roleFamily)
+        }
+        problemIndex={codingIdx}
+        problemTotal={(codingProblems ?? []).length || 1}
+        code={code}
+        onCodeChange={setCode}
+        language={language}
+        onLanguageChange={(l) => {
+          setLanguage(l);
+          // Only overwrite if the candidate hasn't touched it.
+          if (code === STARTER_CODE[language]) setCode(STARTER_CODE[l]);
+        }}
+        onSubmit={submitCode}
+        submitting={submitting}
+        videoRefCallback={setVideoEl}
+        cameraOn={cameraOn}
+        candidateName={candidateName}
+        anticheatWarnings={anticheat.warnings}
+        // Coding round uses ITS OWN timer, completely separate from the
+        // 22-min voice budget. Candidate gets 30 min for the IDE round.
+        elapsed={codingElapsedSec}
+        targetMinutes={CODING_BUDGET_MIN}
       />
     );
   }
@@ -772,6 +1044,15 @@ function LiveInterviewPage() {
           <Badge variant="outline" className="tabular">
             Turn {turnCount}
           </Badge>
+          {anticheat.warnings > 0 && (
+            <Badge
+              variant={anticheat.warnings >= 2 ? "danger" : "warning"}
+              className="tabular"
+            >
+              <ShieldAlert className="mr-1 size-3" />
+              {anticheat.warnings}/{ANTICHEAT_MAX_WARNINGS}
+            </Badge>
+          )}
           {lastScore != null && (
             <Badge variant="primary" className="tabular">
               Last: {lastScore.toFixed(1)}
@@ -780,62 +1061,16 @@ function LiveInterviewPage() {
         </div>
       </header>
 
-      {/* Main */}
-      <div
-        className={cn(
-          "grid flex-1 grid-cols-1 overflow-hidden",
-          // No code editor: 50/50 — audio on the left, BIG camera on the right.
-          // Code editor showing: shrink audio col, give code 1.4fr; camera
-          // demotes to a corner tile inside the audio column.
-          showCodePanel
-            ? "md:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]"
-            : "md:grid-cols-2",
-        )}
-      >
+      {/* Main: 50/50 — audio on the left, big camera on the right. No IDE
+          interruption mid-interview anymore. */}
+      <div className="grid flex-1 grid-cols-1 overflow-hidden md:grid-cols-2">
         <div className="relative flex flex-col items-center justify-center gap-6 border-b border-border p-6 md:border-b-0 md:border-r">
-          {/* Corner camera tile — ONLY when code editor is showing. Uses
-              the same setVideoEl callback ref as the big panel below, so
-              the stream attaches whichever element is currently mounted. */}
-          {showCodePanel && (
-            <div className="absolute right-4 top-4 z-10 h-[140px] w-[200px] overflow-hidden rounded-lg border-2 border-border bg-black shadow-lg md:h-[180px] md:w-[260px]">
-              <video
-                ref={setVideoEl}
-                autoPlay
-                playsInline
-                muted
-                className={cn(
-                  "h-full w-full object-cover [transform:scaleX(-1)]",
-                  !cameraOn && "invisible",
-                )}
-              />
-              {!cameraOn && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 px-2 text-center">
-                  <VideoOff className="size-5 text-muted-foreground" />
-                  <div className="text-[11px] font-medium text-muted-foreground">
-                    Camera off
-                  </div>
-                </div>
-              )}
-              <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
-                <span
-                  className={cn(
-                    "size-1.5 rounded-full",
-                    cameraOn
-                      ? "bg-[var(--danger)] animate-pulse"
-                      : "bg-muted-foreground",
-                  )}
-                />
-                You
-              </div>
-            </div>
-          )}
-
           <div className="text-center">
             <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              {labelFor(aiState, recording, paused)}
+              {labelFor(aiState, recording, paused, interviewerName)}
             </div>
             <div className="mt-1 text-sm text-muted-foreground">
-              {hintFor(aiState, recording, paused)}
+              {hintFor(aiState, recording, paused, interviewerName)}
             </div>
           </div>
 
@@ -884,72 +1119,43 @@ function LiveInterviewPage() {
           )}
         </div>
 
-        {showCodePanel ? (
-          <div className="flex flex-col overflow-hidden">
-            <div className="border-b border-border px-5 py-4">
-              <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                Current question
+        <div className="relative hidden overflow-hidden bg-black md:block">
+          <video
+            ref={setVideoEl}
+            autoPlay
+            playsInline
+            muted
+            className={cn(
+              "absolute inset-0 h-full w-full object-cover [transform:scaleX(-1)]",
+              !cameraOn && "invisible",
+            )}
+          />
+          {!cameraOn && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+              <div className="rounded-full bg-card/40 p-5">
+                <VideoOff className="size-10 text-muted-foreground" />
               </div>
-              <div className="mt-1.5 text-sm leading-relaxed">
-                {currentQuestion}
+              <div className="text-sm font-medium text-muted-foreground">
+                Camera unavailable
+              </div>
+              <div className="max-w-xs text-xs text-muted-foreground/70 leading-relaxed">
+                Allow camera access in the browser permission prompt.
+                (Requires HTTPS or localhost.)
               </div>
             </div>
-
-            <div className="flex-1 overflow-hidden p-3">
-              <CodeEditor
-                value={code}
-                onChange={setCode}
-                language={language}
-                onLanguageChange={(l) => {
-                  setLanguage(l);
-                  setCode(STARTER_CODE[l]);
-                }}
-              />
-            </div>
-          </div>
-        ) : (
-          /* BIG camera panel — the full right half of the screen when no
-             code editor is active. The <video> ref uses the same callback
-             as the corner tile, so the stream attaches to whichever element
-             is currently mounted. */
-          <div className="relative hidden overflow-hidden bg-black md:block">
-            <video
-              ref={setVideoEl}
-              autoPlay
-              playsInline
-              muted
+          )}
+          <div className="pointer-events-none absolute bottom-3 left-3 flex items-center gap-1.5 rounded-md bg-black/70 px-2 py-1 text-xs font-medium text-white">
+            <span
               className={cn(
-                "absolute inset-0 h-full w-full object-cover [transform:scaleX(-1)]",
-                !cameraOn && "invisible",
+                "size-1.5 rounded-full",
+                cameraOn
+                  ? "bg-[var(--danger)] animate-pulse"
+                  : "bg-muted-foreground",
               )}
             />
-            {!cameraOn && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
-                <div className="rounded-full bg-card/40 p-5">
-                  <VideoOff className="size-10 text-muted-foreground" />
-                </div>
-                <div className="text-sm font-medium text-muted-foreground">
-                  Camera unavailable
-                </div>
-                <div className="max-w-xs text-xs text-muted-foreground/70 leading-relaxed">
-                  Allow camera access in the browser permission prompt, or
-                  continue in audio-only mode. (Requires HTTPS or localhost.)
-                </div>
-              </div>
-            )}
-            <div className="pointer-events-none absolute bottom-3 left-3 flex items-center gap-1.5 rounded-md bg-black/70 px-2 py-1 text-xs font-medium text-white">
-              <span
-                className={cn(
-                  "size-1.5 rounded-full",
-                  cameraOn
-                    ? "bg-[var(--danger)] animate-pulse"
-                    : "bg-muted-foreground",
-                )}
-              />
-              {candidateName || "You"}
-            </div>
+            {candidateName || "You"}
           </div>
-        )}
+        </div>
       </div>
 
       {/* Bottom controls */}
@@ -974,9 +1180,7 @@ function LiveInterviewPage() {
 
         <div className="mx-auto flex items-center gap-2">
           <Button
-            variant={
-              recording ? "danger" : muted ? "danger" : "default"
-            }
+            variant={recording ? "danger" : muted ? "danger" : "default"}
             size="icon"
             onClick={onMicButton}
             disabled={submitting}
@@ -985,12 +1189,7 @@ function LiveInterviewPage() {
             {muted ? (
               <MicOff className="size-4" />
             ) : (
-              <Mic
-                className={cn(
-                  "size-4",
-                  recording && "animate-pulse",
-                )}
-              />
+              <Mic className={cn("size-4", recording && "animate-pulse")} />
             )}
           </Button>
           <Button
@@ -1011,6 +1210,24 @@ function LiveInterviewPage() {
               </>
             )}
           </Button>
+          <Button
+            variant="outline"
+            onClick={endVoiceRoundAndProceed}
+            className="gap-1.5"
+            // Available only after the candidate has had at least a couple
+            // of turns — otherwise it's trivially gameable to skip the
+            // voice round entirely.
+            disabled={turnCount < 2}
+            title={
+              turnCount < 2
+                ? "Answer a couple of questions first"
+                : hasCodingRound
+                  ? "Move to the coding round"
+                  : "Finish the voice interview"
+            }
+          >
+            {hasCodingRound ? "Move to coding →" : "Finish interview →"}
+          </Button>
           <Button variant="danger" onClick={endInterview} className="gap-1.5">
             <PhoneOff className="size-4" />
             End interview
@@ -1026,27 +1243,219 @@ function LiveInterviewPage() {
   );
 }
 
-function labelFor(s: WaveState, recording: boolean, paused: boolean) {
+// ───────────────────────────────────────────────────────────────────────────
+// Coding round screen — shown ONCE after the voice rounds finish. The
+// candidate sees one role-matched problem and a Monaco editor with a Submit
+// button. We don't grade compilation; the engine evaluates the pseudocode
+// the same way it would evaluate a spoken answer.
+// ───────────────────────────────────────────────────────────────────────────
+
+interface CodingRoundProps {
+  problem: ReturnType<typeof getCodingProblem>;
+  code: string;
+  onCodeChange: (v: string) => void;
+  language: CodeLanguage;
+  onLanguageChange: (l: CodeLanguage) => void;
+  onSubmit: () => void;
+  submitting: boolean;
+  videoRefCallback: (el: HTMLVideoElement | null) => void;
+  cameraOn: boolean;
+  candidateName: string;
+  anticheatWarnings: number;
+  elapsed: number;
+  targetMinutes: number;
+  problemIndex: number;
+  problemTotal: number;
+}
+
+function CodingRound({
+  problem,
+  code,
+  onCodeChange,
+  language,
+  onLanguageChange,
+  onSubmit,
+  submitting,
+  videoRefCallback,
+  cameraOn,
+  candidateName,
+  anticheatWarnings,
+  elapsed,
+  targetMinutes,
+  problemIndex,
+  problemTotal,
+}: CodingRoundProps) {
+  return (
+    <div className="flex h-screen flex-col bg-background">
+      <header className="flex h-[60px] shrink-0 items-center gap-3 border-b border-border px-4 md:px-6">
+        <div className="flex size-7 items-center justify-center rounded-md bg-[var(--primary)] text-white">
+          <Sparkles className="size-3.5" />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold leading-tight">
+            Coding round · {BRAND_NAME}
+          </div>
+          <div className="text-[11px] text-muted-foreground tabular">
+            {problemTotal > 1
+              ? `Pseudocode · ${problemTotal} problems · ${language}`
+              : `Pseudocode submission · ${language}`}
+            <span className="ml-2 rounded bg-[var(--primary)]/10 px-1.5 py-0.5 text-[10px] font-medium text-[var(--primary)]">
+              separate {targetMinutes}-min budget
+            </span>
+          </div>
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-3 text-xs">
+          <span
+            className={cn(
+              "tabular",
+              // Last 5 min: warn. Last 1 min: red + pulse.
+              elapsed >= targetMinutes * 60 - 60
+                ? "text-[var(--danger)] animate-pulse"
+                : elapsed >= targetMinutes * 60 - 300
+                  ? "text-[var(--warning)]"
+                  : "text-muted-foreground",
+            )}
+          >
+            <Clock className="mr-1 inline size-3" />
+            {formatDuration(elapsed * 1000)} / {targetMinutes}m
+          </span>
+          {anticheatWarnings > 0 && (
+            <Badge
+              variant={anticheatWarnings >= 2 ? "danger" : "warning"}
+              className="tabular"
+            >
+              <ShieldAlert className="mr-1 size-3" />
+              {anticheatWarnings}/{ANTICHEAT_MAX_WARNINGS}
+            </Badge>
+          )}
+        </div>
+      </header>
+
+      <div className="grid flex-1 grid-cols-1 overflow-hidden md:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+        <div className="overflow-y-auto border-b border-border p-5 md:border-b-0 md:border-r">
+          <Card>
+            <div className="space-y-3 p-5">
+              <div className="flex items-center gap-2">
+                <Badge variant="outline" className="w-fit">
+                  Final round · Coding
+                </Badge>
+                {problemTotal > 1 && (
+                  <Badge variant="primary" className="w-fit tabular">
+                    Problem {problemIndex + 1} of {problemTotal}
+                  </Badge>
+                )}
+              </div>
+              <h2 className="text-lg font-semibold tracking-tight">
+                {problem.title}
+              </h2>
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                {problem.prompt}
+              </p>
+              {problem.examples && problem.examples.length > 0 && (
+                <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3 text-xs">
+                  <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Example test cases
+                  </div>
+                  {problem.examples.map((ex, i) => (
+                    <div key={i} className="leading-relaxed tabular">
+                      <span className="text-muted-foreground">Input:</span>{" "}
+                      {ex.input}
+                      <br />
+                      <span className="text-muted-foreground">Output:</span>{" "}
+                      {ex.output}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {problem.hint && (
+                <div className="text-[11px] italic text-muted-foreground">
+                  Hint: {problem.hint}
+                </div>
+              )}
+              <div className="rounded-md border border-[var(--primary)]/30 bg-[var(--primary)]/5 px-3 py-2 text-[11px] text-foreground">
+                Write PSEUDOCODE — focus on the algorithm, data structures, and
+                edge cases. We don&apos;t compile your submission. Aim for ~15
+                lines.
+                {problemTotal > 1 && (
+                  <>
+                    {" "}You&apos;ll get {problemTotal} problems total — submit
+                    each one, then the report is generated.
+                  </>
+                )}
+              </div>
+            </div>
+          </Card>
+
+          <div className="mt-4 overflow-hidden rounded-md border border-border bg-black">
+            <div className="relative aspect-video">
+              <video
+                ref={videoRefCallback}
+                autoPlay
+                playsInline
+                muted
+                className={cn(
+                  "absolute inset-0 h-full w-full object-cover [transform:scaleX(-1)]",
+                  !cameraOn && "invisible",
+                )}
+              />
+              {!cameraOn && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-3 text-center">
+                  <VideoOff className="size-6 text-muted-foreground" />
+                  <div className="text-xs font-medium text-muted-foreground">
+                    Camera off
+                  </div>
+                </div>
+              )}
+              <div className="pointer-events-none absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    cameraOn
+                      ? "bg-[var(--danger)] animate-pulse"
+                      : "bg-muted-foreground",
+                  )}
+                />
+                {candidateName || "You"}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col overflow-hidden p-3">
+          <CodeEditor
+            value={code}
+            onChange={onCodeChange}
+            language={language}
+            onLanguageChange={onLanguageChange}
+            onSubmit={onSubmit}
+            submitting={submitting}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function labelFor(s: WaveState, recording: boolean, paused: boolean, name: string) {
   if (paused) return "Paused";
   if (recording) return "Listening";
   return s === "thinking"
-    ? "Sara is thinking"
+    ? `${name} is thinking`
     : s === "speaking"
-      ? "Sara is speaking"
+      ? `${name} is speaking`
       : "Ready";
 }
 
-function hintFor(s: WaveState, recording: boolean, paused: boolean) {
+function hintFor(s: WaveState, recording: boolean, paused: boolean, name: string) {
   if (paused) return "Take your time. The mic is off.";
   if (recording) return "I'm with you. Click the mic when you're done.";
-  if (s === "thinking") return "Sara is reading your answer…";
+  if (s === "thinking") return `${name} is reading your answer…`;
   if (s === "speaking") return "Listen carefully to the next question.";
   return "Click the mic to start speaking.";
 }
 
 const STAGE_ORDER = ["intro", "background", "core", "follow_up", "wrap_up"] as const;
 function StageProgress({ stage }: { stage: string }) {
-  // Treat the legacy "technical" wire value as core for progress purposes.
   const norm = stage === "technical" ? "core" : stage;
   const idx = STAGE_ORDER.indexOf(norm as typeof STAGE_ORDER[number]);
   return (

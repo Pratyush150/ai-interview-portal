@@ -6,6 +6,13 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { toast } from "sonner";
 import { useAuth } from "@/stores/auth-store";
 import { cn } from "@/lib/utils";
@@ -72,6 +79,7 @@ export default function ReportsPage() {
 
   const [rows, setRows] = React.useState<SessionRow[] | null>(null);
   const [filter, setFilter] = React.useState("");
+  const [roleFamily, setRoleFamily] = React.useState<string>("__all__");
   const [active, setActive] = React.useState<string | null>(null);
   const [detail, setDetail] = React.useState<ReportDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = React.useState(false);
@@ -115,17 +123,64 @@ export default function ReportsPage() {
     }
   }
 
+  // The list of role families present in the current data — drives the
+  // filter dropdown so recruiters don't see options that have no rows.
+  const availableRoles = React.useMemo(() => {
+    if (!rows) return [];
+    const set = new Set<string>();
+    for (const r of rows) {
+      if (r.role_family) set.add(r.role_family);
+    }
+    return Array.from(set).sort();
+  }, [rows]);
+
   const filtered = React.useMemo(() => {
     if (!rows) return [];
     const f = filter.trim().toLowerCase();
-    if (!f) return rows;
-    return rows.filter(
-      (r) =>
+    return rows.filter((r) => {
+      if (roleFamily !== "__all__" && r.role_family !== roleFamily) return false;
+      if (!f) return true;
+      return (
         (r.candidate_name ?? "").toLowerCase().includes(f) ||
         (r.candidate_email ?? "").toLowerCase().includes(f) ||
-        (r.job_title ?? "").toLowerCase().includes(f),
-    );
-  }, [rows, filter]);
+        (r.job_title ?? "").toLowerCase().includes(f)
+      );
+    });
+  }, [rows, filter, roleFamily]);
+
+  // Per-role aggregate (count, avg score, % passed apti) — surfaces a
+  // role-wise dashboard at the top of /reports.
+  const roleAggregates = React.useMemo(() => {
+    if (!rows) return [];
+    const acc = new Map<
+      string,
+      { count: number; scoreSum: number; scoreN: number; aptiPassed: number; aptiTotal: number }
+    >();
+    for (const r of rows) {
+      const key = r.role_family ?? "(unspecified)";
+      const cur = acc.get(key) ?? {
+        count: 0, scoreSum: 0, scoreN: 0, aptiPassed: 0, aptiTotal: 0,
+      };
+      cur.count += 1;
+      if (r.total_score !== null) {
+        cur.scoreSum += r.total_score;
+        cur.scoreN += 1;
+      }
+      if (r.aptitude_status) {
+        cur.aptiTotal += 1;
+        if (r.aptitude_status === "passed") cur.aptiPassed += 1;
+      }
+      acc.set(key, cur);
+    }
+    return Array.from(acc.entries())
+      .map(([rf, v]) => ({
+        role_family: rf,
+        count: v.count,
+        avg_score: v.scoreN > 0 ? v.scoreSum / v.scoreN : null,
+        apti_pass_rate: v.aptiTotal > 0 ? v.aptiPassed / v.aptiTotal : null,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [rows]);
 
   return (
     <div className="space-y-6">
@@ -142,12 +197,80 @@ export default function ReportsPage() {
         </Button>
       </div>
 
-      <Input
-        placeholder="Filter by name, email, or role…"
-        value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-        className="max-w-md"
-      />
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          placeholder="Filter by name, email, or role…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="max-w-md"
+        />
+        <Select value={roleFamily} onValueChange={setRoleFamily}>
+          <SelectTrigger className="h-9 w-[220px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">All role families</SelectItem>
+            {availableRoles.map((rf) => (
+              <SelectItem key={rf} value={rf}>
+                {rf.replace(/_/g, " ")}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {(roleFamily !== "__all__" || filter) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setRoleFamily("__all__");
+              setFilter("");
+            }}
+          >
+            Clear
+          </Button>
+        )}
+      </div>
+
+      {/* Per-role aggregate strip — count + avg score + apti pass rate. */}
+      {roleAggregates.length > 0 && (
+        <Card>
+          <CardContent className="space-y-2 p-4">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              By role family
+            </div>
+            <div className="grid gap-2 md:grid-cols-3 lg:grid-cols-4">
+              {roleAggregates.map((a) => (
+                <button
+                  key={a.role_family}
+                  type="button"
+                  onClick={() =>
+                    setRoleFamily(
+                      a.role_family === "(unspecified)" ? "__all__" : a.role_family,
+                    )
+                  }
+                  className={cn(
+                    "rounded-md border border-border bg-card/60 px-3 py-2 text-left transition-colors hover:bg-accent/40",
+                    roleFamily === a.role_family && "ring-2 ring-[var(--primary)]",
+                  )}
+                >
+                  <div className="truncate text-xs font-medium capitalize">
+                    {a.role_family.replace(/_/g, " ")}
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-3 text-[11px] text-muted-foreground tabular">
+                    <span>{a.count} interview{a.count === 1 ? "" : "s"}</span>
+                    {a.avg_score !== null && (
+                      <span>avg {a.avg_score.toFixed(1)}/10</span>
+                    )}
+                    {a.apti_pass_rate !== null && (
+                      <span>apti {(a.apti_pass_rate * 100).toFixed(0)}%</span>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {rows === null ? (
         <Card>

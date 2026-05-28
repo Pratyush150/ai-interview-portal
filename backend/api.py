@@ -51,8 +51,16 @@ from backend.stt.deepgram_stt import transcribe_file, STTTimeout
 from backend.stt.deepgram_streaming import StreamingTranscriber
 from backend.database import (
     init_db, get_db, hash_password, verify_password, slugify, unique_slug,
-    log_event, audit,
+    log_event, audit, ensure_aptitude_bank, ensure_coding_bank,
 )
+
+
+def _ensure_aptitude_bank(db, company_id: str) -> None:
+    """Thin wrapper so the existing db connection is reused (avoids opening
+    a second sqlite handle while one is still mid-transaction)."""
+    if company_id:
+        ensure_aptitude_bank(db, company_id)
+        ensure_coding_bank(db, company_id)
 from backend.resume_parser import extract_text_from_pdf, analyze_resume
 from backend.email_service import (
     send_interview_invite, send_lead_notification, send_owner_setup_email,
@@ -215,6 +223,11 @@ class SessionResponse(BaseModel):
     interviewer_name: str = "Sara"
     role_family: str = "backend_engineering"
     seniority: str = "mid"
+    # Whether the role gets a coding round after the voice interview. The
+    # frontend uses this to decide whether to transition into the IDE phase
+    # after wrap_up — non-engineering roles (PM, Sales, HR, etc.) go
+    # straight to the report screen.
+    has_coding_round: bool = True
 
 class TextTurnRequest(BaseModel):
     text: str
@@ -501,6 +514,7 @@ def create_session(req: SessionCreate):
         interviewer_name=status["interviewer_name"],
         role_family=status["role_family"],
         seniority=status["seniority"],
+        has_coding_round=status["has_coding_round"],
     )
 
 
@@ -526,6 +540,7 @@ def get_session(session_id: str):
         interviewer_name=status["interviewer_name"],
         role_family=status["role_family"],
         seniority=status["seniority"],
+        has_coding_round=status["has_coding_round"],
     )
 
 
@@ -544,17 +559,47 @@ async def get_report(session_id: str):
     report = await asyncio.to_thread(synthesize_report, session)
     session.cached_report = report
 
-    # Persist for analytics + so a recruiter view can read it later.
+    # Persist EVERY column the recruiter dashboard reads — without this, the
+    # candidate's score never makes it out of in-memory and the recruiter
+    # sees "Not yet scored" forever. We write:
+    #   - report_json    : full synthesized report (cheat-analysis tab)
+    #   - total_score    : avg_score from session.get_status()
+    #   - cheating_flags : the in-memory list batched from /cheating-report
+    #   - status         : 'finished' so the dashboard finished-count moves
+    #   - finished_at    : completion timestamp
+    # We also bump applications.status='finished' so the kanban shows the
+    # candidate in the correct column.
     try:
+        status = session.get_status()
+        avg = status.get("avg_score")
         db = get_db()
         db.execute(
-            "UPDATE interview_sessions SET report_json=? WHERE id=?",
-            (json.dumps(report), session_id),
+            "UPDATE interview_sessions "
+            "SET report_json=?, total_score=?, cheating_flags=?, status='finished', "
+            "    finished_at=CURRENT_TIMESTAMP "
+            "WHERE id=?",
+            (
+                json.dumps(report),
+                float(avg) if avg is not None else None,
+                json.dumps(session.cheating_flags),
+                session_id,
+            ),
+        )
+        # Move the linked application to 'finished' so the recruiter pipeline
+        # advances. We only move from in_progress — never overwrite a manual
+        # rejection or hire decision the recruiter already made.
+        db.execute(
+            "UPDATE applications SET status='finished' "
+            "WHERE session_id=? AND status='in_progress'",
+            (session_id,),
         )
         db.commit()
         db.close()
-    except Exception:
-        pass
+        log_event("interview_finished", session_id=session_id)
+    except Exception as e:
+        # Don't fail the candidate's view just because the write failed —
+        # but DO log it so we notice in the server log.
+        print(f"[REPORT] Persist failed for {session_id}: {e}")
 
     return _report_envelope(session, report)
 
@@ -718,6 +763,19 @@ def report_cheating(session_id: str, report: CheatingReport):
         raise HTTPException(404, "Session not found")
     for v in report.violations:
         session.add_cheating_flag(v)
+    # Mirror to the DB so the recruiter's cheat-analysis tab populates in
+    # real time AND violations survive a server restart. We rewrite the
+    # whole JSON blob each batch — the column is small and a single row.
+    try:
+        db = get_db()
+        db.execute(
+            "UPDATE interview_sessions SET cheating_flags=? WHERE id=?",
+            (json.dumps(session.cheating_flags), session_id),
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[CHEAT] Persist failed for {session_id}: {e}")
     return {"status": "recorded", "total_flags": len(session.cheating_flags)}
 
 
@@ -770,7 +828,7 @@ def _load_application_by_invite(invite_token: str) -> dict:
         "SELECT a.id AS application_id, a.candidate_id, a.job_id, "
         "       a.aptitude_status, a.aptitude_score, a.aptitude_started_at, "
         "       a.aptitude_completed_at, a.invite_expires_at, a.invite_revoked_at, "
-        "       j.company_id, j.title AS job_title, "
+        "       j.company_id, j.title AS job_title, j.role_family, j.seniority, "
         "       j.aptitude_required, j.aptitude_pass_score, j.aptitude_total, "
         "       j.aptitude_duration_min, "
         "       c.name AS candidate_name "
@@ -802,12 +860,47 @@ def aptitude_get(invite_token: str):
     snooping candidate can't read it out of the network panel."""
     app_row = _load_application_by_invite(invite_token)
     db = get_db()
+    # Self-heal: an application can be stuck at 'skipped' if it was created
+    # before the aptitude gate existed (one-shot backfill) OR if it's a
+    # returning candidate hitting the duplicate-application path which
+    # hands back an old invite token. If the job actually REQUIRES
+    # aptitude, reset the status to 'pending' so the candidate sees the
+    # test now instead of silently bypassing.
+    if (
+        app_row["aptitude_status"] == "skipped"
+        and bool(app_row["aptitude_required"])
+    ):
+        db.execute(
+            "UPDATE applications SET aptitude_status='pending' WHERE id=?",
+            (app_row["application_id"],),
+        )
+        db.commit()
+        app_row = dict(app_row)
+        app_row["aptitude_status"] = "pending"
+    total_q = int(app_row["aptitude_total"] or 10)
+    # Role-aware question selection: prefer questions tagged to this job's
+    # role_family, then fall back to general (role_family IS NULL) questions
+    # so a partially-curated bank still serves a full 10-question round.
+    role_fam = app_row["role_family"] or "general"
     qrows = db.execute(
-        "SELECT id, category, question_text, options_json, difficulty, position "
-        "FROM aptitude_questions WHERE company_id=? AND active=1 "
-        "ORDER BY position ASC, created_at ASC LIMIT ?",
-        (app_row["company_id"], int(app_row["aptitude_total"] or 10)),
+        "SELECT id, category, question_text, options_json, difficulty, position, role_family "
+        "FROM aptitude_questions "
+        "WHERE company_id=? AND active=1 "
+        "  AND (role_family=? OR role_family IS NULL OR role_family='') "
+        "ORDER BY CASE WHEN role_family=? THEN 0 ELSE 1 END, position ASC, created_at ASC "
+        "LIMIT ?",
+        (app_row["company_id"], role_fam, role_fam, total_q),
     ).fetchall()
+    # If the role-aware filter returned nothing (e.g. a company with zero
+    # tagged questions), fall back to the original company-wide query so
+    # the candidate isn't shown an empty test.
+    if not qrows:
+        qrows = db.execute(
+            "SELECT id, category, question_text, options_json, difficulty, position, role_family "
+            "FROM aptitude_questions WHERE company_id=? AND active=1 "
+            "ORDER BY position ASC, created_at ASC LIMIT ?",
+            (app_row["company_id"], total_q),
+        ).fetchall()
     questions = [
         {
             "id": r["id"],
@@ -906,12 +999,25 @@ def aptitude_submit(invite_token: str, payload: AptitudeSubmit):
     total = int(app_row["aptitude_total"] or 10)
 
     db = get_db()
+    # Grading honours the same role-aware ordering that we serve to the
+    # candidate — otherwise a candidate could see role-specific questions
+    # but be graded against the generic bank (or vice versa).
+    role_fam = app_row["role_family"] or "general"
     qrows = db.execute(
         "SELECT id, correct_index FROM aptitude_questions "
         "WHERE company_id=? AND active=1 "
-        "ORDER BY position ASC, created_at ASC LIMIT ?",
-        (app_row["company_id"], total),
+        "  AND (role_family=? OR role_family IS NULL OR role_family='') "
+        "ORDER BY CASE WHEN role_family=? THEN 0 ELSE 1 END, position ASC, created_at ASC "
+        "LIMIT ?",
+        (app_row["company_id"], role_fam, role_fam, total),
     ).fetchall()
+    if not qrows:
+        qrows = db.execute(
+            "SELECT id, correct_index FROM aptitude_questions "
+            "WHERE company_id=? AND active=1 "
+            "ORDER BY position ASC, created_at ASC LIMIT ?",
+            (app_row["company_id"], total),
+        ).fetchall()
 
     score = 0
     for r in qrows:
@@ -1083,6 +1189,203 @@ def aptitude_q_delete(slug: str, qid: str, request: Request):
     db.commit()
     db.close()
     return {"ok": True}
+
+
+# ─── Coding problems CRUD (recruiter dashboard) ───────────────────────
+#
+# The coding round at the end of the interview pulls its problem from this
+# table. One problem per (company, role_family) by default; recruiters can
+# add more or edit/disable them through the dashboard. Candidate-facing
+# endpoint is /api/session/{id}/coding-problem (further below).
+
+
+class CodingProblemIn(BaseModel):
+    role_family: str | None = None  # NULL means "generic / fallback"
+    title: str
+    prompt: str
+    hint: str = ""
+    examples: list[dict] = []  # [{"input": "...", "output": "..."}]
+    active: bool = True
+    position: int | None = None
+
+
+@app.get("/api/c/{slug}/coding-problems")
+def coding_q_list(slug: str, request: Request):
+    co = _verify_slug_auth(slug, request)
+    # Make sure the bank exists so first-time recruiters see the seed
+    # problems and can edit them, rather than an empty list.
+    db = get_db()
+    ensure_coding_bank(db, co["id"])
+    rows = db.execute(
+        "SELECT id, role_family, title, prompt, hint, examples_json, "
+        "       active, position, created_at "
+        "FROM coding_problems WHERE company_id=? "
+        "ORDER BY COALESCE(role_family, ''), position ASC, created_at ASC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [
+        {
+            "id": r["id"],
+            "role_family": r["role_family"],
+            "title": r["title"],
+            "prompt": r["prompt"],
+            "hint": r["hint"] or "",
+            "examples": json.loads(r["examples_json"] or "[]"),
+            "active": bool(r["active"]),
+            "position": r["position"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/c/{slug}/coding-problems")
+def coding_q_create(slug: str, q: CodingProblemIn, request: Request):
+    co = _verify_slug_auth(slug, request)
+    if not q.title.strip() or not q.prompt.strip():
+        raise HTTPException(400, "Title and prompt are required.")
+    if q.role_family is not None and q.role_family.strip() == "":
+        q.role_family = None
+    qid = uuid.uuid4().hex[:12]
+    db = get_db()
+    pos = q.position
+    if pos is None:
+        pos = (db.execute(
+            "SELECT COALESCE(MAX(position), -1) AS p FROM coding_problems WHERE company_id=?",
+            (co["id"],),
+        ).fetchone()["p"] or -1) + 1
+    db.execute(
+        "INSERT INTO coding_problems "
+        "(id, company_id, role_family, title, prompt, hint, examples_json, active, position) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            qid, co["id"], q.role_family, q.title.strip(), q.prompt.strip(),
+            q.hint.strip(), json.dumps(q.examples or []),
+            1 if q.active else 0, pos,
+        ),
+    )
+    db.commit()
+    db.close()
+    return {"id": qid, "ok": True}
+
+
+@app.patch("/api/c/{slug}/coding-problems/{qid}")
+def coding_q_update(slug: str, qid: str, q: CodingProblemIn, request: Request):
+    co = _verify_slug_auth(slug, request)
+    if not q.title.strip() or not q.prompt.strip():
+        raise HTTPException(400, "Title and prompt are required.")
+    if q.role_family is not None and q.role_family.strip() == "":
+        q.role_family = None
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM coding_problems WHERE id=? AND company_id=?",
+        (qid, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Problem not found")
+    db.execute(
+        "UPDATE coding_problems SET role_family=?, title=?, prompt=?, hint=?, "
+        "examples_json=?, active=?, position=COALESCE(?, position) WHERE id=?",
+        (
+            q.role_family, q.title.strip(), q.prompt.strip(), q.hint.strip(),
+            json.dumps(q.examples or []), 1 if q.active else 0, q.position, qid,
+        ),
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.delete("/api/c/{slug}/coding-problems/{qid}")
+def coding_q_delete(slug: str, qid: str, request: Request):
+    """Soft delete — preserves history if the problem was already served."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM coding_problems WHERE id=? AND company_id=?",
+        (qid, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Problem not found")
+    db.execute("UPDATE coding_problems SET active=0 WHERE id=?", (qid,))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+# ─── Candidate-facing: fetch the coding problem for an active session ───
+
+
+@app.get("/api/session/{session_id}/coding-problem")
+def get_session_coding_problem(session_id: str):
+    """Return the LIST of problems the candidate should solve in the IDE
+    round (typically 2 for engineering roles). Resolution order:
+      1. All active problems tagged with the session's role_family
+      2. If none, generic (role_family IS NULL) problems
+      3. Hard-coded last-resort so the round never blanks
+
+    Response shape: {"problems": [{title, prompt, hint, examples}, ...]}
+    """
+    session = sessions.get(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    company_id = getattr(session, "_company_id", None)
+    role_fam = session.role_family
+    db = get_db()
+    if not company_id:
+        row = db.execute(
+            "SELECT company_id FROM interview_sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        company_id = row["company_id"] if row else None
+
+    rows: list = []
+    if company_id:
+        rows = db.execute(
+            "SELECT * FROM coding_problems "
+            "WHERE company_id=? AND active=1 AND role_family=? "
+            "ORDER BY position ASC, created_at ASC",
+            (company_id, role_fam),
+        ).fetchall()
+        if not rows:
+            rows = db.execute(
+                "SELECT * FROM coding_problems "
+                "WHERE company_id=? AND active=1 "
+                "  AND (role_family IS NULL OR role_family='') "
+                "ORDER BY position ASC, created_at ASC",
+                (company_id,),
+            ).fetchall()
+    db.close()
+
+    if rows:
+        problems = [
+            {
+                "title": r["title"],
+                "prompt": r["prompt"],
+                "hint": r["hint"] or "",
+                "examples": json.loads(r["examples_json"] or "[]"),
+            }
+            for r in rows
+        ]
+        return {"problems": problems}
+
+    # Last-resort hard-coded so the round never blanks.
+    return {
+        "problems": [
+            {
+                "title": "Top-K most-frequent words",
+                "prompt": (
+                    "Given a list of strings, return the K most-frequently occurring "
+                    "strings (ties broken alphabetically). Outline the approach in "
+                    "pseudocode — focus on data structures, complexity, and edge cases."
+                ),
+                "hint": "Hash map for counts + a heap of size K is enough.",
+                "examples": [],
+            }
+        ]
+    }
 
 
 # ─── Recruiter view: all interview sessions + their reports ────────────
@@ -1444,8 +1747,8 @@ def create_job(company_id: str, req: JobCreate, request: Request):
         INSERT INTO jobs
           (id, company_id, title, description, required_skills,
            role_family, seniority, min_experience_years, max_experience_years,
-           department, employment_type)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+           department, employment_type, aptitude_required)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,1)
         """,
         (
             jid, company_id, req.title, req.description, req.required_skills,
@@ -1454,6 +1757,8 @@ def create_job(company_id: str, req: JobCreate, request: Request):
             req.department, req.employment_type,
         ),
     )
+    # Guarantee the company has an aptitude bank so the new gate isn't empty.
+    _ensure_aptitude_bank(db, company_id)
     db.commit()
     db.close()
     return {"job_id": jid, "title": req.title}
@@ -1559,10 +1864,33 @@ async def apply_to_job(
         candidate_id = cand["id"]
         # Refuse a duplicate application from the same candidate to the same job.
         dup = db.execute(
-            "SELECT id, invite_token FROM applications WHERE candidate_id=? AND job_id=?",
+            "SELECT id, invite_token, aptitude_status FROM applications "
+            "WHERE candidate_id=? AND job_id=?",
             (candidate_id, job_id),
         ).fetchone()
         if dup:
+            # Treat every re-apply as a fresh start so the candidate always
+            # walks the canonical three-stage flow: aptitude → interview →
+            # coding. Previously, a candidate who'd cleared aptitude once
+            # would silently skip it on re-apply because aptitude_status was
+            # still 'passed'. Historical attempt records remain in
+            # `aptitude_attempts` for audit; only the gate state resets.
+            if bool(job["aptitude_required"]) and dup["aptitude_status"] != "in_progress":
+                db.execute(
+                    "UPDATE applications SET aptitude_status='pending', "
+                    "  aptitude_score=NULL, aptitude_started_at=NULL, "
+                    "  aptitude_completed_at=NULL "
+                    "WHERE id=?",
+                    (dup["id"],),
+                )
+                # Reset the previous session reference too so the next start
+                # creates a brand-new interview session (otherwise the old
+                # `report_json` would clobber the new attempt's score).
+                db.execute(
+                    "UPDATE applications SET session_id=NULL, status='invited' WHERE id=?",
+                    (dup["id"],),
+                )
+                db.commit()
             db.close()
             return {
                 "application_id": dup["id"],
@@ -1893,8 +2221,8 @@ def tenant_create_job(slug: str, req: JobCreate, request: Request):
         "INSERT INTO jobs "
         "(id, company_id, title, description, required_skills, "
         " role_family, seniority, min_experience_years, max_experience_years, "
-        " department, employment_type) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        " department, employment_type, aptitude_required) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
         (
             jid, co["id"], req.title, req.description, req.required_skills,
             req.role_family, req.seniority,
@@ -1902,6 +2230,10 @@ def tenant_create_job(slug: str, req: JobCreate, request: Request):
             req.department, req.employment_type,
         ),
     )
+    # Make sure the tenant has a question bank — newly-provisioned companies
+    # would otherwise have aptitude_required=1 with zero questions, which
+    # serves an empty test.
+    _ensure_aptitude_bank(db, co["id"])
     db.commit()
     db.close()
     log_event("job_created", company_id=co["id"], job_id=jid)

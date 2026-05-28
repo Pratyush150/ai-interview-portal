@@ -13,6 +13,8 @@ tests/audio/output_*.mp3
 tests/audio/reply*.mp3
 tests/audio/sessions/
 data/
+# Runtime marker written by run.py on every boot — not source.
+.build-version
 
 # Next.js frontend (web/) — keep source, ignore build artifacts
 web/node_modules/

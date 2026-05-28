@@ -14,6 +14,7 @@ import {
   Sparkles,
   ClipboardList,
   FileText,
+  Code2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -40,6 +41,7 @@ const NAV: NavItem[] = [
   { href: "/candidates", label: "Candidates", icon: Users },
   { href: "/reports", label: "Reports", icon: FileText },
   { href: "/aptitude-bank", label: "Aptitude bank", icon: ClipboardList },
+  { href: "/coding-bank", label: "Coding bank", icon: Code2 },
   {
     href: "/analytics",
     label: "Analytics",

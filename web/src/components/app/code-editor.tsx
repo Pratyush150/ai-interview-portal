@@ -9,6 +9,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
+import { Send } from "lucide-react";
 
 const Monaco = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
@@ -25,6 +27,7 @@ const LANGUAGES = [
   "typescript",
   "go",
   "java",
+  "c",
   "cpp",
   "rust",
   "sql",
@@ -37,13 +40,18 @@ interface Props {
   onChange: (v: string) => void;
   language: CodeLanguage;
   onLanguageChange: (l: CodeLanguage) => void;
+  onSubmit?: () => void;
+  submitting?: boolean;
 }
 
+// Monaco's mode id for "C" is just "c" — Monaco supports it out of the box.
 export function CodeEditor({
   value,
   onChange,
   language,
   onLanguageChange,
+  onSubmit,
+  submitting,
 }: Props) {
   const { resolvedTheme } = useTheme();
   return (
@@ -64,8 +72,23 @@ export function CodeEditor({
             ))}
           </SelectContent>
         </Select>
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Autocomplete disabled
+        <div className="flex items-center gap-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Pseudocode preferred · autocomplete off
+          </div>
+          {onSubmit && (
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={onSubmit}
+              disabled={submitting}
+              loading={submitting}
+              className="gap-1.5"
+            >
+              <Send className="size-3.5" />
+              Submit
+            </Button>
+          )}
         </div>
       </div>
       <div className="flex-1 overflow-hidden rounded-b-md">

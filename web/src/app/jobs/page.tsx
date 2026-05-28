@@ -12,6 +12,15 @@ import {
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { BRAND_NAME } from "@/lib/brand";
 import { Badge } from "@/components/ui/badge";
 import { fetchJobs, fetchRoleCatalog, type JobRow } from "@/lib/auth-api";
@@ -111,33 +120,43 @@ export default function JobsPage() {
         </p>
       </section>
 
-      {/* Filter bar */}
+      {/* Filter bar.
+          NB: Use Radix Select + our Input component here. The previous build
+          used native <select>/<input>, which renders an OS-painted white
+          dropdown panel that isn't themeable — that's the "search bar
+          appears white" / "roles invisible" report on /jobs. */}
       <section className="mx-auto max-w-6xl px-4 pb-4 md:px-8">
         <Card>
           <CardContent className="flex flex-wrap items-end gap-3 p-4">
-            <div className="min-w-[180px] flex-1">
-              <label className="text-xs font-medium" htmlFor="filter-role">
+            <div className="min-w-[200px] flex-1">
+              <Label htmlFor="filter-role" className="text-xs font-medium">
                 Role family
-              </label>
-              <select
-                id="filter-role"
-                value={filterRole}
-                onChange={(e) => setFilterRole(e.target.value)}
-                className="mt-1 flex h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              </Label>
+              {/* Radix passes a Select-internal sentinel ("__all__") instead
+                  of "" because Radix forbids empty string item values; we
+                  collapse that back to "" on change. */}
+              <Select
+                value={filterRole || "__all__"}
+                onValueChange={(v) => setFilterRole(v === "__all__" ? "" : v)}
               >
-                <option value="">All roles</option>
-                {roleFamilies.map((r) => (
-                  <option key={r.role_family} value={r.role_family}>
-                    {r.display_name}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger id="filter-role" className="mt-1 h-9">
+                  <SelectValue placeholder="All roles" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">All roles</SelectItem>
+                  {roleFamilies.map((r) => (
+                    <SelectItem key={r.role_family} value={r.role_family}>
+                      {r.display_name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <div className="min-w-[140px] flex-1">
-              <label className="text-xs font-medium" htmlFor="filter-exp">
+              <Label htmlFor="filter-exp" className="text-xs font-medium">
                 Your experience (yrs)
-              </label>
-              <input
+              </Label>
+              <Input
                 id="filter-exp"
                 type="number"
                 value={filterExp}
@@ -146,22 +165,22 @@ export default function JobsPage() {
                 min={0}
                 max={40}
                 step={0.5}
-                className="mt-1 flex h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="mt-1 h-9"
               />
             </div>
-            <div className="min-w-[180px] flex-1">
-              <label className="text-xs font-medium" htmlFor="filter-skill">
+            <div className="min-w-[200px] flex-1">
+              <Label htmlFor="filter-skill" className="text-xs font-medium">
                 Skill / keyword
-              </label>
+              </Label>
               <div className="relative mt-1">
-                <Search className="absolute left-2 top-2.5 size-3.5 text-muted-foreground" />
-                <input
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
                   id="filter-skill"
-                  type="text"
+                  type="search"
                   value={filterSkill}
                   onChange={(e) => setFilterSkill(e.target.value)}
                   placeholder="React, Postgres, ETABS…"
-                  className="flex h-9 w-full rounded-md border border-input bg-transparent pl-7 pr-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="h-9 pl-8"
                 />
               </div>
             </div>

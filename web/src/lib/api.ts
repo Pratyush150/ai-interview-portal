@@ -16,6 +16,12 @@ function apiBase(): string {
   return "";
 }
 
+// Re-export so feature modules (hooks, components) don't each have to
+// re-derive the base URL.
+export function getApiBase(): string {
+  return apiBase();
+}
+
 export interface SessionCreateBody {
   candidate_name?: string;
   resume_id?: string;
@@ -42,6 +48,10 @@ export interface SessionResponse {
   interviewer_name: string;
   role_family: string;
   seniority: string;
+  // True for engineering roles that get an IDE round after the voice
+  // interview, false for PM/Sales/HR/Marketing etc. — the frontend skips
+  // straight from wrap_up to the report screen when false.
+  has_coding_round: boolean;
 }
 
 export interface TurnResponse {

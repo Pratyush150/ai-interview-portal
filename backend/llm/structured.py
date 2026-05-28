@@ -58,6 +58,16 @@ Response schema:
 Rules:
 - "spoken_text" is what the candidate hears. Conversational, 1-3 sentences. Always acknowledge
   their previous point in a short clause before asking the next question.
+- DIFFICULTY CURVE: open each topic at BASIC level (definitions, idioms). Once the candidate
+  demonstrates competence on a topic, escalate within that SAME topic to intermediate, then
+  advanced. Never start a topic at advanced. Never drop back to a basic question on a topic
+  you have already cleared.
+- NO TOPIC HOPPING: stay with ONE topic until you've reached the candidate's ceiling. If their
+  last answer was weak, drill DEEPER on the same concept instead of jumping to an unrelated
+  subject. Switching topics every turn destroys signal and feels disjointed.
+- VOICE-ONLY: the candidate is SPEAKING. Do NOT ask them to write code aloud. Coding is
+  reserved for a dedicated round at the end (separate UI). If a problem needs code, ask them
+  to describe the APPROACH or PSEUDOCODE in words.
 - For intro/wrap-up stages, set all evaluation scores to null.
 - For 'weaknesses', prefer specific, probe-able items ("could not explain why they chose Postgres
   over Cassandra", "vague on retry semantics") so a future turn can return to them.
@@ -87,13 +97,24 @@ class InterviewResponse:
 
     @classmethod
     def from_json(cls, data: dict) -> InterviewResponse:
-        evaluation = data.get("evaluation", {})
-        meta = data.get("meta", {})
-        ai_det = data.get("ai_detection", {})
+        # The LLM is allowed to emit `evaluation: null` on the intro turn
+        # (no candidate answer yet to score). `data.get(k, {})` only falls
+        # back to the default if the KEY is absent — an explicit JSON null
+        # returns None and crashes downstream .get() calls. Coerce here.
+        evaluation = data.get("evaluation") or {}
+        meta = data.get("meta") or {}
+        ai_det = data.get("ai_detection") or {}
 
         dims = [evaluation.get(d) for d in ("correctness", "depth", "communication", "relevance")]
         valid_dims = [d for d in dims if d is not None]
         calculated_score = round(sum(valid_dims) / len(valid_dims), 1) if valid_dims else evaluation.get("score")
+
+        # Lists can also come back as null when the LLM has nothing to add
+        # for an intro turn. Normalize so callers can iterate safely.
+        strengths = evaluation.get("strengths") or []
+        weaknesses = evaluation.get("weaknesses") or []
+        human_indicators = ai_det.get("human_indicators") or []
+        ai_indicators = ai_det.get("ai_indicators") or []
 
         return cls(
             spoken_text=data.get("spoken_text", ""),
@@ -102,15 +123,15 @@ class InterviewResponse:
             depth=evaluation.get("depth"),
             communication=evaluation.get("communication"),
             relevance=evaluation.get("relevance"),
-            strengths=evaluation.get("strengths", []),
-            weaknesses=evaluation.get("weaknesses", []),
-            eval_notes=evaluation.get("notes", ""),
-            topic=meta.get("topic", ""),
-            difficulty=meta.get("difficulty", "medium"),
-            suggest_advance=meta.get("suggest_advance", False),
-            ai_likelihood=ai_det.get("ai_likelihood", 0.0),
-            human_indicators=ai_det.get("human_indicators", []),
-            ai_indicators=ai_det.get("ai_indicators", []),
+            strengths=strengths,
+            weaknesses=weaknesses,
+            eval_notes=evaluation.get("notes") or "",
+            topic=meta.get("topic") or "",
+            difficulty=meta.get("difficulty") or "medium",
+            suggest_advance=bool(meta.get("suggest_advance", False)),
+            ai_likelihood=float(ai_det.get("ai_likelihood") or 0.0),
+            human_indicators=human_indicators,
+            ai_indicators=ai_indicators,
             raw_json=data,
         )
 

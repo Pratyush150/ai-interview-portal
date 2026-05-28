@@ -23,8 +23,13 @@ export const metadata: Metadata = {
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
+  // Ship the static HTML with `dark` already on <html> so the very first
+  // paint uses the dark palette. Without this, CSS falls back to the
+  // light `:root` palette for the few hundred milliseconds before
+  // next-themes' client script runs — which is the white flash users
+  // were seeing in the search/role dropdowns.
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" className="dark" suppressHydrationWarning>
       <body className={`${geist.variable} ${geistMono.variable} antialiased`}>
         <Providers>
           {children}
