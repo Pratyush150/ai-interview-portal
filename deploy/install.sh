@@ -137,9 +137,13 @@ fi
 : "${DEEPGRAM_API_KEY:?DEEPGRAM_API_KEY missing in $ETC_DIR/.env}"
 
 # ── 5. Build the Next.js static export ──────────────────────────────────────
-echo "==> Building the Next.js static export (one-time, ~3 min)"
+echo "==> Building the Next.js static export (one-time, ~5 min on ARM)"
 cd "$REPO_DIR/web"
-sudo -u "$USER_NAME" bash -c "npm ci --no-audit --no-fund && npm run build"
+# `npm install` (not `npm ci`) so we reconcile any drift between
+# package.json and package-lock.json — the strict ci command refuses
+# when they're out of sync, and our checked-in lock file occasionally
+# lags additions like monaco-editor / dompurify / marked.
+sudo -u "$USER_NAME" bash -c "npm install --no-audit --no-fund && npm run build"
 cd "$REPO_DIR"
 
 # ── 6. Data directory: move the SQLite file off the repo path ──────────────
