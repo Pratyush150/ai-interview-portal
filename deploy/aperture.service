@@ -1,0 +1,35 @@
+[Unit]
+# Aperture AI Interview Portal — FastAPI/uvicorn worker
+#
+# Production-mode boot: no --reload (uvicorn workers are independent),
+# multiple workers for concurrency, env loaded from /etc/aperture/.env,
+# SQLite + audio files written under /var/lib/aperture.
+#
+# Install path is templated; deploy/install.sh substitutes the markers.
+Description=Aperture AI Interview Portal
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__REPO_DIR__
+EnvironmentFile=__ENV_FILE__
+# uvicorn from the venv. 4 workers fits comfortably on an 8 GB VM and
+# saturates a single TCP listener via the standard SO_REUSEPORT dance.
+# Bound to localhost — nginx is the only thing that talks to us.
+ExecStart=__VENV_DIR__/bin/uvicorn backend.api:app \
+  --host 127.0.0.1 --port 8000 \
+  --workers 4 \
+  --proxy-headers --forwarded-allow-ips=127.0.0.1 \
+  --no-access-log
+Restart=always
+RestartSec=3
+# uvicorn writes interim TTS files to a tmp dir under repo root — give
+# the service write perms there (the systemd unit owns the repo).
+ReadWritePaths=__REPO_DIR__ /var/lib/aperture
+# Reasonable resource cap for a single 8 GB instance.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
