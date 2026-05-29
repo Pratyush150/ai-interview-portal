@@ -1,34 +1,49 @@
-# AI Interview Portal full
+# ApertureAI — AI Interview Portal
 
 An end-to-end, voice-first AI interviewer that adapts to the **role and
 seniority** of the job posting. A candidate uploads a resume, gets matched to
-a job, and sits through a staged interview with a role-specific persona — a
-staff SRE for a senior infra job, a consulting partner for an MBA case, a
+a job, and sits through a three-round interview with a role-specific persona —
+a staff SRE for a senior infra job, a consulting partner for an MBA case, a
 mechanical design lead for a hardware role. Audio in, audio out, a 3D
 animated avatar with lip-sync, realtime scoring, AI-answer detection, and a
 browser-side anti-cheat layer that watches the camera, the keyboard, and the
 tab.
 
+**Three rounds, gated in order:**
+
+1. **Aptitude** — 10-question / 10-minute MCQ gate, role-specific question
+   pack (3 role-tagged + 7 general). Pass score required to unlock the voice
+   round.
+2. **Voice interview** — staged conversation (intro → background → core →
+   follow-up → wrap-up) on a 22-minute clock, driven by an LLM that has
+   pre-read the resume against the JD.
+3. **Coding round** *(engineering roles only)* — Monaco-based IDE with 2
+   problems per role from an editable per-tenant bank, separate 30-minute
+   timer. Non-engineering roles (PM, Sales, Marketing, HR, Consulting, Ops,
+   UX, etc.) skip this round.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         AI INTERVIEW PORTAL                               │
+│                              APERTUREAI                                   │
 │                                                                           │
-│  Browser (vanilla JS + three.js)                FastAPI backend           │
+│  Browser (Next.js + three.js + Monaco)          FastAPI backend           │
 │  ┌──────────────┐   audio   ┌────────────────┐   ┌───────────────────┐    │
-│  │ 3D avatar    │──────────▶│ /audio-turn    │──▶│ Deepgram STT      │    │
-│  │ mic + VAD    │           │ /turn          │   │ Groq LLM (struct) │    │
-│  │ camera feed  │──violations▶│ /cheating     │   │ ElevenLabs TTS   │    │
-│  │ anti-cheat   │◀──reply+url┤ (Turn JSON)   │◀──│ (optional)        │    │
-│  │ TTS player   │           └────────────────┘   └───────────────────┘    │
+│  │ aptitude UI  │──answers─▶│ /aptitude/*    │──▶│ Deepgram STT      │    │
+│  │ 3D avatar    │──audio───▶│ /audio-turn    │──▶│ Groq LLM (struct) │    │
+│  │ mic + VAD    │──code────▶│ /turn          │   │ Edge / 11Labs TTS │    │
+│  │ camera feed  │──violations▶│ /cheating-rep│◀──│ (optional)        │    │
+│  │ Monaco IDE   │◀─reply+url┤ /coding-problem │   └───────────────────┘   │
+│  │ TTS player   │           └────────────────┘                            │
 │  └──────────────┘                   │                                     │
 │                                     ▼                                     │
 │                              SQLite (portal.db)                           │
-│                    candidates • resumes • jobs (role_family,              │
-│                    seniority) • applications • interview_sessions •       │
-│                    eval_records • email_log                               │
+│              candidates • resumes • jobs • applications •                 │
+│              interview_sessions • eval_records • aptitude_questions •     │
+│              aptitude_attempts • coding_problems • email_log • leads      │
 │                                                                           │
-│  22 role families  ×  6 seniority tiers  →  role-specific stage prompts,  │
-│                                              topics, depth, rubric weights│
+│  22 role families × 6 seniority tiers × 3 rounds (apti → voice → coding) │
+│   → role-specific stage prompts, topics, depth, rubric weights, MCQ pack,│
+│     coding bank                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -39,26 +54,30 @@ tab.
 1. [Tech stack](#tech-stack)
 2. [Repository layout](#repository-layout)
 3. [Running locally](#running-locally)
-4. [Environment variables](#environment-variables)
-5. [End-to-end data flows](#end-to-end-data-flows)
-6. [Role profiles & seniority](#role-profiles--seniority)
-7. [Interview stage machine](#interview-stage-machine)
-8. [Pre-interview brief (preflight)](#pre-interview-brief-preflight)
-9. [LLM pipeline](#llm-pipeline)
-10. [Speech pipeline — STT & TTS](#speech-pipeline)
-11. [3D avatar interviewer](#3d-avatar-interviewer)
-12. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
-13. [Anti-cheat subsystem](#anti-cheat-subsystem)
-14. [AI-generated-answer detection](#ai-generated-answer-detection)
-15. [Scoring rubric](#scoring-rubric)
-16. [Resume parser](#resume-parser)
-17. [End-of-interview report](#end-of-interview-report)
-18. [Multi-tenant company workspaces](#multi-tenant-company-workspaces)
-19. [Next.js web frontend](#nextjs-web-frontend)
-20. [Rate limiting](#rate-limiting)
-21. [Database schema](#database-schema)
-22. [HTTP / WebSocket API](#http--websocket-api)
-23. [Performance notes](#performance-notes)
+4. [One-shot deploy (Oracle Cloud / Ubuntu)](#one-shot-deploy-oracle-cloud--ubuntu)
+5. [Environment variables](#environment-variables)
+6. [End-to-end data flows](#end-to-end-data-flows)
+7. [Three-round interview flow](#three-round-interview-flow)
+8. [Aptitude gate](#aptitude-gate)
+9. [Coding round + per-tenant bank](#coding-round--per-tenant-bank)
+10. [Role profiles & seniority](#role-profiles--seniority)
+11. [Interview stage machine](#interview-stage-machine)
+12. [Pre-interview brief (preflight)](#pre-interview-brief-preflight)
+13. [LLM pipeline](#llm-pipeline)
+14. [Speech pipeline — STT & TTS](#speech-pipeline)
+15. [3D avatar interviewer](#3d-avatar-interviewer)
+16. [Always-on microphone + click-to-finish](#always-on-microphone--click-to-finish)
+17. [Anti-cheat subsystem](#anti-cheat-subsystem)
+18. [AI-generated-answer detection](#ai-generated-answer-detection)
+19. [Scoring rubric](#scoring-rubric)
+20. [Resume parser](#resume-parser)
+21. [End-of-interview report](#end-of-interview-report)
+22. [Multi-tenant company workspaces](#multi-tenant-company-workspaces)
+23. [Next.js web frontend](#nextjs-web-frontend)
+24. [Rate limiting](#rate-limiting)
+25. [Database schema](#database-schema)
+26. [HTTP / WebSocket API](#http--websocket-api)
+27. [Performance notes](#performance-notes)
 
 ---
 
@@ -69,14 +88,16 @@ tab.
 | STT         | Deepgram `nova-2` (file + streaming)          | sub-second latency, word-level timestamps, good with accents  |
 | LLM         | Groq cloud, `llama-3.3-70b-versatile`         | Groq gives ~5–10× tokens/sec over other hosts; 70b for quality|
 | LLM (fast)  | `llama-3.1-8b-instant`                        | used for intro / background / wrap-up where scoring isn't critical |
-| TTS (default) | Microsoft **Edge TTS** (neural, `en-US-AriaNeural`) | free, no API key, natural female voice — set as primary path |
+| TTS (default) | Microsoft **Edge TTS** (neural, `en-IN-NeerjaExpressiveNeural`) | free, no API key, Indian-English expressive voice — primary path |
 | TTS (alt)   | ElevenLabs `eleven_turbo_v2_5`                | higher quality; opt-in via `TTS_PROVIDER=elevenlabs`          |
+| Code editor | Monaco editor (in-browser IDE)                | C / C++ / Python / JS / Java with submit + run hooks          |
 | Backend     | Python 3.10+, FastAPI, SQLite, uvicorn        | zero-ops, one-file DB, async-friendly                         |
-| Frontend (legacy) | Vanilla HTML / CSS / JS, Web Audio API  | mounted at `/candidate` for the interview-room flow           |
-| Frontend (new) | Next.js 15 + Tailwind + shadcn/ui (static export, `web/`) | marketing site, company dashboard, candidate signup |
+| Frontend (legacy) | Vanilla HTML / CSS / JS, Web Audio API  | mounted at `/candidate` for the legacy interview-room flow    |
+| Frontend (new) | Next.js 15 + Tailwind + shadcn/ui (static export, `web/`) | marketing site, company dashboard, candidate signup, aptitude + interview UI |
 | 3D avatar   | three.js 0.160 + GLTFLoader, local GLB        | morph-target lip sync driven by audio amplitude, idle blinks/gaze |
 | PDF parse   | PyMuPDF (`fitz`)                              | fastest and most reliable text extractor for resumes          |
 | Auth        | Salt + SHA-256 + bearer token                 | company dashboard only; candidates use signed invite tokens   |
+| Deploy      | nginx + uvicorn (systemd) + UFW, self-signed TLS | one-shot installer for Ubuntu 22.04 / Oracle Cloud         |
 
 ---
 
@@ -84,15 +105,18 @@ tab.
 
 ```
 backend/
-  api.py                      REST + WebSocket entry point
-  database.py                 SQLite schema, helpers, demo-company seeding, online migrations
+  api.py                      REST + WebSocket entry point (incl. aptitude + coding endpoints)
+  database.py                 SQLite schema, helpers, demo-company seeding, online migrations,
+                                aptitude/coding bank seeding
   resume_parser.py            PDF → text → LLM-structured resume JSON
-  email_service.py            invite-email dispatcher
+  email_service.py            invite-email dispatcher (ApertureAI templates)
   ai_detection.py             heuristic AI-answer detector
   scoring_rubric.py           LLM prompt text: rubric + AI-detection guidance
   interview/
-    engine.py                 InterviewSession class + time-paced stage machine
-    role_profiles.py          22 role families × 6 seniority tiers, time allocations, mock JDs
+    engine.py                 InterviewSession class + time-paced stage machine + per-stage
+                                turn ceilings; carries has_coding_round flag
+    role_profiles.py          22 role families × 6 seniority tiers, time allocations,
+                                mock JDs, has_coding_round per role
     preflight.py              pre-interview brief: LLM reads resume vs JD before turn 1
     report.py                 end-of-interview synthesized report (hire reco, strengths, etc.)
   llm/
@@ -102,10 +126,15 @@ backend/
     deepgram_stt.py           file-upload transcription with retry + STTTimeout
     deepgram_streaming.py     WebSocket streaming transcriber
   tts/
-    edge_tts_provider.py      Microsoft Edge TTS (default, free, no key)
+    edge_tts_provider.py      Microsoft Edge TTS (default, free, no key, Indian English)
     elevenlabs_tts.py         ElevenLabs synthesize(text, path) → MP3 (opt-in)
   scripts/
     provision_company.py      manual lead → company conversion CLI (setup_token email)
+deploy/                       one-shot Ubuntu 22.04 / Oracle Cloud installer
+  install.sh                  idempotent bootstrapper: venv, Node build, nginx, systemd, UFW
+  aperture.service            systemd unit (4 uvicorn workers on 127.0.0.1:8000)
+  nginx.conf                  TLS terminator + static export server, HTTP→HTTPS redirect
+  DEPLOY.md                   step-by-step deploy guide
 frontend/                     legacy candidate UI (served at /candidate)
   index.html                  all screens in one SPA-ish page
   app.js                      session + VAD + resume render + screens
@@ -114,14 +143,22 @@ frontend/                     legacy candidate UI (served at /candidate)
   anticheat.js                tab, copy, motion, phone, camera-off watchers
   style.css                   dark theme
 web/                          Next.js 15 marketing + company dashboard (TS, Tailwind, shadcn)
-  src/app/                    routes (landing, /c/[slug] dashboard, onboarding, contact)
-  src/components/             reusable UI primitives
+  src/lib/brand.ts            BRAND_NAME = "ApertureAI" (single source of truth)
+  src/app/aptitude/           candidate aptitude (MCQ) UI
+  src/app/(interview)/        candidate three-round flow: check → voice → coding
+  src/app/(app)/reports/      per-role aggregate strip + report-card view
+  src/app/(app)/candidates/   live applications panel with role + score
+  src/app/(app)/coding-bank/  per-tenant CRUD for coding problems + test cases
+  src/components/             reusable UI primitives (Radix Select, Monaco wrapper, etc.)
   src/lib/                    API client, auth, helpers
   package.json                next, react, @tanstack/react-query, monaco-editor, radix
 data/
-  portal.db                   auto-created SQLite file (seeds demo company on first run)
+  portal.db                   auto-created SQLite file (seeds demo company + aptitude bank
+                                + coding bank on first run)
 tests/
   smoke_*.py                  one-off scripts for each subsystem
+run.py                        self-cleaning boot (kills stale uvicorn, wipes __pycache__,
+                                writes .build-version, starts uvicorn --reload)
 ```
 
 ---
@@ -131,9 +168,14 @@ tests/
 ```bash
 python3 -m pip install -r requirements.txt
 cp .env.example .env           # fill in keys
-uvicorn backend.api:app --reload --port 8000
+python run.py                  # or: uvicorn backend.api:app --reload --port 8000
 # open http://localhost:8000/
 ```
+
+`run.py` is a self-cleaning launcher: it kills any uvicorn already bound to
+the port, removes every `__pycache__` / `.pyc` under the repo (skipping
+`node_modules`), writes a `.build-version` marker, then starts uvicorn with
+`--reload`. Pass `--no-clean` to skip the cache wipe.
 
 For the Next.js web app (optional, for the new marketing site + company
 dashboard):
@@ -165,6 +207,40 @@ python tests/smoke_streaming.py    # Deepgram streaming
 
 ---
 
+## One-shot deploy (Oracle Cloud / Ubuntu)
+
+`deploy/install.sh` turns a fresh Ubuntu 22.04 VM into a running ApertureAI
+instance in ~15 minutes / five copy-paste commands. Idempotent — safe to
+re-run after a `git pull`. See `deploy/DEPLOY.md` for the full walkthrough.
+
+```bash
+ssh ubuntu@<public-ip>
+sudo mkdir -p /opt/aperture && sudo chown $USER:$USER /opt/aperture
+git clone https://github.com/Pratyush150/ai-interview-portal.git /opt/aperture/src
+sudo bash /opt/aperture/src/deploy/install.sh    # first run: installs deps, writes .env stub
+sudo nano /etc/aperture/.env                     # fill in GROQ + DEEPGRAM keys, BASE_URL
+sudo bash /opt/aperture/src/deploy/install.sh    # second run: builds + starts everything
+```
+
+What it provisions:
+
+| Component                | Where                                       |
+|--------------------------|---------------------------------------------|
+| nginx (TLS + static)     | systemd `nginx` on 80/443                   |
+| uvicorn (FastAPI)        | systemd `aperture` (4 workers) on `127.0.0.1:8000` |
+| SQLite DB                | `/var/lib/aperture/portal.db` (symlinked)   |
+| Env file                 | `/etc/aperture/.env` (chmod 600)            |
+| TLS cert                 | `/etc/ssl/aperture/{fullchain,privkey}.pem` (self-signed, 1 yr) |
+| Python venv              | `/opt/aperture/venv`                        |
+| Source                   | `/opt/aperture/src`                         |
+| Firewall                 | UFW + iptables, 22/80/443 open              |
+
+The self-signed cert produces a one-time browser warning, then mic / camera
+permissions stick because the page is a "secure context". Drop-in
+replacement with Let's Encrypt once a real domain is in front.
+
+---
+
 ## Environment variables
 
 | Key                 | Required  | Default                        | Purpose                                 |
@@ -175,10 +251,13 @@ python tests/smoke_streaming.py    # Deepgram streaming
 | `DEEPGRAM_API_KEY`  | only for voice | —                         | STT                                     |
 | `USE_SERVER_TTS`    | no        | `1`                            | `1` = server TTS (Edge default, ElevenLabs opt-in); `0` = browser Web Speech |
 | `TTS_PROVIDER`      | no        | `edge`                         | `edge` (free, no key) or `elevenlabs`   |
-| `EDGE_TTS_VOICE`    | no        | `en-US-AriaNeural`             | any Edge neural voice (e.g. `en-IN-NeerjaNeural`) |
+| `EDGE_TTS_VOICE`    | no        | `en-IN-NeerjaExpressiveNeural` | any Edge neural voice (e.g. `en-US-AriaNeural`) |
+| `EDGE_TTS_RATE`     | no        | `+5%`                          | speech rate offset, e.g. `+0%`, `+10%`, `-10%` |
 | `ELEVENLABS_API_KEY`| only if `TTS_PROVIDER=elevenlabs` | —              | ElevenLabs key                          |
 | `ELEVENLABS_VOICE_ID`| no       | `21m00Tcm4TlvDq8ikWAM` (Rachel)| ElevenLabs voice                        |
 | `SMTP_*`            | no        | —                              | outbound invite + onboarding + lead-notification emails |
+| `SALES_NOTIFY_EMAIL`| no        | `sales@apertureai.com`         | where inbound lead notifications go     |
+| `BASE_URL`          | no        | `http://localhost:8000`        | used in invite + onboarding emails      |
 
 ---
 
@@ -202,7 +281,14 @@ company dashboard ─▶ POST /api/invite/send   (Bearer token)
             └──▶ UPDATE applications SET status='invited'
 
 candidate clicks invite link ?token=... ─▶ GET /api/invite/:token
-            returns candidate_name, job_title, resume_id, job_id
+            returns candidate_name, job_title, resume_id, job_id, and —
+            if aptitude is required and not yet passed — an aptitude_url
+            redirect to /aptitude/?invite=...
+
+candidate completes aptitude round (10 Q / 10 min)
+            POST /api/aptitude/:token/submit
+                ├─ pass → applications.aptitude_status='passed', voice round unlocks
+                └─ fail → applications.status='aptitude_failed' (closed)
 
 candidate hits "Start Interview"
             ─▶ POST /api/session  { invite_token | resume_id + job_id }
@@ -211,7 +297,7 @@ candidate hits "Start Interview"
                 │      one Groq call: returns claim_verifications, jd_gaps,
                 │      strong_topics, suggested_opening — injected into the
                 │      interviewer's system prompt before turn 1
-                └──▶ returns session_id, stage='intro'
+                └──▶ returns session_id, stage='intro', has_coding_round
 ```
 
 ### B. Interview turn (voice)
@@ -249,6 +335,134 @@ The browser batches violations and flushes every 30s (or on interview end)
 to `POST /api/session/:id/cheating-report`. The server appends each dict
 verbatim onto `InterviewSession.cheating_flags`, which is surfaced in the
 `evaluations` endpoint and final results.
+
+---
+
+## Three-round interview flow
+
+Every application moves through three rounds in strict order. Each is
+independently gated and independently timed.
+
+```
+                    ┌────────────────────────────────────────┐
+                    │                                        │
+   apply  ─▶  Round 1: APTITUDE  ─pass─▶  Round 2: VOICE  ─▶ Round 3: CODING* ─▶ report
+              10 Q / 10 min                15–22 min            30 min (engineering only)
+              MCQ, role-tagged             5-stage LLM          2 problems from per-tenant bank
+                    │ fail                                          │ * skipped for PM, Sales, HR,
+                    ▼                                                Marketing, Consulting, UX, Ops,
+              application closed                                     IB/Finance, BA, QA, Product Mktg
+```
+
+**Gating.** The frontend phase machine is `check → live → coding → ended (or
+flagged)`. The coding round only loads after `turn.is_finished` from the
+voice round. The role profile's `has_coding_round` flag (set in
+`role_profiles.py`) decides whether the coding round runs at all — when
+false, the report endpoint is called directly after the voice wrap-up.
+
+**Timers.** The voice round is paced by `TOTAL_DURATION_MIN_DEFAULT = 22`
+minutes; the coding round has its own independent 30-minute clock. Each
+voice stage has a per-stage turn ceiling so the voice round reliably
+reaches `wrap_up` regardless of clock time, which guarantees the coding
+round is actually reached on quick or trivial answers. A candidate-side
+"Move to coding →" escape hatch appears after 2 turns in case they want
+to skip ahead.
+
+**TTS silencing across rounds.** When the candidate navigates from voice to
+coding (or to a flagged exit), the interview UI calls `silenceTTS()` —
+pause + `src=''` + `load()` + `speechSynthesis.cancel()` — on tab hide,
+pagehide, and component unmount, so the interviewer's voice never bleeds
+into the next round.
+
+---
+
+## Aptitude gate
+
+File: `backend/database.py` (schema + seeding), `backend/api.py` (endpoints
+under `/api/aptitude/*`), `web/src/app/aptitude/` (UI).
+
+**What it is.** A 10-question, 10-minute MCQ that gates the voice round.
+Each pack is **3 role-tagged + 7 general** questions drawn from the
+`aptitude_questions` table, seeded per company × role family for all 33
+active role families.
+
+**Schema:**
+
+```
+aptitude_questions(id, company_id, role_family, question, options_json,
+                   correct_index, category, difficulty, active, created_at)
+aptitude_attempts(id, application_id, started_at, completed_at,
+                  answers_json, score, total, passed, status)
+jobs(..., aptitude_required, aptitude_pass_score, aptitude_total,
+         aptitude_duration_min)
+```
+
+Defaults: `aptitude_required=1`, `aptitude_pass_score=6`,
+`aptitude_total=10`, `aptitude_duration_min=10`.
+
+**Flow:**
+
+```
+candidate clicks invite link
+  /api/invite/:token ─▶ if aptitude required and status='pending':
+                          response carries { aptitude_url: "/aptitude/?invite=..." }
+  GET  /api/aptitude/:token         → load questions + state
+  POST /api/aptitude/:token/start   → create attempt, set in_progress
+  POST /api/aptitude/:token/submit  → grade, finalize, set passed/failed
+                                       on pass: applications.aptitude_status='passed'
+                                       on fail: status='aptitude_failed' (closed)
+```
+
+**Self-healing migrations.** Boot-time migrations (v2/v3/v4) reset
+grandfathered `skipped` aptitude states on jobs that now require aptitude,
+and `/api/aptitude/:token` will reset `skipped → pending` for any
+aptitude-required job so old invites still work. Re-applying to the same
+job also resets `aptitude_status` so a candidate re-takes the gate.
+
+**Recruiter view.** The `/reports` page in the Next.js dashboard surfaces a
+per-role aggregate strip — count, average voice score, and **aptitude pass
+rate** — on top of the per-candidate report-card view.
+
+---
+
+## Coding round + per-tenant bank
+
+File: `backend/database.py` (`coding_problems` table + `ensure_coding_bank`),
+`backend/api.py` (`/api/c/:slug/coding-problems` CRUD + `GET
+/api/session/:id/coding-problem`), `web/src/app/(app)/coding-bank/` (CRUD
+UI), `web/src/app/(interview)/interview/` (IDE).
+
+**What it is.** A Monaco-based in-browser IDE that runs as round 3 for
+engineering roles only. The candidate is walked through 2 problems
+sequentially, both pulled from the company's per-role bank. The coding
+timer is 30 minutes and is independent of the 22-minute voice clock; on
+expiry, the IDE auto-submits whatever's in the editor.
+
+**Schema:**
+
+```
+coding_problems(id, company_id, role_family, position, title,
+                 statement, examples_json, hint, language_hint, active,
+                 created_at, updated_at)
+```
+
+`examples_json` is a list of `{input, output}` pairs that double as visible
+test cases in the IDE. The bank-seeder (`ensure_coding_bank`) inserts
+**2 problems × 2 example test cases each** per engineering role on first
+boot, top-up style — recruiter edits are preserved across restarts.
+Migrations re-enable any seed rows whose examples were filled in by a
+later boot, and auto-disable seed rows that are still missing examples so
+candidates never see broken problems.
+
+**Recruiter CRUD.** `/coding-bank` in the dashboard is a full editor:
+title, statement (markdown), language hint, hint, plus a per-problem
+test-case editor (add/remove input/output rows). The Monaco wrapper
+supports **C / C++ / Python / JS / Java**; a small pseudocode badge marks
+problems that don't require a specific language.
+
+**Submission.** The Submit button posts the candidate's final code to the
+session; submissions and timing are folded into the final report alongside
+the voice round's per-turn evaluations.
 
 ---
 
@@ -291,6 +505,16 @@ Each role family declares per-dimension weights that sum to 1.0. Engineering
 roles weight correctness/depth; consulting and design lean on communication
 and relevance; security and embedded weight correctness highest. Weights
 are passed into the LLM's job context so scoring respects the role.
+
+### `has_coding_round`
+
+Each `RoleProfile` carries a `has_coding_round: bool`. Engineering families
+(software, data, ML, devops/SRE, security, embedded, mobile, etc.) have it
+true; the 11 non-engineering profiles — PM, Sales, Marketing, Product
+Marketing, HR, Consulting, Ops, BA, IB/Finance, UX, QA Testing — have it
+false. The interview engine reads it and the frontend phase machine
+honours it, so business / design candidates go straight from voice
+wrap-up to the report.
 
 ### Mock JDs
 
@@ -487,9 +711,11 @@ and produces a natural neural voice.
 **Edge TTS (default, `TTS_PROVIDER=edge`):**
 - `backend/tts/edge_tts_provider.py` calls the public Edge Online TTS
   service via the `edge-tts` Python package. No API key.
-- Default voice: `en-US-AriaNeural`. Override with `EDGE_TTS_VOICE`
-  (e.g. `en-IN-NeerjaNeural`, `en-GB-SoniaNeural`,
-  `en-US-JennyNeural`).
+- Default voice: **`en-IN-NeerjaExpressiveNeural`** (Indian English,
+  expressive). Override with `EDGE_TTS_VOICE` (e.g. `en-US-AriaNeural`,
+  `en-GB-SoniaNeural`, `en-US-JennyNeural`).
+- Default rate: **`+5%`** for a brisker interviewer cadence. Override
+  with `EDGE_TTS_RATE` (e.g. `+0%`, `+10%`, `-10%`).
 - Writes MP3 to `tests/audio/sessions/<sid>/turn_<n>.mp3`, returns
   `audio_url: "/api/audio/<sid>/turn_<n>.mp3"`.
 
@@ -798,13 +1024,27 @@ session started/finished) are logged via `audit()` /
 The `web/` directory is a standalone Next.js 15 app (TypeScript, App
 Router, Tailwind, shadcn/ui, React Query, Monaco editor) that ships:
 
-- **Marketing landing page** — what the product does, demo CTA
+- **Marketing landing page** — what the product does, demo CTA. Branding
+  pulls from `src/lib/brand.ts` (`BRAND_NAME = "ApertureAI"`).
 - **Contact form** — wired to `POST /api/leads`
 - **Owner onboarding page** — consumes a setup_token via
   `/api/c/:slug/onboard`
 - **Company dashboard** at `/c/:slug` — jobs, applications, candidate
   files, shareable application links, usage panel
 - **Candidate signup/login** for the multi-application flow
+- **Aptitude UI** at `/aptitude/` — invite-token gated MCQ runner
+- **Three-round interview UI** at `/interview` — check → voice → coding
+  phase machine with a Monaco IDE for the coding round
+- **Coding bank editor** at `/coding-bank` — per-tenant CRUD for problems
+  with a per-problem test-case editor
+- **Reports page** at `/reports` — per-role aggregate strip (count, avg
+  score, aptitude pass rate) + per-candidate report-card view
+- **Candidates page** — live applications panel with role badge + score;
+  honours sidebar role filter
+- **Dark theme is forced** via `next-themes` (`forcedTheme="dark"`) and
+  `<html class="dark">` on the root layout; a `:-webkit-autofill`
+  override in `globals.css` repaints inputs with the card colour so
+  Chrome's yellow / Edge's white autofill flash doesn't leak through.
 
 It is **statically exported** (`next build` → `web/out/`) and served by
 FastAPI in production, which is why two small middlewares live in
@@ -852,30 +1092,48 @@ companies(id, name, email, password_hash, auth_token, created_at,
           setup_token, setup_token_expires_at)
 jobs(id, company_id, title, description, required_skills,
      role_family, seniority, min_experience_years, max_experience_years,
-     department, employment_type, status, created_at)
+     department, employment_type, status, created_at,
+     aptitude_required, aptitude_pass_score, aptitude_total,
+     aptitude_duration_min)
 applications(id, job_id, candidate_id, resume_id, session_id, status,
-             invite_token UNIQUE, created_at)
+             invite_token UNIQUE, invite_expires_at, invite_revoked_at,
+             aptitude_status, aptitude_score,
+             aptitude_started_at, aptitude_completed_at, created_at)
 interview_sessions(id, candidate_id, resume_id, job_id, stage, status,
                     cheating_flags, total_score, created_at, finished_at,
                     report_json)
 eval_records(id PK autoinc, session_id, turn_number, stage, score,
               correctness, depth, communication, relevance, topic,
               strengths, weaknesses, notes, ai_likelihood, created_at)
+aptitude_questions(id, company_id, role_family, question, options_json,
+                    correct_index, category, difficulty, active, created_at)
+aptitude_attempts(id, application_id, started_at, completed_at,
+                   answers_json, score, total, passed, status)
+coding_problems(id, company_id, role_family, position, title, statement,
+                 examples_json, hint, language_hint, active,
+                 created_at, updated_at)
 email_log(id, to_addr, subject, body, status, sent_at)
 leads(id, kind, company_name, contact_name, email, phone, role_count,
       use_case, source, status, notes, created_at, converted_company_id)
 interview_events(id PK autoinc, company_id, job_id, application_id,
                   session_id, event, metadata, created_at)
+audit_log(id PK autoinc, actor_type, actor_id, action, entity,
+           entity_id, metadata, created_at)
 ```
 
 Password hashing uses a random 16-byte salt with SHA-256 → stored as
 `salt$hash`. Auth tokens rotate on every login.
 
 `init_db()` runs lightweight online migrations: missing columns on
-`jobs`, `companies`, and `interview_sessions` are added via `ALTER TABLE`
-on boot, and any company without a `slug` gets one back-filled from its
-name. Then it seeds `DemoCorp` plus one mock JD per role family from
-`MOCK_JDS`, skipping any title that already exists.
+`jobs`, `companies`, `applications`, and `interview_sessions` are added via
+`ALTER TABLE` on boot; any company without a `slug` gets one back-filled
+from its name; legacy `aptitude_status='skipped'` rows are healed to
+`'pending'` on jobs that now require aptitude; coding-problem seed rows
+that were disabled for missing examples get re-enabled if a later boot
+filled them in. Then it seeds `DemoCorp` plus one mock JD per role family
+from `MOCK_JDS`, **plus the aptitude question bank (per role family) and
+the coding-problem bank (2 problems × 2 example test cases per
+engineering role)** — all top-up style, so recruiter edits survive.
 
 ---
 
@@ -902,7 +1160,11 @@ name. Then it seeds `DemoCorp` plus one mock JD per role family from
 | POST   | `/api/session/:id/audio-turn`          | voice turn (multipart WebM/Opus)             |
 | POST   | `/api/session/:id/cheating-report`     | append violations (list of arbitrary dicts)  |
 | GET    | `/api/session/:id/evaluations`         | per-turn scores + cheating flags             |
+| GET    | `/api/session/:id/coding-problem`      | list coding problems for the IDE             |
 | GET    | `/api/audio/:id/:file`                 | serve Edge / ElevenLabs MP3                  |
+| GET    | `/api/aptitude/:token`                 | load aptitude pack + attempt state           |
+| POST   | `/api/aptitude/:token/start`           | create attempt → in_progress                 |
+| POST   | `/api/aptitude/:token/submit`          | grade + finalize attempt                     |
 | POST   | `/api/leads`                           | submit contact-form lead                     |
 | WS     | `/ws/interview/:id`                    | streaming STT + structured reply             |
 
@@ -945,6 +1207,10 @@ slug, so the Next.js dashboard can use stable paths like `/c/acme/jobs`.
 | GET    | `/api/c/:slug/jobs/:job_id/links`               | list shareable links                     |
 | DELETE | `/api/c/:slug/links/:token`                     | revoke shareable link                    |
 | GET    | `/api/c/:slug/usage`                            | usage / plan limits                      |
+| GET    | `/api/c/:slug/coding-problems`                  | list per-tenant coding bank              |
+| POST   | `/api/c/:slug/coding-problems`                  | create coding problem (with examples)    |
+| PATCH  | `/api/c/:slug/coding-problems/:id`              | edit title / statement / examples / hint |
+| DELETE | `/api/c/:slug/coding-problems/:id`              | soft-delete coding problem               |
 | GET    | `/api/c/:slug/onboard/:token`                   | validate setup_token (public)            |
 | POST   | `/api/c/:slug/onboard`                          | complete owner onboarding (set password) |
 
