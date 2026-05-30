@@ -1223,24 +1223,25 @@ function LiveInterviewPage() {
               </>
             )}
           </Button>
-          <Button
-            variant="outline"
-            onClick={endVoiceRoundAndProceed}
-            className="gap-1.5"
-            // Available only after the candidate has had at least a couple
-            // of turns — otherwise it's trivially gameable to skip the
-            // voice round entirely.
-            disabled={turnCount < 2}
-            title={
-              turnCount < 2
-                ? "Answer a couple of questions first"
-                : hasCodingRound
+          {/* The coding round must NOT be reachable mid-interview. We only
+              surface "Move to coding" once the oral interview has reached its
+              final stage (wrap_up) — before that the option is hidden
+              entirely. The automatic hand-off on engine is_finished still
+              covers the normal end-of-interview path. */}
+          {stage === "wrap_up" && (
+            <Button
+              variant="outline"
+              onClick={endVoiceRoundAndProceed}
+              className="gap-1.5"
+              title={
+                hasCodingRound
                   ? "Move to the coding round"
                   : "Finish the voice interview"
-            }
-          >
-            {hasCodingRound ? "Move to coding →" : "Finish interview →"}
-          </Button>
+              }
+            >
+              {hasCodingRound ? "Move to coding →" : "Finish interview →"}
+            </Button>
+          )}
           <Button variant="danger" onClick={endInterview} className="gap-1.5">
             <PhoneOff className="size-4" />
             End interview
