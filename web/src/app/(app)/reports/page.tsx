@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, FileText, X, RefreshCw } from "lucide-react";
+import { Loader2, FileText, X, RefreshCw, Code2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -70,7 +70,18 @@ interface ReportDetail {
   finished_at: string | null;
   report: Record<string, unknown> | null;
   evaluations: EvalRow[];
+  coding_submissions?: CodingSub[];
   cheating_flags: unknown[];
+}
+
+interface CodingSub {
+  title: string;
+  language: string;
+  code: string;
+  score: number | null;
+  strengths: string[] | null;
+  weaknesses: string[] | null;
+  notes: string | null;
 }
 
 export default function ReportsPage() {
@@ -415,6 +426,7 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
     topics_covered?: string[];
     ai_detection_summary?: string;
   };
+  const codingSubs = detail.coding_submissions ?? [];
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-3 gap-3">
@@ -484,6 +496,42 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
           <div className="grid grid-cols-2 gap-2">
             {Object.entries(report.dimensions).map(([k, v]) => (
               <Stat key={k} label={k.replace(/_/g, " ")} value={Number(v).toFixed(1)} className="capitalize" />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {codingSubs.length > 0 && (
+        <section>
+          <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <Code2 className="size-3.5" />
+            Coding round ({codingSubs.length})
+          </h3>
+          <div className="space-y-3">
+            {codingSubs.map((c, i) => (
+              <Card key={i}>
+                <CardContent className="p-3 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-medium">
+                      {i + 1}. {c.title}{" "}
+                      <span className="font-normal text-muted-foreground">
+                        · {c.language}
+                      </span>
+                    </div>
+                    {c.score != null && (
+                      <Badge variant="outline" className="tabular text-[10px]">
+                        {c.score.toFixed(1)} / 10
+                      </Badge>
+                    )}
+                  </div>
+                  <pre className="mt-2 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-2 leading-relaxed">
+                    <code>{c.code || "(no submission captured)"}</code>
+                  </pre>
+                  {c.notes && (
+                    <div className="mt-1.5 text-muted-foreground">{c.notes}</div>
+                  )}
+                </CardContent>
+              </Card>
             ))}
           </div>
         </section>

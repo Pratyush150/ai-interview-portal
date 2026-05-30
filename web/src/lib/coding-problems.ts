@@ -17,6 +17,9 @@ export interface CodingProblem {
   prompt: string;
   examples?: { input: string; output: string }[];
   hint?: string;
+  // Recruiter-authored starter code the candidate fills in. Empty/undefined
+  // means the IDE falls back to the generic per-language pseudocode stub.
+  boilerplate?: string;
 }
 
 const GENERIC: CodingProblem = {

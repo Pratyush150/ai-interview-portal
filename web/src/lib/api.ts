@@ -94,6 +94,20 @@ export interface ReportSynthesis {
   ai_integrity_note: string;
   next_round_focus: string[];
 }
+export interface CodingSubmission {
+  title: string;
+  language: string;
+  code: string;
+  score: number | null;
+  correctness: number | null;
+  depth: number | null;
+  communication: number | null;
+  relevance: number | null;
+  strengths: string[] | null;
+  weaknesses: string[] | null;
+  notes: string | null;
+  ai_likelihood: number | null;
+}
 export interface ReportEnvelope {
   session_id: string;
   interviewer_name: string;
@@ -112,6 +126,7 @@ export interface ReportEnvelope {
   topics_covered: string[];
   interview_brief: Record<string, unknown>;
   evaluations: Array<Record<string, unknown>>;
+  coding_submissions?: CodingSubmission[];
   report: ReportSynthesis;
 }
 

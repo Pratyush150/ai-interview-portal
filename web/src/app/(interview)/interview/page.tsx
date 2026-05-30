@@ -100,6 +100,16 @@ const STARTER_CODE: Record<CodeLanguage, string> = {
   sql: "-- Write PSEUDOCODE here — focus on the algorithm.\n",
 };
 
+// The buffer a problem should open with: the recruiter's boilerplate if they
+// authored one (any role), otherwise the generic per-language pseudocode stub.
+function starterFor(
+  problem: CodingProblem | undefined,
+  language: CodeLanguage,
+): string {
+  const bp = problem?.boilerplate;
+  return bp && bp.trim().length > 0 ? bp : STARTER_CODE[language];
+}
+
 function LiveInterviewPage() {
   const params = useSearchParams();
   const router = useRouter();
@@ -626,9 +636,10 @@ function LiveInterviewPage() {
       // Advance to next problem OR end the interview.
       if (currentIdx + 1 < problemList.length) {
         setCodingIdx(currentIdx + 1);
-        // Reset the editor buffer to the language's starter so the
-        // candidate isn't tempted to copy-paste their previous solution.
-        setCode(STARTER_CODE[language]);
+        // Reset the editor buffer to the next problem's starter (recruiter
+        // boilerplate if any, else the generic stub) so the candidate isn't
+        // tempted to copy-paste their previous solution.
+        setCode(starterFor(problemList[currentIdx + 1], language));
         toast.success(
           `Submitted ${currentIdx + 1}/${problemList.length}. On to the next.`,
         );
@@ -683,6 +694,7 @@ function LiveInterviewPage() {
               if (list.length > 0) {
                 setCodingProblems(list);
                 setCodingIdx(0);
+                setCode(starterFor(list[0], language));
               }
             })
             .catch(() => undefined);
@@ -919,6 +931,7 @@ function LiveInterviewPage() {
             if (list.length > 0) {
               setCodingProblems(list);
               setCodingIdx(0);
+              setCode(starterFor(list[0], language));
             }
           })
           .catch(() => undefined);

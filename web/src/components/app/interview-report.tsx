@@ -9,11 +9,12 @@ import {
   ArrowRight,
   Loader2,
   Download,
+  Code2,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { getReport, type ReportEnvelope } from "@/lib/api";
+import { getReport, type ReportEnvelope, type CodingSubmission } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -130,6 +131,7 @@ export function InterviewReport({
   const recColor = REC_COLOR[recommendationKey] ?? REC_COLOR.lean_hire;
   const recLabel = REC_LABEL[recommendationKey] ?? "Pending";
   const score = data.avg_score ?? 0;
+  const codingSubmissions = data.coding_submissions ?? [];
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8 md:px-6 md:py-12">
@@ -282,6 +284,23 @@ export function InterviewReport({
         </Card>
       )}
 
+      {/* Coding round — problem, full submission, and per-problem score */}
+      {codingSubmissions.length > 0 && (
+        <Card className="mt-4">
+          <CardContent className="p-6">
+            <div className="inline-flex items-center gap-1.5 text-xs font-medium uppercase tracking-wider text-[var(--primary)]">
+              <Code2 className="size-3.5" />
+              Coding round
+            </div>
+            <div className="mt-3 space-y-4">
+              {codingSubmissions.map((c, i) => (
+                <CodingSubmissionBlock key={i} sub={c} index={i} />
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Next-round focus */}
       {r.next_round_focus.length > 0 && (
         <Card className="mt-4">
@@ -327,6 +346,77 @@ export function InterviewReport({
           Download JSON
         </Button>
       </div>
+    </div>
+  );
+}
+
+function CodingSubmissionBlock({
+  sub,
+  index,
+}: {
+  sub: CodingSubmission;
+  index: number;
+}) {
+  const strengths = sub.strengths ?? [];
+  const weaknesses = sub.weaknesses ?? [];
+  return (
+    <div className="rounded-md border border-border bg-card/40 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">
+            {index + 1}. {sub.title}
+          </div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            Language: {sub.language}
+          </div>
+        </div>
+        {sub.score != null && (
+          <Badge variant="outline" className="tabular shrink-0">
+            {sub.score.toFixed(1)} / 10
+          </Badge>
+        )}
+      </div>
+      <pre className="mt-3 max-h-72 overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed">
+        <code>{sub.code || "(no submission captured)"}</code>
+      </pre>
+      {(strengths.length > 0 || weaknesses.length > 0 || sub.notes) && (
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
+          {strengths.length > 0 && (
+            <div>
+              <div className="text-xs font-medium text-emerald-600">
+                Strengths
+              </div>
+              <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                {strengths.map((x, j) => (
+                  <li key={j}>• {x}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {weaknesses.length > 0 && (
+            <div>
+              <div className="text-xs font-medium text-amber-600">
+                Weaknesses
+              </div>
+              <ul className="mt-1 space-y-1 text-xs text-muted-foreground">
+                {weaknesses.map((x, j) => (
+                  <li key={j}>• {x}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {sub.notes && (
+            <div className="md:col-span-2">
+              <div className="text-xs font-medium text-muted-foreground">
+                Verdict
+              </div>
+              <p className="mt-1 text-xs italic text-muted-foreground">
+                {sub.notes}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

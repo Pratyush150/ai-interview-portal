@@ -24,10 +24,17 @@ def get_db() -> sqlite3.Connection:
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str):
-    """Lightweight migration — add column if missing."""
+    """Lightweight migration — add column if missing. Idempotent and safe
+    under concurrent workers: if another process adds the column between the
+    PRAGMA check and the ALTER, SQLite raises 'duplicate column name', which
+    we swallow (the column now exists either way)."""
     cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
 
 def slugify(name: str) -> str:
@@ -206,6 +213,7 @@ def init_db():
             prompt TEXT NOT NULL,
             hint TEXT DEFAULT '',
             examples_json TEXT DEFAULT '[]',
+            boilerplate TEXT DEFAULT '',
             active INTEGER DEFAULT 1,
             position INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -302,6 +310,9 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_aptitude_a_application ON aptitude_attempts(application_id)"
     )
+    # Additive: recruiter-authored starter/boilerplate code the candidate
+    # fills in (so they write only the logic). Empty string = no boilerplate.
+    _ensure_column(conn, "coding_problems", "boilerplate", "TEXT DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_coding_problems_company ON coding_problems(company_id, active)"
     )

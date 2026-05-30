@@ -557,6 +557,9 @@ async def get_report(session_id: str):
 
     # Run synthesis off the event loop — it's an LLM call.
     report = await asyncio.to_thread(synthesize_report, session)
+    # Attach coding-round submissions so both the candidate report and the
+    # recruiter view (which reads report_json) can render the coding card.
+    report["coding_submissions"] = session.coding_submissions
     session.cached_report = report
 
     # Persist EVERY column the recruiter dashboard reads — without this, the
@@ -624,6 +627,7 @@ def _report_envelope(session: InterviewSession, report: dict) -> dict:
         "topics_covered": status["topics_covered"],
         "interview_brief": session.interview_brief,
         "evaluations": session.evaluations,
+        "coding_submissions": report.get("coding_submissions", session.coding_submissions),
         "report": report,
     }
 
@@ -1205,6 +1209,7 @@ class CodingProblemIn(BaseModel):
     prompt: str
     hint: str = ""
     examples: list[dict] = []  # [{"input": "...", "output": "..."}]
+    boilerplate: str = ""  # starter code the candidate fills in (any/all roles)
     active: bool = True
     position: int | None = None
 
@@ -1218,7 +1223,7 @@ def coding_q_list(slug: str, request: Request):
     ensure_coding_bank(db, co["id"])
     rows = db.execute(
         "SELECT id, role_family, title, prompt, hint, examples_json, "
-        "       active, position, created_at "
+        "       boilerplate, active, position, created_at "
         "FROM coding_problems WHERE company_id=? "
         "ORDER BY COALESCE(role_family, ''), position ASC, created_at ASC",
         (co["id"],),
@@ -1232,6 +1237,7 @@ def coding_q_list(slug: str, request: Request):
             "prompt": r["prompt"],
             "hint": r["hint"] or "",
             "examples": json.loads(r["examples_json"] or "[]"),
+            "boilerplate": r["boilerplate"] or "",
             "active": bool(r["active"]),
             "position": r["position"],
             "created_at": r["created_at"],
@@ -1257,11 +1263,11 @@ def coding_q_create(slug: str, q: CodingProblemIn, request: Request):
         ).fetchone()["p"] or -1) + 1
     db.execute(
         "INSERT INTO coding_problems "
-        "(id, company_id, role_family, title, prompt, hint, examples_json, active, position) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
+        "(id, company_id, role_family, title, prompt, hint, examples_json, boilerplate, active, position) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
         (
             qid, co["id"], q.role_family, q.title.strip(), q.prompt.strip(),
-            q.hint.strip(), json.dumps(q.examples or []),
+            q.hint.strip(), json.dumps(q.examples or []), q.boilerplate or "",
             1 if q.active else 0, pos,
         ),
     )
@@ -1287,10 +1293,11 @@ def coding_q_update(slug: str, qid: str, q: CodingProblemIn, request: Request):
         raise HTTPException(404, "Problem not found")
     db.execute(
         "UPDATE coding_problems SET role_family=?, title=?, prompt=?, hint=?, "
-        "examples_json=?, active=?, position=COALESCE(?, position) WHERE id=?",
+        "examples_json=?, boilerplate=?, active=?, position=COALESCE(?, position) WHERE id=?",
         (
             q.role_family, q.title.strip(), q.prompt.strip(), q.hint.strip(),
-            json.dumps(q.examples or []), 1 if q.active else 0, q.position, qid,
+            json.dumps(q.examples or []), q.boilerplate or "",
+            1 if q.active else 0, q.position, qid,
         ),
     )
     db.commit()
@@ -1366,6 +1373,7 @@ def get_session_coding_problem(session_id: str):
                 "prompt": r["prompt"],
                 "hint": r["hint"] or "",
                 "examples": json.loads(r["examples_json"] or "[]"),
+                "boilerplate": (r["boilerplate"] if "boilerplate" in r.keys() else "") or "",
             }
             for r in rows
         ]
@@ -1499,6 +1507,7 @@ async def get_session_report_for_recruiter(slug: str, session_id: str, request: 
         "finished_at": row["finished_at"],
         "report": report,
         "evaluations": [dict(e) for e in evals],
+        "coding_submissions": (report or {}).get("coding_submissions", []),
         "cheating_flags": json.loads(row["cheating_flags"] or "[]"),
     }
 

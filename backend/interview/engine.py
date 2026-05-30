@@ -125,6 +125,10 @@ class InterviewSession:
     # Cached synthesized report so /api/session/:id/report can reuse it.
     cached_report: dict | None = None
 
+    # Coding-round submissions, captured distinctly from the voice-turn
+    # evaluations so the report can show problem + full pseudocode + score.
+    coding_submissions: list[dict] = field(default_factory=list)
+
     def __post_init__(self):
         # Auto-detect seniority from candidate YOE if not explicitly set.
         if self.seniority == "mid" and self.candidate_experience_years is not None:
@@ -422,6 +426,13 @@ class InterviewSession:
                 "candidate_excerpt": user_text[:280],
             })
 
+        # Coding round: the IDE ships the candidate's pseudocode as a text turn
+        # prefixed with a marker (see web interview page submitCode). Capture it
+        # distinctly — full code, not the 280-char excerpt — so the report can
+        # render a dedicated coding card with the score and the AI's verdict.
+        if user_text.lstrip().startswith("[Coding round"):
+            self._capture_coding_submission(user_text, resp, combined_ai)
+
         # Feed weaknesses back into the next turn's drill targets.
         self._absorb_drill_targets(resp)
 
@@ -432,6 +443,43 @@ class InterviewSession:
             self._advance_stage()
 
         return resp
+
+    def _capture_coding_submission(self, user_text: str, resp, combined_ai: float):
+        """Parse the IDE marker payload and record a structured submission.
+
+        Payload shape (from the web client):
+            [Coding round — pseudocode submission 1/2, python]
+            Problem: <title>
+
+            <code...>
+        """
+        lines = user_text.split("\n")
+        marker = lines[0] if lines else ""
+        language = ""
+        if "," in marker and marker.rstrip().endswith("]"):
+            language = marker.rstrip()[:-1].rsplit(",", 1)[-1].strip()
+        title = ""
+        code_start = 1
+        for i, ln in enumerate(lines[1:], start=1):
+            if ln.startswith("Problem:"):
+                title = ln[len("Problem:"):].strip()
+                code_start = i + 1
+                break
+        code = "\n".join(lines[code_start:]).strip()
+        self.coding_submissions.append({
+            "title": title or "Coding problem",
+            "language": language or "text",
+            "code": code,
+            "score": resp.score,
+            "correctness": resp.correctness,
+            "depth": resp.depth,
+            "communication": resp.communication,
+            "relevance": resp.relevance,
+            "strengths": resp.strengths,
+            "weaknesses": resp.weaknesses,
+            "notes": resp.eval_notes,
+            "ai_likelihood": combined_ai,
+        })
 
     def add_cheating_flag(self, violation: dict):
         self.cheating_flags.append(violation)

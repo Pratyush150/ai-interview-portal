@@ -33,6 +33,7 @@ interface CodingProblem {
   prompt: string;
   hint: string;
   examples: { input: string; output: string }[];
+  boilerplate: string;
   active: boolean;
   position: number;
   created_at: string;
@@ -54,6 +55,7 @@ const DEFAULT_NEW: Omit<CodingProblem, "id" | "position" | "created_at"> = {
   prompt: "",
   hint: "",
   examples: [],
+  boilerplate: "",
   active: true,
 };
 
@@ -131,6 +133,7 @@ export default function CodingBankPage() {
           prompt: editing.q.prompt.trim(),
           hint: editing.q.hint.trim(),
           examples: editing.q.examples,
+          boilerplate: editing.q.boilerplate ?? "",
           active: editing.q.active,
         }),
       });
@@ -379,6 +382,24 @@ export default function CodingBankPage() {
                 }
                 placeholder="One-liner that nudges the candidate without spoiling the solution."
               />
+            </div>
+            <div>
+              <Label>Starter / boilerplate code (optional)</Label>
+              <Textarea
+                className="mt-1 min-h-[120px] font-mono text-xs"
+                value={editing.q.boilerplate ?? ""}
+                onChange={(e) =>
+                  setEditing({
+                    ...editing,
+                    q: { ...editing.q, boilerplate: e.target.value },
+                  } as EditingState)
+                }
+                placeholder={"Pre-fills the candidate's editor so they write only the logic, e.g.\n\ndef solve(nums, target):\n    # your approach here\n    pass"}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Shown to candidates of every role for this problem. Leave blank
+                to use the generic per-language pseudocode stub.
+              </p>
             </div>
             {/* Test-case editor.
                 We store each example as {input, output}. The candidate
