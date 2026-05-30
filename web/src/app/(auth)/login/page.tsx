@@ -175,27 +175,33 @@ export default function LoginPage() {
           </Button>
 
           <div className="space-y-2 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+            <div className="font-medium text-foreground">
+              Demo logins — pick the role above, then sign in:
+            </div>
             <div>
-              <span className="font-medium text-foreground">Real backend:</span>{" "}
+              <span className="font-medium text-foreground">
+                Recruiter · Hiring manager · Admin:
+              </span>{" "}
               <code className="tabular text-foreground">DemoCorp</code> ·{" "}
               <code className="tabular text-foreground">demo1234</code>
+              <span className="block text-[11px]">
+                All three share this workspace — the role buttons above decide
+                what you can see.
+              </span>
             </div>
             <div>
-              <span className="font-medium text-foreground">Mock-only personas</span>{" "}
-              (any password):{" "}
-              <code className="tabular text-foreground">naidu@democorp.test</code>,{" "}
-              <code className="tabular text-foreground">sneha@democorp.test</code>,{" "}
-              <code className="tabular text-foreground">riya@democorp.test</code>
-            </div>
-            <div>
-              Candidate?{" "}
+              <span className="font-medium text-foreground">Candidate:</span>{" "}
               <Link
                 href="/candidate-login"
                 className="text-foreground underline-offset-4 hover:underline"
               >
                 Interview portal
               </Link>{" "}
-              · No account?{" "}
+              · <code className="tabular text-foreground">demo@aperture.test</code>{" "}
+              · <code className="tabular text-foreground">demo1234</code>
+            </div>
+            <div>
+              No account?{" "}
               <Link
                 href="/signup"
                 className="text-foreground underline-offset-4 hover:underline"

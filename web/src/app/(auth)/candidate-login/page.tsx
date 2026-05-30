@@ -256,15 +256,23 @@ function CandidateLogin() {
             </form>
           )}
 
-          <div className="rounded-md border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
-            Recruiter or hiring manager?{" "}
-            <Link
-              href="/login"
-              className="text-foreground underline-offset-4 hover:underline"
-            >
-              Sign in here
-            </Link>
-            .
+          <div className="space-y-2 rounded-md border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+            <div>
+              <span className="font-medium text-foreground">Demo candidate:</span>{" "}
+              <code className="tabular text-foreground">demo@aperture.test</code>{" "}
+              ·{" "}
+              <code className="tabular text-foreground">demo1234</code>
+            </div>
+            <div>
+              Recruiter or hiring manager?{" "}
+              <Link
+                href="/login"
+                className="text-foreground underline-offset-4 hover:underline"
+              >
+                Sign in here
+              </Link>
+              .
+            </div>
           </div>
 
           <p className="text-center text-xs text-muted-foreground">
