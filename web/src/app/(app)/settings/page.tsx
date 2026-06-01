@@ -1,7 +1,10 @@
 "use client";
 
 import * as React from "react";
-import { Plug, Slack, Mail, Building2, CreditCard, Users, Plus } from "lucide-react";
+import {
+  Plug, Slack, Mail, Building2, CreditCard, Users, Plus,
+  Trash2, Send, Download, Loader2,
+} from "lucide-react";
 import {
   Card,
   CardContent,
@@ -21,6 +24,13 @@ import {
 } from "@/components/ui/avatar";
 import { lakhs } from "@/lib/format";
 import { toast } from "sonner";
+import { useAuth } from "@/stores/auth-store";
+
+function apiBase(): string {
+  if (typeof window === "undefined") return "";
+  if (window.location.port === "3000") return "http://localhost:8000";
+  return "";
+}
 
 const TEAM = [
   { name: "Naidu Krishore", role: "Owner", email: "naidu@democorp.test" },
@@ -263,9 +273,191 @@ export default function SettingsPage() {
               );
             })}
           </div>
+          <AtsIntegrations />
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+interface AtsConn {
+  id: string;
+  label: string;
+  target_url: string;
+  secret_masked: string;
+  active: boolean;
+  last_delivery_at: string | null;
+  last_status: string | null;
+}
+
+function AtsIntegrations() {
+  const slug = useAuth((s) => s.user?.companySlug);
+  const token = useAuth((s) => s.user?.authToken);
+  const [conns, setConns] = React.useState<AtsConn[] | null>(null);
+  const [label, setLabel] = React.useState("");
+  const [url, setUrl] = React.useState("");
+  const [secret, setSecret] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  const auth = React.useCallback(
+    (path: string, init?: RequestInit) =>
+      fetch(`${apiBase()}/api/c/${slug}${path}`, {
+        ...init,
+        headers: { Authorization: `Bearer ${token}`, ...(init?.headers ?? {}) },
+      }),
+    [slug, token],
+  );
+
+  const load = React.useCallback(async () => {
+    if (!slug || !token) return;
+    try {
+      const r = await auth("/ats-connections");
+      if (r.ok) setConns(await r.json());
+    } catch {
+      /* non-fatal */
+    }
+  }, [slug, token, auth]);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function add() {
+    if (!url.trim()) {
+      toast.error("Enter a webhook URL.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await auth("/ats-connections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: label.trim(), target_url: url.trim(), secret }),
+      });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({}));
+        toast.error(b.detail || "Could not add the webhook.");
+        return;
+      }
+      setLabel("");
+      setUrl("");
+      setSecret("");
+      toast.success("Webhook added.");
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(id: string) {
+    const r = await auth(`/ats-connections/${id}`, { method: "DELETE" });
+    if (r.ok) {
+      toast.success("Webhook removed.");
+      await load();
+    }
+  }
+
+  async function test(id: string) {
+    const r = await auth(`/ats-connections/${id}/test`, { method: "POST" });
+    const b = await r.json().catch(() => ({}));
+    if (r.ok) {
+      toast.success(`Test delivered — last status: ${b.last_status ?? "?"}`);
+      await load();
+    } else {
+      toast.error("Test failed.");
+    }
+  }
+
+  async function downloadCsv() {
+    if (!slug || !token) return;
+    try {
+      const r = await auth("/export/reports.csv");
+      if (!r.ok) {
+        toast.error("Export failed.");
+        return;
+      }
+      const blob = await r.blob();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = `${slug}-reports.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(href);
+    } catch {
+      toast.error("Export failed.");
+    }
+  }
+
+  return (
+    <Card className="mt-4">
+      <CardHeader className="flex flex-row items-start justify-between gap-3">
+        <div>
+          <CardTitle>ATS webhooks &amp; export</CardTitle>
+          <CardDescription>
+            Push each finished interview to your ATS / systems (HMAC-signed), or
+            export finished reports as CSV.
+          </CardDescription>
+        </div>
+        <Button variant="outline" size="sm" className="gap-1.5" onClick={downloadCsv}>
+          <Download className="size-3.5" /> Export CSV
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-2 sm:grid-cols-[1fr_2fr_1fr_auto]">
+          <Input placeholder="Label (e.g. Greenhouse)" value={label} onChange={(e) => setLabel(e.target.value)} />
+          <Input placeholder="https://your-ats.example/webhook" value={url} onChange={(e) => setUrl(e.target.value)} />
+          <Input placeholder="Signing secret (optional)" value={secret} onChange={(e) => setSecret(e.target.value)} />
+          <Button onClick={add} disabled={busy} className="gap-1.5">
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+            Add
+          </Button>
+        </div>
+
+        {conns === null ? (
+          <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" /> Loading…
+          </div>
+        ) : conns.length === 0 ? (
+          <p className="py-2 text-sm text-muted-foreground">No webhooks yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {conns.map((c) => (
+              <div
+                key={c.id}
+                className="flex items-center gap-3 rounded-md border border-border p-3"
+              >
+                <Plug className="size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium">
+                    {c.label || c.target_url}
+                  </div>
+                  <div className="truncate text-xs text-muted-foreground">
+                    {c.target_url}
+                    {c.secret_masked ? ` · secret ${c.secret_masked}` : ""}
+                  </div>
+                  {c.last_status ? (
+                    <div className="text-[11px] text-muted-foreground tabular">
+                      last delivery: {c.last_status}
+                      {c.last_delivery_at
+                        ? ` · ${c.last_delivery_at.replace("T", " ").slice(0, 16)}`
+                        : ""}
+                    </div>
+                  ) : null}
+                </div>
+                <Button size="sm" variant="ghost" className="gap-1" onClick={() => test(c.id)}>
+                  <Send className="size-3.5" /> Test
+                </Button>
+                <Button size="icon" variant="ghost" onClick={() => remove(c.id)}>
+                  <Trash2 className="size-4 text-[var(--danger)]" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

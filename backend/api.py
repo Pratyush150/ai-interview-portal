@@ -1023,6 +1023,47 @@ def identity_submit(invite_token: str, request: Request):
     }
 
 
+@app.post("/api/identity/webhook/{provider}")
+async def identity_webhook(provider: str, request: Request):
+    """Inbound callback for a real identity provider to flip a verification's
+    status (pending -> verified/failed). Inert unless IDENTITY_WEBHOOK_SECRET is
+    set; the raw body is HMAC-SHA256 verified against the X-Identity-Signature
+    header ('sha256=<hex>'). Expects JSON {reference, status}. This is the piece
+    that lets any provider (Stripe Identity / Persona / Onfido) complete the
+    lifecycle without an SDK — wire its webhook here and map its payload."""
+    secret = os.getenv("IDENTITY_WEBHOOK_SECRET")
+    if not secret:
+        raise HTTPException(503, "Identity webhook not configured")
+    raw = await request.body()
+    sig = request.headers.get("X-Identity-Signature", "")
+    expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(401, "Bad signature")
+    try:
+        body = json.loads(raw or b"{}")
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    reference = body.get("reference")
+    status = (body.get("status") or "").strip().lower()
+    if not reference or status not in ("verified", "failed", "pending"):
+        raise HTTPException(400, "reference and a valid status are required")
+    db = get_db()
+    cur = db.execute(
+        "UPDATE identity_verifications SET status=?, "
+        "verified_at=CASE WHEN ?='verified' THEN CURRENT_TIMESTAMP ELSE verified_at END "
+        "WHERE reference=?",
+        (status, status, reference),
+    )
+    updated = cur.rowcount
+    db.commit()
+    db.close()
+    log_event(
+        "identity_webhook",
+        metadata=json.dumps({"provider": provider, "status": status, "updated": updated}),
+    )
+    return {"ok": True, "updated": updated, "status": status}
+
+
 def _consent_acknowledged(application_id: str, notice_version: str) -> bool:
     """True if this application acknowledged the given AEDT notice version."""
     db = get_db()

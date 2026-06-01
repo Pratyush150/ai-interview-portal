@@ -370,12 +370,25 @@ function CodingSubmissionBlock({
             Language: {sub.language}
           </div>
         </div>
-        {sub.score != null && (
-          <Badge variant="outline" className="tabular shrink-0">
-            {sub.score.toFixed(1)} / 10
-          </Badge>
-        )}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {sub.ai_assist_allowed && (
+            <Badge variant="outline">
+              AI-assist {sub.ai_policy === "required" ? "required" : "allowed"}
+            </Badge>
+          )}
+          {sub.score != null && (
+            <Badge variant="outline" className="tabular">
+              {sub.score.toFixed(1)} / 10
+            </Badge>
+          )}
+        </div>
       </div>
+      {sub.ai_assist_allowed && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          AI assistance was permitted for this problem — a high AI-likelihood
+          signal here is expected and is not treated as an integrity concern.
+        </p>
+      )}
       <pre className="mt-3 max-h-72 overflow-auto rounded-md border border-border bg-muted/40 p-3 text-xs leading-relaxed">
         <code>{sub.code || "(no submission captured)"}</code>
       </pre>

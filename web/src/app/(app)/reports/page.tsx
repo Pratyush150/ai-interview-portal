@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Loader2, FileText, X, RefreshCw, Code2 } from "lucide-react";
+import { Loader2, FileText, X, RefreshCw, Code2, ShieldCheck, Scale } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -82,6 +82,29 @@ interface CodingSub {
   strengths: string[] | null;
   weaknesses: string[] | null;
   notes: string | null;
+  ai_policy?: string;
+  ai_assist_allowed?: boolean;
+}
+
+interface BiasAudit {
+  demographic_data_available: boolean;
+  note: string;
+  overall: {
+    applications: number;
+    interviews_finished: number;
+    advance_rate: number | null;
+    avg_score: number | null;
+    median_score: number | null;
+  };
+  per_job: {
+    job_id: string;
+    title: string;
+    applications: number;
+    interviews_finished: number;
+    advance_rate: number;
+    aptitude_pass_rate: number | null;
+    avg_score: number | null;
+  }[];
 }
 
 export default function ReportsPage() {
@@ -283,6 +306,8 @@ export default function ReportsPage() {
         </Card>
       )}
 
+      <BiasAuditPanel slug={slug} token={token} />
+
       {rows === null ? (
         <Card>
           <CardContent className="flex items-center justify-center gap-2 p-8 text-sm text-muted-foreground">
@@ -425,6 +450,14 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
     dimensions?: Record<string, number>;
     topics_covered?: string[];
     ai_detection_summary?: string;
+    compliance?: {
+      notice_required?: boolean;
+      acknowledged?: boolean | null;
+      notice_version?: string | null;
+      acknowledged_at?: string | null;
+      alt_assessment_enabled?: boolean;
+      alt_assessment_status?: string;
+    };
   };
   const codingSubs = detail.coding_submissions ?? [];
   return (
@@ -501,6 +534,44 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
         </section>
       )}
 
+      {report.compliance?.notice_required && (
+        <section>
+          <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            <ShieldCheck className="size-3.5" />
+            Compliance
+          </h3>
+          <div className="space-y-1 rounded-md border border-border bg-card/50 p-3 text-xs">
+            <div>
+              AEDT notice:{" "}
+              {report.compliance.acknowledged ? (
+                <span className="text-[var(--success,#10b981)]">
+                  acknowledged
+                  {report.compliance.notice_version
+                    ? ` (v${report.compliance.notice_version})`
+                    : ""}
+                </span>
+              ) : (
+                <span className="text-[var(--danger)]">not acknowledged</span>
+              )}
+              {report.compliance.acknowledged_at ? (
+                <span className="text-muted-foreground">
+                  {" "}
+                  · {report.compliance.acknowledged_at.replace("T", " ").slice(0, 16)}
+                </span>
+              ) : null}
+            </div>
+            {report.compliance.alt_assessment_enabled && (
+              <div>
+                Alternative assessment:{" "}
+                <span className="capitalize">
+                  {report.compliance.alt_assessment_status || "none requested"}
+                </span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
       {codingSubs.length > 0 && (
         <section>
           <h3 className="mb-2 inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -518,11 +589,18 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
                         · {c.language}
                       </span>
                     </div>
-                    {c.score != null && (
-                      <Badge variant="outline" className="tabular text-[10px]">
-                        {c.score.toFixed(1)} / 10
-                      </Badge>
-                    )}
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {c.ai_assist_allowed && (
+                        <Badge variant="outline" className="text-[10px]">
+                          AI-assist {c.ai_policy === "required" ? "required" : "allowed"}
+                        </Badge>
+                      )}
+                      {c.score != null && (
+                        <Badge variant="outline" className="tabular text-[10px]">
+                          {c.score.toFixed(1)} / 10
+                        </Badge>
+                      )}
+                    </div>
                   </div>
                   <pre className="mt-2 max-h-64 overflow-auto rounded-md border border-border bg-muted/40 p-2 leading-relaxed">
                     <code>{c.code || "(no submission captured)"}</code>
@@ -597,6 +675,92 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
         </section>
       )}
     </div>
+  );
+}
+
+function BiasAuditPanel({
+  slug,
+  token,
+}: {
+  slug: string | null | undefined;
+  token: string | null | undefined;
+}) {
+  const [data, setData] = React.useState<BiasAudit | null>(null);
+  const [open, setOpen] = React.useState(false);
+  React.useEffect(() => {
+    if (!slug || !token) return;
+    (async () => {
+      try {
+        const r = await fetch(`${apiBase()}/api/c/${slug}/bias-audit`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (r.ok) setData(await r.json());
+      } catch {
+        /* non-fatal */
+      }
+    })();
+  }, [slug, token]);
+
+  if (!data || data.overall.applications === 0) return null;
+  const o = data.overall;
+  return (
+    <Card>
+      <CardContent className="space-y-2 p-4">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center gap-2 text-left"
+        >
+          <Scale className="size-3.5 text-muted-foreground" />
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Adverse-impact / selection-rate overview
+          </span>
+          <span className="ml-auto text-[11px] text-muted-foreground tabular">
+            {o.applications} apps · advance {((o.advance_rate ?? 0) * 100).toFixed(0)}%
+            {o.avg_score != null ? ` · avg ${o.avg_score.toFixed(1)}` : ""}
+            {" · "}
+            {open ? "hide" : "details"}
+          </span>
+        </button>
+        {open && (
+          <div className="space-y-3">
+            <p className="text-[11px] leading-relaxed text-muted-foreground">{data.note}</p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <tr>
+                    <th className="py-1 text-left font-medium">Role</th>
+                    <th className="py-1 text-right font-medium">Apps</th>
+                    <th className="py-1 text-right font-medium">Advance</th>
+                    <th className="py-1 text-right font-medium">Apti pass</th>
+                    <th className="py-1 text-right font-medium">Avg score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.per_job.map((j) => (
+                    <tr key={j.job_id} className="border-t border-border">
+                      <td className="py-1.5 pr-2">{j.title}</td>
+                      <td className="py-1.5 text-right tabular">{j.applications}</td>
+                      <td className="py-1.5 text-right tabular">
+                        {(j.advance_rate * 100).toFixed(0)}%
+                      </td>
+                      <td className="py-1.5 text-right tabular">
+                        {j.aptitude_pass_rate != null
+                          ? `${(j.aptitude_pass_rate * 100).toFixed(0)}%`
+                          : "—"}
+                      </td>
+                      <td className="py-1.5 text-right tabular">
+                        {j.avg_score != null ? j.avg_score.toFixed(1) : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

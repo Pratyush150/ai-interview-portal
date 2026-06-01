@@ -107,6 +107,8 @@ export interface CodingSubmission {
   weaknesses: string[] | null;
   notes: string | null;
   ai_likelihood: number | null;
+  ai_policy?: string;
+  ai_assist_allowed?: boolean;
 }
 export interface ReportEnvelope {
   session_id: string;
