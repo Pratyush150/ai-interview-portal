@@ -443,13 +443,14 @@ export default function ReportsPage() {
 
 function ReportDetailView({ detail }: { detail: ReportDetail }) {
   const report = (detail.report ?? {}) as {
-    hire_recommendation?: string;
-    summary?: string;
-    strengths?: string[];
-    weaknesses?: string[];
-    dimensions?: Record<string, number>;
-    topics_covered?: string[];
-    ai_detection_summary?: string;
+    recommendation?: string;
+    recommendation_reason?: string;
+    summary_paragraph?: string;
+    top_strengths?: { point: string; evidence?: string }[];
+    top_weaknesses?: { point: string; evidence?: string }[];
+    dimension_averages?: Record<string, number>;
+    vs_seniority_bar?: string;
+    ai_integrity_note?: string;
     compliance?: {
       notice_required?: boolean;
       acknowledged?: boolean | null;
@@ -466,7 +467,7 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
         <Stat label="Total score" value={detail.total_score?.toFixed(1) ?? "—"} />
         <Stat
           label="Recommendation"
-          value={report.hire_recommendation?.replace(/_/g, " ") ?? "—"}
+          value={report.recommendation?.replace(/_/g, " ") ?? "—"}
           className="capitalize"
         />
         <Stat label="Stage reached" value={detail.stage.replace(/_/g, " ")} className="capitalize" />
@@ -482,52 +483,77 @@ function ReportDetailView({ detail }: { detail: ReportDetail }) {
         </Card>
       )}
 
-      {report.summary && (
+      {report.recommendation_reason && (
+        <p className="text-sm leading-relaxed">{report.recommendation_reason}</p>
+      )}
+
+      {report.summary_paragraph && (
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Summary
           </h3>
-          <p className="text-sm leading-relaxed">{report.summary}</p>
+          <p className="text-sm leading-relaxed">{report.summary_paragraph}</p>
         </section>
       )}
 
-      {(report.strengths?.length ?? 0) > 0 && (
+      {report.ai_integrity_note && (
+        <section>
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Integrity
+          </h3>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            {report.ai_integrity_note}
+          </p>
+        </section>
+      )}
+
+      {(report.top_strengths?.length ?? 0) > 0 && (
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Strengths
           </h3>
-          <ul className="space-y-1 text-sm">
-            {report.strengths!.map((s, i) => (
+          <ul className="space-y-1.5 text-sm">
+            {report.top_strengths!.map((s, i) => (
               <li key={i} className="leading-relaxed">
-                • {s}
+                • {s.point}
+                {s.evidence ? (
+                  <span className="block pl-3 text-xs italic text-muted-foreground">
+                    “{s.evidence}”
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>
         </section>
       )}
 
-      {(report.weaknesses?.length ?? 0) > 0 && (
+      {(report.top_weaknesses?.length ?? 0) > 0 && (
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Weaknesses
           </h3>
-          <ul className="space-y-1 text-sm">
-            {report.weaknesses!.map((s, i) => (
+          <ul className="space-y-1.5 text-sm">
+            {report.top_weaknesses!.map((s, i) => (
               <li key={i} className="leading-relaxed">
-                • {s}
+                • {s.point}
+                {s.evidence ? (
+                  <span className="block pl-3 text-xs italic text-muted-foreground">
+                    “{s.evidence}”
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>
         </section>
       )}
 
-      {report.dimensions && Object.keys(report.dimensions).length > 0 && (
+      {report.dimension_averages && Object.keys(report.dimension_averages).length > 0 && (
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Per-dimension averages
           </h3>
           <div className="grid grid-cols-2 gap-2">
-            {Object.entries(report.dimensions).map(([k, v]) => (
+            {Object.entries(report.dimension_averages).map(([k, v]) => (
               <Stat key={k} label={k.replace(/_/g, " ")} value={Number(v).toFixed(1)} className="capitalize" />
             ))}
           </div>
