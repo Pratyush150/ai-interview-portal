@@ -240,6 +240,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             verified_at TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS ats_connections (
+            id TEXT PRIMARY KEY,
+            company_id TEXT REFERENCES companies(id),
+            kind TEXT DEFAULT 'webhook',
+            label TEXT DEFAULT '',
+            target_url TEXT NOT NULL,
+            secret TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_delivery_at TIMESTAMP,
+            last_status TEXT
+        );
     """)
 
     # ── Migrations on existing tables (additive only) ─────────────────────
@@ -362,6 +374,9 @@ def init_db():
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_identity_application ON identity_verifications(application_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ats_company ON ats_connections(company_id, active)"
     )
 
     conn.commit()

@@ -52,7 +52,7 @@ The highest ROI/effort move; a procurement/legal selling point at low cost.
 5. **Compliance summary in the report** — extend the single `report_json`
    synthesis pass (prompt + schema field)
 
-### Gap 2 — Post-LeetCode, AI-aware coding assessment  ✅ feasible (1 caveat)
+### Gap 2 — Post-LeetCode, AI-aware coding assessment  ✅ DONE (sandbox deferred)
 Builds directly on `coding_problems` (+`boilerplate`) and the scored
 `coding_submissions` already in the report.
 
@@ -66,7 +66,7 @@ Builds directly on `coding_problems` (+`boilerplate`) and the scored
    runner (Judge0 / Piston / container). That is a NEW service — the one place
    here beyond "additive." AI-aware *evaluation* without execution ships now.
 
-### Gap 3 — Identity / deepfake verification  ⚠️ split
+### Gap 3 — Identity / deepfake verification  ✅ gate DONE (real-time video deferred)
 1. ✅ **Front-of-funnel ID + selfie liveness** via 3rd-party API (Stripe
    Identity / Persona / Onfido). New `identity_verifications` table + a gate
    before aptitude — the exact pattern the aptitude gate already uses.
@@ -76,7 +76,7 @@ Builds directly on `coding_problems` (+`boilerplate`) and the scored
    audio over WS + turn text; it never sees video frames. Needs a NEW media
    pipeline. **Deferred.**
 
-### Gap 4 — ATS integration ("embed, don't replace")  ⚠️ phased
+### Gap 4 — ATS integration ("embed, don't replace")  ✅ Phase 1 DONE (sync deferred)
 1. ✅ **Phase 1 — outbound export/webhook:** push finished reports/scores via
    webhook + CSV/email export. New `ats_connections` table; reuse
    `email_service.py` + `interview_events`. Additive.

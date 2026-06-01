@@ -27,6 +27,11 @@ import asyncio
 import base64
 import tempfile
 import secrets
+import hmac
+import hashlib
+import urllib.request
+import csv as _csv
+import io as _io
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -34,7 +39,7 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -642,6 +647,23 @@ async def get_report(session_id: str):
         # Don't fail the candidate's view just because the write failed —
         # but DO log it so we notice in the server log.
         print(f"[REPORT] Persist failed for {session_id}: {e}")
+
+    # Gap 4 — fire outbound ATS webhooks (best-effort, off the event loop).
+    try:
+        cid = getattr(session, "_company_id", None)
+        if not cid:
+            db = get_db()
+            row = db.execute(
+                "SELECT company_id FROM interview_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            cid = row["company_id"] if row else None
+            db.close()
+        if cid:
+            await asyncio.to_thread(
+                _deliver_ats_webhooks, cid, _ats_payload_for_session(session, report)
+            )
+    except Exception as e:
+        print(f"[ATS] webhook dispatch failed for {session_id}: {e}")
 
     return _report_envelope(session, report)
 
@@ -1389,6 +1411,208 @@ def bias_audit(slug: str, request: Request):
         "per_job": per_job,
         "four_fifths": None,
     }
+
+
+# ── Gap 4: ATS outbound export / webhooks (Phase 1) ──────────────────────────
+
+def _ats_payload_for_session(session: InterviewSession, report: dict) -> dict:
+    """Compact, stable JSON summary delivered to ATS webhooks on finish."""
+    status = session.get_status()
+    rep = report or {}
+    return {
+        "event": "interview.finished",
+        "session_id": session.session_id,
+        "candidate_name": session.candidate_name,
+        "job_title": session.job_title,
+        "role_family": status.get("role_family"),
+        "seniority": status.get("seniority"),
+        "avg_score": status.get("avg_score"),
+        "recommendation": rep.get("recommendation"),
+        "cheating_flags_count": status.get("cheating_flags_count"),
+    }
+
+
+def _deliver_ats_webhooks(company_id: str, payload: dict) -> None:
+    """Best-effort POST of `payload` to each active webhook for the company.
+    Never raises. HMAC-signs the body when a secret is set (header
+    X-Aperture-Signature: sha256=<hex>). Records last delivery status."""
+    if not company_id:
+        return
+    try:
+        db = get_db()
+        rows = db.execute(
+            "SELECT id, target_url, secret FROM ats_connections "
+            "WHERE company_id=? AND active=1 AND kind='webhook'",
+            (company_id,),
+        ).fetchall()
+        db.close()
+    except Exception:
+        return
+    body = json.dumps(payload).encode("utf-8")
+    for r in rows:
+        result = "ok"
+        try:
+            headers = {"Content-Type": "application/json", "User-Agent": "ApertureAI-webhook"}
+            if r["secret"]:
+                sig = hmac.new(r["secret"].encode(), body, hashlib.sha256).hexdigest()
+                headers["X-Aperture-Signature"] = f"sha256={sig}"
+            req = urllib.request.Request(r["target_url"], data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = str(resp.status)
+        except Exception as e:
+            result = f"error: {str(e)[:80]}"
+        try:
+            db = get_db()
+            db.execute(
+                "UPDATE ats_connections SET last_delivery_at=CURRENT_TIMESTAMP, last_status=? WHERE id=?",
+                (result, r["id"]),
+            )
+            db.commit()
+            db.close()
+        except Exception:
+            pass
+
+
+class AtsConnectionIn(BaseModel):
+    kind: str = "webhook"
+    label: str = ""
+    target_url: str
+    secret: str = ""
+    active: bool = True
+
+
+def _mask_secret(secret: str | None) -> str:
+    """Never echo the full secret back to the dashboard."""
+    if not secret:
+        return ""
+    return ("•" * max(0, len(secret) - 4)) + secret[-4:]
+
+
+@app.get("/api/c/{slug}/ats-connections")
+def ats_list(slug: str, request: Request):
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, kind, label, target_url, secret, active, created_at, "
+        "       last_delivery_at, last_status "
+        "FROM ats_connections WHERE company_id=? ORDER BY created_at DESC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    return [
+        {
+            "id": r["id"],
+            "kind": r["kind"],
+            "label": r["label"] or "",
+            "target_url": r["target_url"],
+            "secret_masked": _mask_secret(r["secret"]),
+            "active": bool(r["active"]),
+            "created_at": r["created_at"],
+            "last_delivery_at": r["last_delivery_at"],
+            "last_status": r["last_status"],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/c/{slug}/ats-connections")
+def ats_create(slug: str, body: AtsConnectionIn, request: Request):
+    co = _verify_slug_auth(slug, request)
+    url = (body.target_url or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://")):
+        raise HTTPException(400, "target_url must be an http(s) URL.")
+    cid = uuid.uuid4().hex[:12]
+    db = get_db()
+    db.execute(
+        "INSERT INTO ats_connections (id, company_id, kind, label, target_url, secret, active) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (cid, co["id"], "webhook", body.label.strip(), url, body.secret or "",
+         1 if body.active else 0),
+    )
+    db.commit()
+    db.close()
+    log_event("ats_connection_created", company_id=co["id"], metadata=json.dumps({"id": cid}))
+    return {"id": cid, "ok": True}
+
+
+@app.delete("/api/c/{slug}/ats-connections/{conn_id}")
+def ats_delete(slug: str, conn_id: str, request: Request):
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM ats_connections WHERE id=? AND company_id=?",
+        (conn_id, co["id"]),
+    ).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(404, "Connection not found")
+    db.execute("UPDATE ats_connections SET active=0 WHERE id=?", (conn_id,))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+@app.post("/api/c/{slug}/ats-connections/{conn_id}/test")
+def ats_test(slug: str, conn_id: str, request: Request):
+    """Fire a sample event to one connection so the recruiter can confirm wiring."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    row = db.execute(
+        "SELECT id FROM ats_connections WHERE id=? AND company_id=? AND active=1",
+        (conn_id, co["id"]),
+    ).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(404, "Active connection not found")
+    _deliver_ats_webhooks(co["id"], {"event": "test.ping", "company": slug})
+    db = get_db()
+    st = db.execute("SELECT last_status FROM ats_connections WHERE id=?", (conn_id,)).fetchone()
+    db.close()
+    return {"ok": True, "last_status": st["last_status"] if st else None}
+
+
+@app.get("/api/c/{slug}/export/reports.csv")
+def export_reports_csv(slug: str, request: Request):
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    rows = db.execute(
+        "SELECT s.id, s.role_family, s.seniority, s.total_score, s.finished_at, "
+        "       s.report_json, s.cheating_flags, "
+        "       c.name AS candidate_name, j.title AS job_title "
+        "FROM interview_sessions s "
+        "LEFT JOIN candidates c ON s.candidate_id=c.id "
+        "LEFT JOIN jobs j ON s.job_id=j.id "
+        "WHERE s.company_id=? AND s.status='finished' "
+        "ORDER BY s.finished_at DESC",
+        (co["id"],),
+    ).fetchall()
+    db.close()
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["session_id", "candidate", "job", "role_family", "seniority",
+                "avg_score", "recommendation", "cheating_flags", "finished_at"])
+    for r in rows:
+        rec = ""
+        if r["report_json"]:
+            try:
+                rec = (json.loads(r["report_json"]) or {}).get("recommendation", "")
+            except Exception:
+                rec = ""
+        try:
+            cf = len(json.loads(r["cheating_flags"] or "[]"))
+        except Exception:
+            cf = 0
+        w.writerow([
+            r["id"], r["candidate_name"] or "", r["job_title"] or "",
+            r["role_family"] or "", r["seniority"] or "",
+            r["total_score"] if r["total_score"] is not None else "",
+            rec, cf, r["finished_at"] or "",
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{slug}-reports.csv"'},
+    )
 
 
 class AptitudeQuestionIn(BaseModel):
