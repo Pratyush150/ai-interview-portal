@@ -2,6 +2,8 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import {
   Sparkles,
   Briefcase,
@@ -9,6 +11,7 @@ import {
   ArrowRight,
   Building2,
   Loader2,
+  LogOut,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -33,7 +36,15 @@ interface RoleFamily {
 
 export default function JobsPage() {
   const user = useAuth((s) => s.user);
+  const logout = useAuth((s) => s.logout);
+  const router = useRouter();
   const isCandidateAuthed = !!user?.candidateToken;
+
+  function handleSignOut() {
+    logout();
+    toast.success("Signed out");
+    router.push("/");
+  }
   const [roleFamilies, setRoleFamilies] = React.useState<RoleFamily[]>([]);
   const [filterRole, setFilterRole] = React.useState("");
   const [filterSkill, setFilterSkill] = React.useState("");
@@ -86,9 +97,15 @@ export default function JobsPage() {
           </Link>
           <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
             {isCandidateAuthed ? (
-              <span>
-                Signed in as <span className="font-medium text-foreground">{user?.name}</span>
-              </span>
+              <>
+                <span>
+                  Signed in as <span className="font-medium text-foreground">{user?.name}</span>
+                </span>
+                <Button variant="ghost" size="sm" onClick={handleSignOut}>
+                  <LogOut className="size-3.5" />
+                  Sign out
+                </Button>
+              </>
             ) : (
               <>
                 <Link

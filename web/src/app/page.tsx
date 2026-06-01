@@ -59,6 +59,7 @@ export default function Landing() {
 function Nav() {
   const user = useAuth((s) => s.user);
   const hydrated = useAuth((s) => s.hydrated);
+  const logout = useAuth((s) => s.logout);
   const isRecruiter = !!user && RECRUITER_ROLES.includes(user.role);
   const isCandidate = user?.role === "candidate";
   return (
@@ -100,13 +101,23 @@ function Nav() {
               </Button>
             </>
           ) : isRecruiter ? (
-            <Button variant="primary" size="sm" asChild>
-              <Link href="/dashboard">Go to dashboard</Link>
-            </Button>
+            <>
+              <Button variant="ghost" size="sm" asChild>
+                <Link href="/dashboard">Go to dashboard</Link>
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => logout()}>
+                Sign out
+              </Button>
+            </>
           ) : (
-            <Button variant="primary" size="sm" asChild>
-              <Link href="/jobs">Browse jobs</Link>
-            </Button>
+            <>
+              <Button variant="ghost" size="sm" asChild>
+                <Link href="/jobs">Browse jobs</Link>
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => logout()}>
+                Sign out
+              </Button>
+            </>
           )}
         </div>
       </div>
