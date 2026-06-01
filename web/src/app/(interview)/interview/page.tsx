@@ -628,7 +628,8 @@ function LiveInterviewPage() {
       const currentProblem = problemList[currentIdx];
       const payload =
         `[Coding round — pseudocode submission ${currentIdx + 1}/${problemList.length}, ${language}]\n` +
-        `Problem: ${currentProblem.title}\n\n` +
+        `Problem: ${currentProblem.title}\n` +
+        `Policy: ${currentProblem.ai_policy ?? "forbidden"}\n\n` +
         code;
       const turn = await postTextTurn(sessionId, payload);
       setTranscript((t) => [...t, { role: "candidate", text: payload }]);
@@ -1365,6 +1366,13 @@ function CodingRound({
               <p className="text-sm leading-relaxed text-muted-foreground">
                 {problem.prompt}
               </p>
+              {problem.ai_policy && problem.ai_policy !== "forbidden" ? (
+                <div className="rounded-md border border-[var(--primary)]/30 bg-[var(--primary)]/5 px-3 py-2 text-[11px] text-foreground">
+                  AI tools are{" "}
+                  {problem.ai_policy === "required" ? "expected" : "allowed"} for
+                  this problem — we evaluate how you use them, not whether you do.
+                </div>
+              ) : null}
               {problem.examples && problem.examples.length > 0 && (
                 <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3 text-xs">
                   <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">

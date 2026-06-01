@@ -458,14 +458,36 @@ class InterviewSession:
         language = ""
         if "," in marker and marker.rstrip().endswith("]"):
             language = marker.rstrip()[:-1].rsplit(",", 1)[-1].strip()
+        # Header region: consecutive "Key: value" lines after the marker,
+        # ending at the first blank line (or the first unrecognised line). Then
+        # the rest is the code. New optional keys (Policy:, Elapsed:) are
+        # backward-compatible — older clients that only send "Problem:" still
+        # parse, and ai_policy defaults to "forbidden".
         title = ""
-        code_start = 1
-        for i, ln in enumerate(lines[1:], start=1):
+        ai_policy = "forbidden"
+        elapsed_seconds = None
+        idx = 1
+        while idx < len(lines):
+            ln = lines[idx]
+            if ln.strip() == "":
+                idx += 1
+                break
             if ln.startswith("Problem:"):
                 title = ln[len("Problem:"):].strip()
-                code_start = i + 1
+            elif ln.startswith("Policy:"):
+                ai_policy = ln[len("Policy:"):].strip().lower() or "forbidden"
+            elif ln.startswith("Elapsed:"):
+                raw = ln[len("Elapsed:"):].strip().rstrip("s")
+                try:
+                    elapsed_seconds = int(float(raw))
+                except (ValueError, TypeError):
+                    elapsed_seconds = None
+            else:
                 break
-        code = "\n".join(lines[code_start:]).strip()
+            idx += 1
+        if ai_policy not in ("forbidden", "allowed", "required"):
+            ai_policy = "forbidden"
+        code = "\n".join(lines[idx:]).strip()
         self.coding_submissions.append({
             "title": title or "Coding problem",
             "language": language or "text",
@@ -479,6 +501,11 @@ class InterviewSession:
             "weaknesses": resp.weaknesses,
             "notes": resp.eval_notes,
             "ai_likelihood": combined_ai,
+            # Gap 2 — AI-aware coding context for the report. When AI assistance
+            # was allowed/required, a high ai_likelihood is expected, not a flag.
+            "ai_policy": ai_policy,
+            "ai_assist_allowed": ai_policy != "forbidden",
+            "elapsed_seconds": elapsed_seconds,
         })
 
     def add_cheating_flag(self, violation: dict):

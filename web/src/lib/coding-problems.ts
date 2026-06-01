@@ -20,6 +20,9 @@ export interface CodingProblem {
   // Recruiter-authored starter code the candidate fills in. Empty/undefined
   // means the IDE falls back to the generic per-language pseudocode stub.
   boilerplate?: string;
+  // Gap 2 — AI-aware coding. Undefined on the hard-coded fallbacks (treated as
+  // "forbidden"); set by the backend bank for DB-backed problems.
+  ai_policy?: "forbidden" | "allowed" | "required";
 }
 
 const GENERIC: CodingProblem = {

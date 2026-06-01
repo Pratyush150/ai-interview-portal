@@ -334,6 +334,9 @@ def init_db():
     # Additive: recruiter-authored starter/boilerplate code the candidate
     # fills in (so they write only the logic). Empty string = no boilerplate.
     _ensure_column(conn, "coding_problems", "boilerplate", "TEXT DEFAULT ''")
+    # Gap 2 — AI-aware coding: per-problem policy on AI assistance.
+    # 'forbidden' (default, = today's behaviour) | 'allowed' | 'required'.
+    _ensure_column(conn, "coding_problems", "ai_policy", "TEXT DEFAULT 'forbidden'")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_coding_problems_company ON coding_problems(company_id, active)"
     )

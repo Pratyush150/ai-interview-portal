@@ -1431,6 +1431,15 @@ def aptitude_q_delete(slug: str, qid: str, request: Request):
 # endpoint is /api/session/{id}/coding-problem (further below).
 
 
+_CODING_AI_POLICIES = {"forbidden", "allowed", "required"}
+
+def _norm_ai_policy(v) -> str:
+    """Clamp the per-problem AI-assistance policy to a known value.
+    Defaults to 'forbidden' (today's behaviour) on anything unexpected."""
+    v = (v or "").strip().lower()
+    return v if v in _CODING_AI_POLICIES else "forbidden"
+
+
 class CodingProblemIn(BaseModel):
     role_family: str | None = None  # NULL means "generic / fallback"
     title: str
@@ -1438,6 +1447,8 @@ class CodingProblemIn(BaseModel):
     hint: str = ""
     examples: list[dict] = []  # [{"input": "...", "output": "..."}]
     boilerplate: str = ""  # starter code the candidate fills in (any/all roles)
+    # Gap 2 — AI-aware coding: 'forbidden' | 'allowed' | 'required'.
+    ai_policy: str = "forbidden"
     active: bool = True
     position: int | None = None
 
@@ -1451,7 +1462,7 @@ def coding_q_list(slug: str, request: Request):
     ensure_coding_bank(db, co["id"])
     rows = db.execute(
         "SELECT id, role_family, title, prompt, hint, examples_json, "
-        "       boilerplate, active, position, created_at "
+        "       boilerplate, ai_policy, active, position, created_at "
         "FROM coding_problems WHERE company_id=? "
         "ORDER BY COALESCE(role_family, ''), position ASC, created_at ASC",
         (co["id"],),
@@ -1466,6 +1477,7 @@ def coding_q_list(slug: str, request: Request):
             "hint": r["hint"] or "",
             "examples": json.loads(r["examples_json"] or "[]"),
             "boilerplate": r["boilerplate"] or "",
+            "ai_policy": _norm_ai_policy(r["ai_policy"] if "ai_policy" in r.keys() else None),
             "active": bool(r["active"]),
             "position": r["position"],
             "created_at": r["created_at"],
@@ -1491,12 +1503,12 @@ def coding_q_create(slug: str, q: CodingProblemIn, request: Request):
         ).fetchone()["p"] or -1) + 1
     db.execute(
         "INSERT INTO coding_problems "
-        "(id, company_id, role_family, title, prompt, hint, examples_json, boilerplate, active, position) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "(id, company_id, role_family, title, prompt, hint, examples_json, boilerplate, ai_policy, active, position) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             qid, co["id"], q.role_family, q.title.strip(), q.prompt.strip(),
             q.hint.strip(), json.dumps(q.examples or []), q.boilerplate or "",
-            1 if q.active else 0, pos,
+            _norm_ai_policy(q.ai_policy), 1 if q.active else 0, pos,
         ),
     )
     db.commit()
@@ -1521,11 +1533,11 @@ def coding_q_update(slug: str, qid: str, q: CodingProblemIn, request: Request):
         raise HTTPException(404, "Problem not found")
     db.execute(
         "UPDATE coding_problems SET role_family=?, title=?, prompt=?, hint=?, "
-        "examples_json=?, boilerplate=?, active=?, position=COALESCE(?, position) WHERE id=?",
+        "examples_json=?, boilerplate=?, ai_policy=?, active=?, position=COALESCE(?, position) WHERE id=?",
         (
             q.role_family, q.title.strip(), q.prompt.strip(), q.hint.strip(),
             json.dumps(q.examples or []), q.boilerplate or "",
-            1 if q.active else 0, q.position, qid,
+            _norm_ai_policy(q.ai_policy), 1 if q.active else 0, q.position, qid,
         ),
     )
     db.commit()
@@ -1602,6 +1614,7 @@ def get_session_coding_problem(session_id: str):
                 "hint": r["hint"] or "",
                 "examples": json.loads(r["examples_json"] or "[]"),
                 "boilerplate": (r["boilerplate"] if "boilerplate" in r.keys() else "") or "",
+                "ai_policy": _norm_ai_policy(r["ai_policy"] if "ai_policy" in r.keys() else None),
             }
             for r in rows
         ]

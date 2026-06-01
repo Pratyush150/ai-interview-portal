@@ -34,6 +34,7 @@ interface CodingProblem {
   hint: string;
   examples: { input: string; output: string }[];
   boilerplate: string;
+  ai_policy: "forbidden" | "allowed" | "required";
   active: boolean;
   position: number;
   created_at: string;
@@ -56,6 +57,7 @@ const DEFAULT_NEW: Omit<CodingProblem, "id" | "position" | "created_at"> = {
   hint: "",
   examples: [],
   boilerplate: "",
+  ai_policy: "forbidden",
   active: true,
 };
 
@@ -134,6 +136,7 @@ export default function CodingBankPage() {
           hint: editing.q.hint.trim(),
           examples: editing.q.examples,
           boilerplate: editing.q.boilerplate ?? "",
+          ai_policy: editing.q.ai_policy ?? "forbidden",
           active: editing.q.active,
         }),
       });
@@ -382,6 +385,30 @@ export default function CodingBankPage() {
                 }
                 placeholder="One-liner that nudges the candidate without spoiling the solution."
               />
+            </div>
+            <div>
+              <Label>AI assistance policy</Label>
+              <select
+                className="mt-1 block w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={editing.q.ai_policy ?? "forbidden"}
+                onChange={(e) =>
+                  setEditing({
+                    ...editing,
+                    q: {
+                      ...editing.q,
+                      ai_policy: e.target.value as CodingProblem["ai_policy"],
+                    },
+                  } as EditingState)
+                }
+              >
+                <option value="forbidden">Forbidden — no AI tools (default)</option>
+                <option value="allowed">Allowed — candidate may use AI</option>
+                <option value="required">Required — AI-assisted task</option>
+              </select>
+              <p className="mt-1 text-xs text-muted-foreground">
+                When AI is allowed or required, a high AI-likelihood signal is
+                expected and is not treated as cheating in the report.
+              </p>
             </div>
             <div>
               <Label>Starter / boilerplate code (optional)</Label>
