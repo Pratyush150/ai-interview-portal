@@ -27,9 +27,12 @@ genuinely require *new* architecture are called out and deferred.
 ## Workstreams, sequenced
 
 ### Gap 1 — Compliance-native interviewing  ✅ feasible, additive  ·  **IN PROGRESS**
+
+> Status: items **1 (AEDT notice + consent)** and **2 (alternative-assessment
+> request)** are implemented, tested (23/23), and committed. Items 3–5 pending.
 The highest ROI/effort move; a procurement/legal selling point at low cost.
 
-1. **AEDT candidate notice + consent capture** (NYC Local Law 144 / EU AI Act)
+1. ✅ **AEDT candidate notice + consent capture** (NYC Local Law 144 / EU AI Act) — DONE
    - `consents` table (application_id, notice_version, acknowledged, ip, ua, ts)
    - `jobs.aedt_notice_required` flag (default 0 → additive safety, opt-in)
    - `GET/POST /api/consent/:token`; notice surfaced in `/api/invite/:token`
@@ -37,7 +40,7 @@ The highest ROI/effort move; a procurement/legal selling point at low cost.
    - Versioned notice text in `backend/compliance.py`
    - Candidate-facing `/consent` page in `web/`
    - Consent events written to the existing `audit_log` / `interview_events`
-2. **Alternative-assessment request flow**
+2. ✅ **Alternative-assessment request flow** — DONE
    - `jobs.alt_assessment_enabled` flag + `applications.alt_assessment_status`
    - Surfaced on the consent/notice screen; recruiter sees requests in `/reports`
 3. **Bias-audit aggregates** (four-fifths / selection-rate)

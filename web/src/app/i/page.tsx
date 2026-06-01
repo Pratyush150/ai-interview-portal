@@ -29,6 +29,9 @@ interface InviteState {
   status: string;
   expires_at: string | null;
   already_used: boolean;
+  consent_required?: boolean;
+  consent_url?: string | null;
+  alt_assessment_enabled?: boolean;
 }
 
 function apiBase(): string {
@@ -79,9 +82,14 @@ function InvitePage() {
 
   function startInterview() {
     if (!state || !token) return;
-    // Route through /aptitude first — that page will redirect straight to
-    // /interview if the job doesn't require an aptitude round (or if it's
-    // already been cleared).
+    // Compliance first: if the job requires the AEDT notice and it hasn't been
+    // acknowledged, route through /consent. That page forwards to /aptitude
+    // once acknowledged. Otherwise go straight to /aptitude, which itself
+    // redirects to /interview when no aptitude round is required (or cleared).
+    if (state.consent_required) {
+      window.location.href = `/consent/?invite=${encodeURIComponent(token)}`;
+      return;
+    }
     window.location.href = `/aptitude/?invite=${encodeURIComponent(token)}`;
   }
 

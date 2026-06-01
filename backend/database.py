@@ -218,6 +218,16 @@ def init_db():
             position INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS consents (
+            id TEXT PRIMARY KEY,
+            application_id TEXT REFERENCES applications(id),
+            candidate_id TEXT,
+            notice_version TEXT NOT NULL,
+            acknowledged INTEGER DEFAULT 1,
+            ip TEXT,
+            user_agent TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     # ── Migrations on existing tables (additive only) ─────────────────────
@@ -237,6 +247,13 @@ def init_db():
         ("aptitude_pass_score",   "INTEGER DEFAULT 6"),
         ("aptitude_total",        "INTEGER DEFAULT 10"),
         ("aptitude_duration_min", "INTEGER DEFAULT 10"),
+        # Compliance (NYC Local Law 144 / EU AI Act): require an AEDT use
+        # notice + consent before any assessment, and allow the candidate to
+        # request an alternative (non-AI) assessment. Default 0 for additive
+        # safety — existing jobs and old invite links are unaffected until a
+        # recruiter (or the demo seed below) opts in.
+        ("aedt_notice_required",   "INTEGER DEFAULT 0"),
+        ("alt_assessment_enabled", "INTEGER DEFAULT 0"),
     ]:
         _ensure_column(conn, "jobs", col, decl)
 
@@ -292,6 +309,10 @@ def init_db():
         ("aptitude_score",         "INTEGER"),
         ("aptitude_started_at",    "TIMESTAMP"),
         ("aptitude_completed_at",  "TIMESTAMP"),
+        # Compliance: candidate's alternative-assessment request state.
+        # '' = none requested; 'requested' = candidate asked; 'granted' /
+        # 'declined' = recruiter acted. Purely additive; never gates anything.
+        ("alt_assessment_status",  "TEXT DEFAULT ''"),
     ]:
         _ensure_column(conn, "applications", col, decl)
 
@@ -318,6 +339,9 @@ def init_db():
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_coding_problems_role ON coding_problems(company_id, role_family, active)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_consents_application ON consents(application_id)"
     )
 
     conn.commit()
@@ -510,6 +534,12 @@ def _seed_demo_company(conn: sqlite3.Connection) -> None:
     # the demo we want the feature actually exercised.
     conn.execute(
         "UPDATE jobs SET aptitude_required=1 WHERE company_id=? AND aptitude_required=0",
+        (company_id,),
+    )
+    # Exercise the compliance gate on the demo too (off by default elsewhere).
+    conn.execute(
+        "UPDATE jobs SET aedt_notice_required=1, alt_assessment_enabled=1 "
+        "WHERE company_id=? AND aedt_notice_required=0",
         (company_id,),
     )
     conn.commit()

@@ -61,6 +61,7 @@ def _ensure_aptitude_bank(db, company_id: str) -> None:
     if company_id:
         ensure_aptitude_bank(db, company_id)
         ensure_coding_bank(db, company_id)
+from backend.compliance import current_notice, NOTICE_VERSION
 from backend.resume_parser import extract_text_from_pdf, analyze_resume
 from backend.email_service import (
     send_interview_invite, send_lead_notification, send_owner_setup_email,
@@ -280,6 +281,10 @@ class InviteSend(BaseModel):
 class CheatingReport(BaseModel):
     violations: list[dict]
 
+class ConsentSubmit(BaseModel):
+    acknowledged: bool = True
+    request_alt_assessment: bool = False
+
 
 # --- Health ---
 
@@ -348,7 +353,7 @@ def create_session(req: SessionCreate):
         app_row = db.execute(
             "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, "
             "j.role_family, j.seniority, j.min_experience_years, j.max_experience_years, "
-            "j.company_id, j.aptitude_required, "
+            "j.company_id, j.aptitude_required, j.aedt_notice_required, "
             "r.raw_text, r.skills_json "
             "FROM applications a "
             "JOIN candidates c ON a.candidate_id=c.id "
@@ -370,6 +375,22 @@ def create_session(req: SessionCreate):
                     raise
                 except (ValueError, TypeError):
                     pass
+
+            # Compliance: AEDT notice + consent gate. If the job requires the
+            # automated-decision-tool notice and the candidate hasn't
+            # acknowledged the CURRENT notice version, refuse to start. The
+            # frontend reads consent_url and redirects.
+            if bool(app_row["aedt_notice_required"]) and not _consent_acknowledged(
+                app_row["id"], NOTICE_VERSION
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "consent_required",
+                        "consent_url": f"/consent/?invite={req.invite_token}",
+                        "message": "Please review and acknowledge the interview notice before starting.",
+                    },
+                )
 
             # ── Aptitude gate ─────────────────────────────────────────────
             # If the job requires aptitude and this application hasn't
@@ -835,6 +856,8 @@ def _load_application_by_invite(invite_token: str) -> dict:
         "       j.company_id, j.title AS job_title, j.role_family, j.seniority, "
         "       j.aptitude_required, j.aptitude_pass_score, j.aptitude_total, "
         "       j.aptitude_duration_min, "
+        "       j.aedt_notice_required, j.alt_assessment_enabled, "
+        "       a.alt_assessment_status, "
         "       c.name AS candidate_name "
         "FROM applications a "
         "LEFT JOIN jobs j ON a.job_id=j.id "
@@ -855,6 +878,86 @@ def _load_application_by_invite(invite_token: str) -> dict:
         except (ValueError, TypeError):
             pass
     return dict(row)
+
+
+def _consent_acknowledged(application_id: str, notice_version: str) -> bool:
+    """True if this application acknowledged the given AEDT notice version."""
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM consents "
+        "WHERE application_id=? AND notice_version=? AND acknowledged=1 LIMIT 1",
+        (application_id, notice_version),
+    ).fetchone()
+    db.close()
+    return row is not None
+
+
+@app.get("/api/consent/{invite_token}")
+def consent_get(invite_token: str):
+    """Return the AEDT notice for this candidate plus their acknowledgement
+    state. Safe to call even when the job doesn't require the notice — the
+    frontend uses `required` to decide whether to show the gate."""
+    app_row = _load_application_by_invite(invite_token)
+    alt_enabled = bool(app_row["alt_assessment_enabled"])
+    return {
+        "candidate_name": app_row["candidate_name"],
+        "job_title": app_row["job_title"],
+        "required": bool(app_row["aedt_notice_required"]),
+        "acknowledged": _consent_acknowledged(app_row["application_id"], NOTICE_VERSION),
+        "alt_assessment_status": app_row["alt_assessment_status"] or "",
+        "notice": current_notice(alt_assessment_enabled=alt_enabled),
+    }
+
+
+@app.post("/api/consent/{invite_token}")
+def consent_submit(invite_token: str, body: ConsentSubmit, request: Request):
+    """Record the candidate's acknowledgement of the AEDT notice (and an
+    optional alternative-assessment request). Idempotent: re-acknowledging the
+    same version writes another audit row; the gate only checks existence."""
+    app_row = _load_application_by_invite(invite_token)
+    if not body.acknowledged and not body.request_alt_assessment:
+        raise HTTPException(
+            400, "Nothing to record: acknowledge the notice or request an alternative."
+        )
+
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    db = get_db()
+    if body.acknowledged:
+        db.execute(
+            "INSERT INTO consents (id, application_id, candidate_id, notice_version, "
+            "acknowledged, ip, user_agent) VALUES (?,?,?,?,1,?,?)",
+            (uuid.uuid4().hex[:12], app_row["application_id"], app_row["candidate_id"],
+             NOTICE_VERSION, ip, ua),
+        )
+    alt_status = app_row["alt_assessment_status"] or ""
+    if body.request_alt_assessment:
+        if not bool(app_row["alt_assessment_enabled"]):
+            db.close()
+            raise HTTPException(400, "Alternative assessment is not offered for this role.")
+        alt_status = "requested"
+        db.execute(
+            "UPDATE applications SET alt_assessment_status='requested' WHERE id=?",
+            (app_row["application_id"],),
+        )
+    db.commit()
+    db.close()
+
+    log_event(
+        "consent_acknowledged" if body.acknowledged else "alt_assessment_requested",
+        company_id=app_row["company_id"],
+        job_id=app_row["job_id"],
+        application_id=app_row["application_id"],
+        metadata=json.dumps({
+            "notice_version": NOTICE_VERSION,
+            "alt_assessment": bool(body.request_alt_assessment),
+        }),
+    )
+    return {
+        "status": "recorded",
+        "acknowledged": bool(body.acknowledged),
+        "alt_assessment_status": alt_status,
+    }
 
 
 @app.get("/api/aptitude/{invite_token}")
@@ -1998,7 +2101,8 @@ def validate_invite(token: str, request: Request):
     db = get_db()
     row = db.execute(
         "SELECT a.*, c.name, c.email, j.title, j.id as jid, j.description, j.required_skills, "
-        "j.company_id, co.name as company_name, co.slug as company_slug, "
+        "j.company_id, j.aedt_notice_required, j.alt_assessment_enabled, "
+        "co.name as company_name, co.slug as company_slug, "
         "r.id as rid, r.skills_json "
         "FROM applications a "
         "JOIN candidates c ON a.candidate_id=c.id "
@@ -2037,6 +2141,10 @@ def validate_invite(token: str, request: Request):
         application_id=row["id"],
     )
 
+    consent_required = bool(row["aedt_notice_required"]) and not _consent_acknowledged(
+        row["id"], NOTICE_VERSION
+    )
+
     return {
         "valid": True,
         "candidate_name": row["name"],
@@ -2050,6 +2158,9 @@ def validate_invite(token: str, request: Request):
         "status": row["status"],
         "expires_at": row["invite_expires_at"],
         "already_used": bool(row["invite_used_at"]),
+        "consent_required": consent_required,
+        "consent_url": f"/consent/?invite={token}" if consent_required else None,
+        "alt_assessment_enabled": bool(row["alt_assessment_enabled"]),
     }
 
 
