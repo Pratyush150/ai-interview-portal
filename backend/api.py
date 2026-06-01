@@ -581,6 +581,7 @@ async def get_report(session_id: str):
     # Attach coding-round submissions so both the candidate report and the
     # recruiter view (which reads report_json) can render the coding card.
     report["coding_submissions"] = session.coding_submissions
+    report["compliance"] = _compliance_block(session_id)
     session.cached_report = report
 
     # Persist EVERY column the recruiter dashboard reads — without this, the
@@ -628,6 +629,43 @@ async def get_report(session_id: str):
     return _report_envelope(session, report)
 
 
+def _compliance_block(session_id: str) -> dict:
+    """Deterministic compliance summary for the report: whether the AEDT
+    notice was required, whether (and which version) the candidate
+    acknowledged, and any alternative-assessment request. Read from the
+    application linked to this session. No LLM involved — this is audit data."""
+    db = get_db()
+    row = db.execute(
+        "SELECT a.id AS application_id, a.alt_assessment_status, "
+        "       j.aedt_notice_required, j.alt_assessment_enabled "
+        "FROM applications a LEFT JOIN jobs j ON a.job_id=j.id "
+        "WHERE a.session_id=?",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        db.close()
+        return {
+            "notice_required": False, "acknowledged": None,
+            "notice_version": None, "acknowledged_at": None,
+            "alt_assessment_enabled": False, "alt_assessment_status": "",
+        }
+    crow = db.execute(
+        "SELECT notice_version, created_at FROM consents "
+        "WHERE application_id=? AND acknowledged=1 "
+        "ORDER BY created_at DESC LIMIT 1",
+        (row["application_id"],),
+    ).fetchone()
+    db.close()
+    return {
+        "notice_required": bool(row["aedt_notice_required"]),
+        "acknowledged": crow is not None,
+        "notice_version": crow["notice_version"] if crow else None,
+        "acknowledged_at": crow["created_at"] if crow else None,
+        "alt_assessment_enabled": bool(row["alt_assessment_enabled"]),
+        "alt_assessment_status": row["alt_assessment_status"] or "",
+    }
+
+
 def _report_envelope(session: InterviewSession, report: dict) -> dict:
     status = session.get_status()
     return {
@@ -649,6 +687,7 @@ def _report_envelope(session: InterviewSession, report: dict) -> dict:
         "interview_brief": session.interview_brief,
         "evaluations": session.evaluations,
         "coding_submissions": report.get("coding_submissions", session.coding_submissions),
+        "compliance": report.get("compliance"),
         "report": report,
     }
 
@@ -1182,6 +1221,92 @@ def _verify_slug_auth(slug: str, request: Request) -> dict:
     if not token or token != co["auth_token"]:
         raise HTTPException(401, "Unauthorized")
     return dict(co)
+
+
+@app.get("/api/c/{slug}/bias-audit")
+def bias_audit(slug: str, request: Request):
+    """Adverse-impact / selection-rate aggregate over the company's pipeline.
+
+    Honest scaffold: a true four-fifths (80%) protected-class analysis needs
+    self-reported demographic data, which is not collected by default. Until
+    that's enabled this returns deterministic pipeline aggregates (advance
+    rates, aptitude pass rates, score stats) plus an explicit note so the
+    figures are never mistaken for a completed legal bias audit."""
+    co = _verify_slug_auth(slug, request)
+    db = get_db()
+    jobs = db.execute(
+        "SELECT id, title FROM jobs WHERE company_id=? ORDER BY created_at DESC",
+        (co["id"],),
+    ).fetchall()
+    per_job = []
+    tot_apps = tot_advanced = 0
+    score_all = []
+    for j in jobs:
+        apps = db.execute(
+            "SELECT status, aptitude_status FROM applications WHERE job_id=?",
+            (j["id"],),
+        ).fetchall()
+        n = len(apps)
+        if n == 0:
+            continue
+        finished = sum(1 for a in apps if a["status"] == "finished")
+        apt_attempted = sum(
+            1 for a in apps if (a["aptitude_status"] or "") in ("passed", "failed")
+        )
+        apt_passed = sum(1 for a in apps if (a["aptitude_status"] or "") == "passed")
+        scores = [
+            r["total_score"]
+            for r in db.execute(
+                "SELECT total_score FROM interview_sessions "
+                "WHERE job_id=? AND total_score IS NOT NULL",
+                (j["id"],),
+            ).fetchall()
+        ]
+        tot_apps += n
+        tot_advanced += finished
+        score_all.extend(scores)
+        per_job.append({
+            "job_id": j["id"],
+            "title": j["title"],
+            "applications": n,
+            "interviews_finished": finished,
+            "advance_rate": round(finished / n, 3),
+            "aptitude_attempted": apt_attempted,
+            "aptitude_passed": apt_passed,
+            "aptitude_pass_rate": round(apt_passed / apt_attempted, 3) if apt_attempted else None,
+            "avg_score": round(sum(scores) / len(scores), 2) if scores else None,
+            "min_score": round(min(scores), 2) if scores else None,
+            "max_score": round(max(scores), 2) if scores else None,
+        })
+    db.close()
+
+    def _median(xs):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        m = len(xs) // 2
+        return round(xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2, 2)
+
+    return {
+        "company_slug": slug,
+        "basis": "deterministic aggregate over applications + interview_sessions",
+        "demographic_data_available": False,
+        "note": (
+            "Protected-class four-fifths (adverse-impact) analysis requires "
+            "self-reported demographic data, which is not collected by default. "
+            "Enable opt-in demographics to activate it. The figures below are "
+            "pipeline aggregates, not a completed legal bias audit."
+        ),
+        "overall": {
+            "applications": tot_apps,
+            "interviews_finished": tot_advanced,
+            "advance_rate": round(tot_advanced / tot_apps, 3) if tot_apps else None,
+            "avg_score": round(sum(score_all) / len(score_all), 2) if score_all else None,
+            "median_score": _median(score_all),
+        },
+        "per_job": per_job,
+        "four_fifths": None,
+    }
 
 
 class AptitudeQuestionIn(BaseModel):
