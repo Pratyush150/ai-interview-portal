@@ -228,6 +228,18 @@ def init_db():
             user_agent TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS identity_verifications (
+            id TEXT PRIMARY KEY,
+            application_id TEXT REFERENCES applications(id),
+            candidate_id TEXT,
+            provider TEXT,
+            status TEXT DEFAULT 'pending',
+            reference TEXT,
+            ip TEXT,
+            user_agent TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            verified_at TIMESTAMP
+        );
     """)
 
     # ── Migrations on existing tables (additive only) ─────────────────────
@@ -254,6 +266,8 @@ def init_db():
         # recruiter (or the demo seed below) opts in.
         ("aedt_notice_required",   "INTEGER DEFAULT 0"),
         ("alt_assessment_enabled", "INTEGER DEFAULT 0"),
+        # Gap 3 — front-of-funnel identity verification gate. Default 0.
+        ("identity_check_required", "INTEGER DEFAULT 0"),
     ]:
         _ensure_column(conn, "jobs", col, decl)
 
@@ -345,6 +359,9 @@ def init_db():
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_consents_application ON consents(application_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_identity_application ON identity_verifications(application_id)"
     )
 
     conn.commit()
@@ -543,6 +560,11 @@ def _seed_demo_company(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE jobs SET aedt_notice_required=1, alt_assessment_enabled=1 "
         "WHERE company_id=? AND aedt_notice_required=0",
+        (company_id,),
+    )
+    conn.execute(
+        "UPDATE jobs SET identity_check_required=1 "
+        "WHERE company_id=? AND identity_check_required=0",
         (company_id,),
     )
     conn.commit()

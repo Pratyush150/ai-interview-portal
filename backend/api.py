@@ -62,6 +62,7 @@ def _ensure_aptitude_bank(db, company_id: str) -> None:
         ensure_aptitude_bank(db, company_id)
         ensure_coding_bank(db, company_id)
 from backend.compliance import current_notice, NOTICE_VERSION
+from backend.identity import start_verification, current_provider
 from backend.resume_parser import extract_text_from_pdf, analyze_resume
 from backend.email_service import (
     send_interview_invite, send_lead_notification, send_owner_setup_email,
@@ -354,6 +355,7 @@ def create_session(req: SessionCreate):
             "SELECT a.*, c.name as cname, c.email, j.title, j.description, j.required_skills, "
             "j.role_family, j.seniority, j.min_experience_years, j.max_experience_years, "
             "j.company_id, j.aptitude_required, j.aedt_notice_required, "
+            "j.identity_check_required, "
             "r.raw_text, r.skills_json "
             "FROM applications a "
             "JOIN candidates c ON a.candidate_id=c.id "
@@ -375,6 +377,21 @@ def create_session(req: SessionCreate):
                     raise
                 except (ValueError, TypeError):
                     pass
+
+            # Compliance: identity verification gate (front of funnel). If the
+            # job requires an identity check and it isn't verified, refuse to
+            # start; the frontend reads identity_url and redirects.
+            if bool(app_row["identity_check_required"]) and not _identity_verified(
+                app_row["id"]
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "identity_required",
+                        "identity_url": f"/identity/?invite={req.invite_token}",
+                        "message": "Please verify your identity before starting.",
+                    },
+                )
 
             # Compliance: AEDT notice + consent gate. If the job requires the
             # automated-decision-tool notice and the candidate hasn't
@@ -896,6 +913,7 @@ def _load_application_by_invite(invite_token: str) -> dict:
         "       j.aptitude_required, j.aptitude_pass_score, j.aptitude_total, "
         "       j.aptitude_duration_min, "
         "       j.aedt_notice_required, j.alt_assessment_enabled, "
+        "       j.identity_check_required, "
         "       a.alt_assessment_status, "
         "       c.name AS candidate_name "
         "FROM applications a "
@@ -917,6 +935,70 @@ def _load_application_by_invite(invite_token: str) -> dict:
         except (ValueError, TypeError):
             pass
     return dict(row)
+
+
+def _identity_verified(application_id: str) -> bool:
+    """True if this application has a verified identity check."""
+    db = get_db()
+    row = db.execute(
+        "SELECT 1 FROM identity_verifications "
+        "WHERE application_id=? AND status='verified' LIMIT 1",
+        (application_id,),
+    ).fetchone()
+    db.close()
+    return row is not None
+
+
+@app.get("/api/identity/{invite_token}")
+def identity_get(invite_token: str):
+    """Identity-check state for this candidate. Safe to call even when the job
+    doesn't require it — the frontend uses `required` to decide."""
+    app_row = _load_application_by_invite(invite_token)
+    return {
+        "candidate_name": app_row["candidate_name"],
+        "job_title": app_row["job_title"],
+        "required": bool(app_row["identity_check_required"]),
+        "verified": _identity_verified(app_row["application_id"]),
+        "provider": current_provider(),
+    }
+
+
+@app.post("/api/identity/{invite_token}")
+def identity_submit(invite_token: str, request: Request):
+    """Begin (and, for the stub provider, complete) identity verification.
+    A real provider returns status='pending' plus a redirect_url; a webhook
+    would later flip the row to 'verified'/'failed'."""
+    app_row = _load_application_by_invite(invite_token)
+    result = start_verification(app_row["application_id"])
+    ip = request.client.host if request.client else None
+    ua = request.headers.get("user-agent")
+    verified_at = datetime.utcnow().isoformat() if result["status"] == "verified" else None
+    db = get_db()
+    db.execute(
+        "INSERT INTO identity_verifications (id, application_id, candidate_id, "
+        "provider, status, reference, ip, user_agent, verified_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            uuid.uuid4().hex[:12], app_row["application_id"], app_row["candidate_id"],
+            result["provider"], result["status"], result.get("reference"),
+            ip, ua, verified_at,
+        ),
+    )
+    db.commit()
+    db.close()
+    log_event(
+        "identity_verification",
+        company_id=app_row["company_id"],
+        job_id=app_row["job_id"],
+        application_id=app_row["application_id"],
+        metadata=json.dumps({"provider": result["provider"], "status": result["status"]}),
+    )
+    return {
+        "status": result["status"],
+        "provider": result["provider"],
+        "redirect_url": result.get("redirect_url"),
+        "verified": result["status"] == "verified",
+    }
 
 
 def _consent_acknowledged(application_id: str, notice_version: str) -> bool:
@@ -2240,6 +2322,7 @@ def validate_invite(token: str, request: Request):
     row = db.execute(
         "SELECT a.*, c.name, c.email, j.title, j.id as jid, j.description, j.required_skills, "
         "j.company_id, j.aedt_notice_required, j.alt_assessment_enabled, "
+        "j.identity_check_required, "
         "co.name as company_name, co.slug as company_slug, "
         "r.id as rid, r.skills_json "
         "FROM applications a "
@@ -2279,6 +2362,9 @@ def validate_invite(token: str, request: Request):
         application_id=row["id"],
     )
 
+    identity_required = bool(row["identity_check_required"]) and not _identity_verified(
+        row["id"]
+    )
     consent_required = bool(row["aedt_notice_required"]) and not _consent_acknowledged(
         row["id"], NOTICE_VERSION
     )
@@ -2299,6 +2385,8 @@ def validate_invite(token: str, request: Request):
         "consent_required": consent_required,
         "consent_url": f"/consent/?invite={token}" if consent_required else None,
         "alt_assessment_enabled": bool(row["alt_assessment_enabled"]),
+        "identity_required": identity_required,
+        "identity_url": f"/identity/?invite={token}" if identity_required else None,
     }
 
 

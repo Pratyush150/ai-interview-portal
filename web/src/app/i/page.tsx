@@ -32,6 +32,8 @@ interface InviteState {
   consent_required?: boolean;
   consent_url?: string | null;
   alt_assessment_enabled?: boolean;
+  identity_required?: boolean;
+  identity_url?: string | null;
 }
 
 function apiBase(): string {
@@ -82,10 +84,13 @@ function InvitePage() {
 
   function startInterview() {
     if (!state || !token) return;
-    // Compliance first: if the job requires the AEDT notice and it hasn't been
-    // acknowledged, route through /consent. That page forwards to /aptitude
-    // once acknowledged. Otherwise go straight to /aptitude, which itself
-    // redirects to /interview when no aptitude round is required (or cleared).
+    // Gate chain (front to back): identity → consent → aptitude → interview.
+    // Each page forwards to the next when its own gate is satisfied, so we only
+    // need to send the candidate to the first unmet gate here.
+    if (state.identity_required) {
+      window.location.href = `/identity/?invite=${encodeURIComponent(token)}`;
+      return;
+    }
     if (state.consent_required) {
       window.location.href = `/consent/?invite=${encodeURIComponent(token)}`;
       return;
