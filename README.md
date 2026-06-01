@@ -442,9 +442,14 @@ expiry, the IDE auto-submits whatever's in the editor.
 
 ```
 coding_problems(id, company_id, role_family, position, title,
-                 statement, examples_json, hint, language_hint, active,
-                 created_at, updated_at)
+                 statement, examples_json, hint, boilerplate, language_hint,
+                 active, created_at, updated_at)
 ```
+
+`boilerplate` is optional starter code the candidate fills in; the IDE seeds
+the editor with it and falls back to a generic per-language pseudocode stub
+when none is set. The recruiter `/coding-bank` editor has a starter-code field
+per problem.
 
 `examples_json` is a list of `{input, output}` pairs that double as visible
 test cases in the IDE. The bank-seeder (`ensure_coding_bank`) inserts
@@ -460,9 +465,14 @@ test-case editor (add/remove input/output rows). The Monaco wrapper
 supports **C / C++ / Python / JS / Java**; a small pseudocode badge marks
 problems that don't require a specific language.
 
-**Submission.** The Submit button posts the candidate's final code to the
-session; submissions and timing are folded into the final report alongside
-the voice round's per-turn evaluations.
+**Submission & scoring.** The Submit button posts the candidate's final code
+to the session. Each submission is now captured distinctly — problem, language,
+full code/pseudocode, an LLM-assigned score, and the AI's
+strengths/weaknesses/verdict — instead of being buried in the voice round's
+per-turn evaluations. The list is persisted to `report_json` as
+`coding_submissions` and exposed on both report endpoints, so the candidate
+report and the recruiter `/reports` detail each render a dedicated **Coding
+round** card showing every submission and its score.
 
 ---
 
@@ -962,6 +972,8 @@ session collected:
   relevance) and a comparison to the seniority bar
 - **Topic coverage map** — which `topic_categories` were actually touched
 - **AI-detection summary** with the worst-offending turns
+- **Coding round card** (engineering roles) — each `coding_submissions`
+  entry with its problem, language, full code, score, and verdict
 - **One-paragraph human-readable summary**
 
 The synthesized report is cached on the `InterviewSession` and persisted
@@ -1031,7 +1043,11 @@ Router, Tailwind, shadcn/ui, React Query, Monaco editor) that ships:
   `/api/c/:slug/onboard`
 - **Company dashboard** at `/c/:slug` — jobs, applications, candidate
   files, shareable application links, usage panel
-- **Candidate signup/login** for the multi-application flow
+- **Candidate signup/login** for the multi-application flow. Both `/login`
+  and `/candidate-login` spell out per-role **demo credentials** (DemoCorp /
+  `demo1234` for recruiter/HM/admin, `demo@aperture.test` / `demo1234` for
+  candidates) so the deployed demo is testable without seed knowledge. A
+  **Sign out** action is available from the landing nav and the jobs header.
 - **Aptitude UI** at `/aptitude/` — invite-token gated MCQ runner
 - **Three-round interview UI** at `/interview` — check → voice → coding
   phase machine with a Monaco IDE for the coding round
